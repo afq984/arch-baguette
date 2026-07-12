@@ -14,15 +14,26 @@
 #
 # Usage: image/build.sh [options]
 #   --fast                 zstd -3 instead of the release default -19
+#   --zstd-level N         explicit zstd level 1..22 (overrides --fast/default)
 #   --dev-user NAME[:PW]   bake a dev user (uid 1000, full 11-group contract
 #                          set, linger). Default password: test0000.
 #                          Production default: NO user is created.
+#   --guest-repo-url URL   configure the FINAL image to consume the signed
+#                          [baguette] pacman repo at URL: writes the repo
+#                          entry (SigLevel = Required) into the image's
+#                          /etc/pacman.conf and installs + locally signs the
+#                          repo public key (keys/baguette.pub; override with
+#                          GUEST_REPO_KEY env) in the target pacman keyring.
+#                          CI passes the GitHub Releases repo URL on main
+#                          builds; local builds omit it (guest updates then
+#                          cover core/extra only).
 #   --skip-baguette-repo   build without the local [baguette] repo and its
 #                          packages (pipeline smoke-test before packages exist)
 #   -h | --help            this text
 #
 # Env overrides: WORKDIR (default <repo>/build/image), OUTDIR (default
-# <repo>/out/image), BAGUETTE_REPO_DIR (default <repo>/out/repo).
+# <repo>/out/image), BAGUETTE_REPO_DIR (default <repo>/out/repo),
+# GUEST_REPO_KEY (default <repo>/keys/baguette.pub).
 #
 # Output: $OUTDIR/baguette_arch_rootfs.img.zst (+ .sha256, manifest.txt)
 set -euo pipefail
@@ -52,6 +63,8 @@ ZSTD_LEVEL=19
 DEV_USER=""
 DEV_PASSWORD="test0000"
 SKIP_BAGUETTE_REPO=0
+GUEST_REPO_URL=""
+GUEST_REPO_KEY="${GUEST_REPO_KEY:-${REPO_ROOT}/keys/baguette.pub}"
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
@@ -68,6 +81,16 @@ while [ $# -gt 0 ]; do
             DEV_USER="${arg%%:*}"
             case "$arg" in *:*) DEV_PASSWORD="${arg#*:}" ;; esac
             ;;
+        --zstd-level)
+            shift; [ $# -gt 0 ] || { echo "error: --zstd-level needs a number" >&2; exit 2; }
+            ZSTD_LEVEL="$1"
+            ;;
+        --zstd-level=*) ZSTD_LEVEL="${1#--zstd-level=}" ;;
+        --guest-repo-url)
+            shift; [ $# -gt 0 ] || { echo "error: --guest-repo-url needs a URL" >&2; exit 2; }
+            GUEST_REPO_URL="$1"
+            ;;
+        --guest-repo-url=*) GUEST_REPO_URL="${1#--guest-repo-url=}" ;;
         --skip-baguette-repo) SKIP_BAGUETTE_REPO=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -77,6 +100,11 @@ done
 
 if [ -n "${DEV_USER}" ] && ! printf '%s' "${DEV_USER}" | grep -Eq '^[a-z_][a-z0-9_-]*$'; then
     echo "error: invalid --dev-user name: ${DEV_USER}" >&2
+    exit 2
+fi
+if ! printf '%s' "${ZSTD_LEVEL}" | grep -Eq '^[0-9]+$' \
+   || [ "${ZSTD_LEVEL}" -lt 1 ] || [ "${ZSTD_LEVEL}" -gt 22 ]; then
+    echo "error: invalid --zstd-level: ${ZSTD_LEVEL} (want 1..22)" >&2
     exit 2
 fi
 
@@ -114,13 +142,24 @@ as_root() {
 # Preflight
 # ---------------------------------------------------------------------------
 missing=0
-for tool in pacstrap arch-chroot mkfs.btrfs zstd systemctl sha256sum; do
+# unshare is needed in BOTH modes: the mkfs step always runs in a private
+# mount namespace (rootful desk-check fix — it used to be rootless-only).
+for tool in pacstrap arch-chroot mkfs.btrfs zstd systemctl sha256sum unshare; do
     command -v "${tool}" >/dev/null || { echo "error: missing tool: ${tool}" >&2; missing=1; }
 done
 if [ "${ROOTLESS}" -eq 1 ]; then
-    for tool in unshare newuidmap newgidmap; do
+    for tool in newuidmap newgidmap; do
         command -v "${tool}" >/dev/null || { echo "error: missing tool: ${tool} (rootless mode)" >&2; missing=1; }
     done
+fi
+if [ -n "${GUEST_REPO_URL}" ]; then
+    command -v gpg >/dev/null || { echo "error: missing tool: gpg (--guest-repo-url)" >&2; missing=1; }
+    if [ ! -f "${GUEST_REPO_KEY}" ]; then
+        echo "error: --guest-repo-url given but repo public key not found: ${GUEST_REPO_KEY}" >&2
+        echo "  Generate and commit the repo signing PUBLIC key first (see keys/README.md" >&2
+        echo "  for generation + bootstrap order), or point GUEST_REPO_KEY at it." >&2
+        missing=1
+    fi
 fi
 # no grep -q here: with pipefail, grep -q's early exit SIGPIPEs mkfs.btrfs
 mkfs.btrfs --help 2>&1 | grep -- '--subvol' >/dev/null \
@@ -140,6 +179,7 @@ echo "==> mode: $([ "${ROOTLESS}" -eq 1 ] && echo rootless || echo 'rootful (UNT
 echo "==> zstd level: ${ZSTD_LEVEL}$([ "${ZSTD_LEVEL}" -eq 3 ] && echo ' (--fast)')"
 echo "==> dev user: ${DEV_USER:-<none — production userless image>}"
 echo "==> [baguette] repo: $([ "${SKIP_BAGUETTE_REPO}" -eq 1 ] && echo 'SKIPPED' || echo "${BAGUETTE_REPO_DIR}")"
+echo "==> guest [baguette] repo baked into image: ${GUEST_REPO_URL:-<none — local build>}"
 
 # ---------------------------------------------------------------------------
 # [1/9] Clean previous build (rootfs files are subuid-owned -> remove in userns)
@@ -283,10 +323,38 @@ as_root ln -sfnT /run/resolv.conf "${ROOTFS}/etc/resolv.conf"
 # Working in-guest mirrorlist so `pacman -Syu` functions after first boot —
 # the stock pacman-mirrorlist package ships every Server line commented out.
 # Reuse the exact server list the build itself used.
-# TODO(phase D): also configure the [baguette] repo in the guest's
-# /etc/pacman.conf once the CI-hosted repo has a public URL + signing key
-# (until then guest updates cover core/extra only).
 as_root install -m644 "${WORKDIR}/mirrorlist" "${ROOTFS}/etc/pacman.d/mirrorlist"
+
+# --guest-repo-url: make the FINAL image consume the CI-published signed
+# [baguette] repo (DESIGN "CI": SigLevel = Required for consumers). Two
+# halves, exactly what a user would do by hand on an existing install:
+#   (a) install + locally sign the repo public key in the target pacman
+#       keyring (in-chroot pacman-key; the keyring was initialized above);
+#   (b) append the repo entry to the target /etc/pacman.conf.
+# Without the flag (local/dev builds) the guest gets NO [baguette] entry:
+# the local out/repo is unsigned and never referenced by the image
+# (DESIGN "Security posture": local repo may be unsigned; never bake it).
+if [ -n "${GUEST_REPO_URL}" ]; then
+    echo "      configuring guest [baguette] repo: ${GUEST_REPO_URL}"
+    GUEST_REPO_FPR="$(gpg --batch --with-colons --show-keys "${GUEST_REPO_KEY}" \
+        | awk -F: '/^fpr:/ {print $10; exit}')"
+    if [ -z "${GUEST_REPO_FPR}" ]; then
+        echo "error: cannot extract a key fingerprint from ${GUEST_REPO_KEY}" >&2
+        exit 1
+    fi
+    as_root install -m644 "${GUEST_REPO_KEY}" "${ROOTFS}/baguette-repo.pub"
+    "${ARCH_CHROOT[@]}" "${ROOTFS}" /bin/bash -euc "
+        pacman-key --add /baguette-repo.pub
+        pacman-key --lsign-key '${GUEST_REPO_FPR}'
+    "
+    as_root rm -f "${ROOTFS}/baguette-repo.pub"
+    as_root tee -a "${ROOTFS}/etc/pacman.conf" >/dev/null <<EOF
+
+[baguette]
+SigLevel = Required
+Server = ${GUEST_REPO_URL}
+EOF
+fi
 
 # ---------------------------------------------------------------------------
 # [6/9] Enable units via presets
@@ -355,6 +423,7 @@ echo "Verify:"
 VERIFY_FLAGS=""
 [ -n "${DEV_USER}" ] && VERIFY_FLAGS+=" --dev-user ${DEV_USER}"
 [ "${SKIP_BAGUETTE_REPO}" -eq 1 ] && VERIFY_FLAGS+=" --skip-baguette-repo"
+[ -n "${GUEST_REPO_URL}" ] && VERIFY_FLAGS+=" --guest-repo-url ${GUEST_REPO_URL}"
 echo "  ${HERE}/tests/verify-rootfs.sh${VERIFY_FLAGS} ${ROOTFS}"
 echo "  ${HERE}/tests/verify-image.sh ${IMG}"
 if [ -z "${DEV_USER}" ]; then

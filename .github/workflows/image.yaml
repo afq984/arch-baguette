@@ -1,0 +1,295 @@
+# Build (and on main: release) the Baguette image.
+#
+#   PRs touching image/**:  --fast build, workflow artifacts only.
+#   weekly cron / dispatch / after a successful packages publish on main:
+#     full production (userless) build baking the published signed
+#     [baguette] repo URL, released to a dated tag vYYYY.MM.DD(.N) and
+#     mirrored to the rolling `latest` release.
+#
+# Hermetic: job 1 builds the packages from THIS checkout and job 2 builds
+# the image against that freshly-built repo — never against the published
+# one. The dev flavor (--dev-user test, baked credentials) is only reachable
+# via the dispatch input and is NEVER published to a release.
+name: image
+
+on:
+  schedule:
+    # weekly: rolling distro -> fresh images keep the first -Syu small
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Image flavor (dev bakes user test:test0000; artifact-only)'
+        type: choice
+        options: [prod, dev]
+        default: prod
+      zstd_level:
+        description: 'zstd compression level (1..22)'
+        type: string
+        default: '19'
+  workflow_run:
+    workflows: [packages]
+    types: [completed]
+    branches: [main]
+  pull_request:
+    paths:
+      - 'image/**'
+      - .github/workflows/image.yaml
+
+# Default: read-only. Only the publish job gets contents: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-repo:
+    # For workflow_run: only continue when the packages run on main succeeded
+    # (the trigger also fires for failed/PR-branch runs).
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 45
+    steps:
+      - name: Install build tooling (native pacman)
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm
+          pacman -S --noconfirm --needed base-devel git \
+            bash btrfs-progs dbus sudo systemd xorg-xauth xxd
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build packages and assemble repo
+        run: |
+          # makepkg refuses to run as root — build as a dedicated user.
+          # (env HOME=...: runuser keeps the caller's HOME, which would
+          # point git/makepkg at root-owned dotfiles.)
+          useradd -m builder
+          chown -R builder: .
+          runuser -u builder -- env HOME=/home/builder bash scripts/build-repo.sh
+
+      - name: Upload repo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo
+          path: out/repo/
+          if-no-files-found: error
+
+  build-image:
+    needs: build-repo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download freshly-built repo
+        uses: actions/download-artifact@v4
+        with:
+          name: repo
+          path: out/repo
+
+      - name: Install host dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            arch-install-scripts pacman-package-manager archlinux-keyring \
+            zstd btrfs-progs guestfs-tools
+
+      - name: Install btrfs-progs >= 6.8 (static)
+        run: |
+          # noble ships btrfs-progs 6.6 — too old for
+          # `mkfs.btrfs --subvol default:` (needs >= 6.8, DESIGN). Use the
+          # upstream static "box" binary (busybox-style applet dispatch by
+          # argv[0]); /usr/local/bin shadows /usr/bin in both the runner
+          # PATH and sudo's secure_path.
+          set -euo pipefail
+          version=v7.0
+          sha256=061da670a9d0cd3fd3402f5eab4ee7b2001eb53534ebe28ce18c8f1e69721b06
+          curl -fsSL -o /tmp/btrfs.box.static \
+            "https://github.com/kdave/btrfs-progs/releases/download/${version}/btrfs.box.static"
+          echo "${sha256}  /tmp/btrfs.box.static" | sha256sum -c -
+          sudo install -m755 /tmp/btrfs.box.static /usr/local/bin/btrfs.box
+          sudo ln -sf btrfs.box /usr/local/bin/mkfs.btrfs
+          sudo ln -sf btrfs.box /usr/local/bin/btrfs
+          mkfs.btrfs --version
+          btrfs version
+
+      - name: Bootstrap a current Arch keyring on the Ubuntu host
+        run: |
+          # noble's archlinux-keyring package is a point-in-time snapshot;
+          # packages signed by newer packager keys would fail verification.
+          # Fetch the CURRENT keyring package from Arch and install its
+          # keyring files where pacman-key --populate looks (pacman 6.x
+          # reads /usr/share/keyrings, 7.x /usr/share/pacman/keyrings —
+          # install both, same as the proven legacy Ubuntu build).
+          set -euo pipefail
+          url="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+            'https://archlinux.org/packages/core/any/archlinux-keyring/download/')"
+          curl -fsSL -o /tmp/archlinux-keyring.pkg.tar.zst "${url}"
+          mkdir -p /tmp/akr
+          tar --zstd -xf /tmp/archlinux-keyring.pkg.tar.zst -C /tmp/akr
+          for d in /usr/share/keyrings /usr/share/pacman/keyrings; do
+            sudo install -Dm644 -t "${d}" \
+              /tmp/akr/usr/share/pacman/keyrings/archlinux.gpg \
+              /tmp/akr/usr/share/pacman/keyrings/archlinux-trusted \
+              /tmp/akr/usr/share/pacman/keyrings/archlinux-revoked
+          done
+
+      - name: Build image (rootful branch, sudo)
+        env:
+          FLAVOR: ${{ inputs.flavor || 'prod' }}
+          ZSTD_LEVEL: ${{ inputs.zstd_level || '' }}
+          GH_REPO: ${{ github.repository }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          # repo-add creates baguette.db as a symlink; the artifact
+          # round-trip flattens it — recreate if it got dropped (build.sh's
+          # preflight and pacman both want out/repo/baguette.db).
+          for n in db files; do
+            if [ ! -f "out/repo/baguette.${n}" ]; then
+              cp "out/repo/baguette.${n}.tar.zst" "out/repo/baguette.${n}"
+            fi
+          done
+          args=()
+          if [ "${IS_PR}" = "true" ]; then
+            # PR builds: fast, artifact-only, and NOT wired to the published
+            # repo (PRs must not depend on release/signing state).
+            args+=(--fast)
+          else
+            if [ ! -f keys/baguette.pub ]; then
+              echo "::error::keys/baguette.pub is not committed — bootstrap the signing key first (keys/README.md)"
+              exit 1
+            fi
+            args+=(--guest-repo-url \
+              "https://github.com/${GH_REPO}/releases/download/repo-x86_64")
+          fi
+          if [ -n "${ZSTD_LEVEL}" ]; then
+            args+=(--zstd-level "${ZSTD_LEVEL}")
+          fi
+          if [ "${FLAVOR}" = "dev" ]; then
+            args+=(--dev-user test)
+          fi
+          echo "build args: ${args[*]}"
+          sudo image/build.sh "${args[@]}"
+
+      - name: Verify rootfs (contract asserts)
+        env:
+          FLAVOR: ${{ inputs.flavor || 'prod' }}
+          GH_REPO: ${{ github.repository }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${FLAVOR}" = "dev" ]; then
+            args+=(--dev-user test)
+          fi
+          if [ "${IS_PR}" != "true" ]; then
+            args+=(--guest-repo-url \
+              "https://github.com/${GH_REPO}/releases/download/repo-x86_64")
+          fi
+          sudo image/tests/verify-rootfs.sh "${args[@]}" build/image/rootfs
+
+      - name: Verify image (btrfs + guestfish asserts)
+        run: |
+          set -euo pipefail
+          # libguestfs builds its appliance from the host kernel, which is
+          # not world-readable on Ubuntu; the script itself runs under sudo
+          # anyway (root-owned build tree), so both paths are covered.
+          sudo chmod 0644 /boot/vmlinuz*
+          sudo image/tests/verify-image.sh build/image/baguette_arch_rootfs.img
+
+      - name: Make outputs readable for artifact upload
+        run: sudo chmod -R a+rX out/image
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ inputs.flavor || 'prod' }}
+          path: out/image/
+          if-no-files-found: error
+
+  publish:
+    name: Publish dated release + rolling latest
+    needs: build-image
+    # main only, never for PRs, never for the dev flavor (baked credentials
+    # must not reach Releases). schedule/workflow_run always run on main.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_run' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' && inputs.flavor != 'dev')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: image-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image-prod
+          path: out/image
+
+      - name: Create dated release and update rolling latest
+        run: |
+          set -euo pipefail
+          cd out/image
+          test -f baguette_arch_rootfs.img.zst
+          test -f manifest.txt
+          sha256sum -c baguette_arch_rootfs.img.zst.sha256
+          sha="$(cut -d' ' -f1 baguette_arch_rootfs.img.zst.sha256)"
+
+          base="v$(date -u +%Y.%m.%d)"
+          tag="${base}"
+          n=0
+          while gh release view "${tag}" --json name >/dev/null 2>&1; do
+            n=$((n + 1))
+            tag="${base}.${n}"
+          done
+
+          notes="Arch Linux Baguette image (userless production flavor).
+
+          sha256: \`${sha}\`
+
+          Create the VM from crosh (see README.md for details):
+          \`\`\`
+          vmc create --vm-type BAGUETTE --size 10G \\
+            --source /home/chronos/user/MyFiles/Downloads/baguette_arch_rootfs.img.zst \\
+            arch
+          vmc start --vm-type BAGUETTE arch
+          \`\`\`"
+
+          gh release create "${tag}" \
+            --title "arch-baguette ${tag}" \
+            --notes "${notes}" \
+            baguette_arch_rootfs.img.zst \
+            baguette_arch_rootfs.img.zst.sha256 \
+            manifest.txt
+
+          if ! gh release view latest --json name >/dev/null 2>&1; then
+            gh release create latest \
+              --title 'arch-baguette (latest)' \
+              --latest=false \
+              --notes "Rolling mirror of the newest dated release."
+          fi
+          gh release upload latest --clobber \
+            baguette_arch_rootfs.img.zst \
+            baguette_arch_rootfs.img.zst.sha256 \
+            manifest.txt
+          gh release edit latest \
+            --notes "Rolling mirror of ${tag} (sha256 \`${sha}\`)."

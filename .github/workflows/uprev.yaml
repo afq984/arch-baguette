@@ -1,0 +1,122 @@
+# Daily check of cros-container-guest-tools upstream main: if HEAD moved
+# past the _commit pin in packages/cros-guest-tools/PKGBUILD, open a PR that
+# bumps the pin, recomputes pkgver exactly like the PKGBUILD's pkgver()
+# does, and resets pkgrel to 1.
+#
+# Plain bash + gh; the only action used is checkout.
+#
+# Known GitHub limitation: PRs opened with the workflow's GITHUB_TOKEN do
+# not trigger the `packages` pull_request workflow automatically — close and
+# reopen the PR (or push any commit to its branch) to run CI on it.
+name: uprev
+
+on:
+  schedule:
+    - cron: '43 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: uprev
+  cancel-in-progress: false
+
+jobs:
+  uprev:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM: https://chromium.googlesource.com/chromiumos/containers/cros-container-guest-tools
+      PKGBUILD: packages/cros-guest-tools/PKGBUILD
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check upstream and open uprev PR if needed
+        run: |
+          set -euo pipefail
+
+          new="$(git ls-remote "${UPSTREAM}" main | awk '{print $1; exit}')"
+          if ! printf '%s' "${new}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::could not resolve upstream main HEAD (got: '${new}')"
+            exit 1
+          fi
+          old="$(sed -n 's/^_commit=\([0-9a-f]\{40\}\)$/\1/p' "${PKGBUILD}")"
+          if [ -z "${old}" ]; then
+            echo "::error::no _commit=<40-hex> pin found in ${PKGBUILD}"
+            exit 1
+          fi
+
+          echo "pinned:   ${old}"
+          echo "upstream: ${new}"
+          if [ "${new}" = "${old}" ]; then
+            echo "pin is up to date — nothing to do"
+            exit 0
+          fi
+
+          short="$(printf '%.7s' "${new}")"
+          branch="uprev/cros-guest-tools-${short}"
+          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "branch ${branch} already exists — uprev PR pending, nothing to do"
+            exit 0
+          fi
+
+          # Recompute pkgver EXACTLY like the PKGBUILD's pkgver() does,
+          # from a clone at the new commit (full clone: rev-list --count
+          # needs history, and the changelog needs the old commit too).
+          tmp="$(mktemp -d)"
+          git clone "${UPSTREAM}" "${tmp}/src"
+          git -C "${tmp}/src" checkout --detach "${new}"
+          date="$(git -C "${tmp}/src" log -1 --format=%cd --date=format:%Y%m%d)"
+          count="$(git -C "${tmp}/src" rev-list --count HEAD)"
+          gshort="$(git -C "${tmp}/src" rev-parse --short=7 HEAD)"
+          pkgver="${date}.r${count}.g${gshort}"
+          echo "new pkgver: ${pkgver}"
+
+          changelog="$(git -C "${tmp}/src" log --oneline --no-decorate \
+            "${old}..${new}" 2>/dev/null | head -n 200 \
+            || echo '(upstream history rewritten; old pin not an ancestor)')"
+
+          sed -i \
+            -e "s/^_commit=.*/_commit=${new}/" \
+            -e "s/^pkgver=.*/pkgver=${pkgver}/" \
+            -e "s/^pkgrel=.*/pkgrel=1/" \
+            "${PKGBUILD}"
+          grep -q "^_commit=${new}\$" "${PKGBUILD}"
+          grep -q "^pkgver=${pkgver}\$" "${PKGBUILD}"
+          grep -q "^pkgrel=1\$" "${PKGBUILD}"
+          git diff -- "${PKGBUILD}"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "${branch}"
+          git add "${PKGBUILD}"
+          git commit -m "cros-guest-tools: uprev to ${pkgver}" \
+            -m "Bump the upstream pin ${old} -> ${new} (automated)."
+          git push origin "${branch}"
+
+          {
+            echo "Automated uprev of \`cros-guest-tools\` to upstream main."
+            echo
+            echo "- old pin: ${old}"
+            echo "- new pin: ${new}"
+            echo "- pkgver: ${pkgver} (pkgrel reset to 1)"
+            echo
+            echo "Upstream changes (\`git log --oneline old..new\`, newest first, capped at 200):"
+            echo '```'
+            printf '%s\n' "${changelog}"
+            echo '```'
+            echo
+            echo "_PRs opened with GITHUB_TOKEN do not trigger CI automatically —"
+            echo "close/reopen this PR (or push to the branch) to run the packages workflow._"
+          } > "${tmp}/body.md"
+
+          gh pr create \
+            --base main \
+            --head "${branch}" \
+            --title "cros-guest-tools: uprev to ${pkgver}" \
+            --body-file "${tmp}/body.md"

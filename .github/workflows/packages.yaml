@@ -1,0 +1,202 @@
+# Build the pacman packages and assemble the [baguette] repo.
+#
+#   PRs:  build + namcap lint only; unsigned repo uploaded as a plain
+#         workflow artifact. No secrets, no releases.
+#   main: additionally sign every package and the repo db with the release
+#         key (secrets BAGUETTE_GPG_PRIVATE_KEY / BAGUETTE_GPG_PASSPHRASE,
+#         see keys/README.md) and publish the flat repo directory to the
+#         rolling release tag `repo-x86_64`. Consumers use:
+#
+#           [baguette]
+#           SigLevel = Required
+#           Server = https://github.com/OWNER/REPO/releases/download/repo-x86_64
+#
+# A successful run of this workflow on main triggers image.yaml
+# (workflow_run) so published images always track the published packages.
+name: packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+      - scripts/build-repo.sh
+      - .github/workflows/packages.yaml
+  pull_request:
+    paths:
+      - 'packages/**'
+      - scripts/build-repo.sh
+      - .github/workflows/packages.yaml
+  workflow_dispatch:
+
+# Default: read-only. Only the publish job gets contents: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 45
+    steps:
+      - name: Install build tooling (native pacman)
+        run: |
+          # keyring first so a stale container image can still verify pkgs
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm
+          # base-devel: makepkg/fakeroot; the rest are the PKGBUILDs'
+          # makedepends + depends (makepkg without -d checks both).
+          pacman -S --noconfirm --needed base-devel git namcap \
+            bash btrfs-progs dbus sudo systemd xorg-xauth xxd
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build packages and assemble repo
+        run: |
+          # makepkg refuses to run as root — build as a dedicated user.
+          # (env HOME=...: runuser keeps the caller's HOME, which would
+          # point git/makepkg at root-owned dotfiles.)
+          useradd -m builder
+          chown -R builder: .
+          runuser -u builder -- env HOME=/home/builder bash scripts/build-repo.sh
+
+      - name: Lint with namcap
+        run: |
+          # Informational: expected findings are the documented waivers in
+          # packages/AUDIT.md and the PKGBUILD headers (dangling
+          # /opt/google/... symlinks, deliberate /mnt layout, sudoers 0440,
+          # runtime-only deps). Review new findings in this log.
+          runuser -u builder -- env HOME=/home/builder namcap \
+            packages/*/PKGBUILD out/packages/*.pkg.tar.zst | tee namcap.log || true
+          echo "namcap emitted $(wc -l < namcap.log) finding(s)"
+
+      - name: Upload repo artifact (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-x86_64
+          path: out/repo/
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish repo to rolling release
+    needs: build
+    # Never for PRs (no secrets, no releases) and never off main.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: repo-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Install tooling
+        run: |
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm
+          pacman -S --noconfirm --needed github-cli gnupg
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download built repo
+        uses: actions/download-artifact@v4
+        with:
+          name: repo-x86_64
+          path: out/repo
+
+      - name: Import signing key (must match committed keys/baguette.pub)
+        env:
+          BAGUETTE_GPG_PRIVATE_KEY: ${{ secrets.BAGUETTE_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BAGUETTE_GPG_PRIVATE_KEY}" ]; then
+            echo "::error::secret BAGUETTE_GPG_PRIVATE_KEY is not set (see keys/README.md)"
+            exit 1
+          fi
+          if [ ! -f keys/baguette.pub ]; then
+            echo "::error::keys/baguette.pub is not committed — see keys/README.md (bootstrap order)"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${BAGUETTE_GPG_PRIVATE_KEY}" | gpg --batch --import
+          fpr="$(gpg --batch --with-colons --list-secret-keys \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          pub_fpr="$(gpg --batch --with-colons --show-keys keys/baguette.pub \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ -z "${fpr}" ] || [ "${fpr}" != "${pub_fpr}" ]; then
+            echo "::error::secret key fingerprint (${fpr:-none}) != keys/baguette.pub (${pub_fpr:-none})"
+            exit 1
+          fi
+          echo "FPR=${fpr}" >> "${GITHUB_ENV}"
+
+      - name: Sign packages and repo database
+        env:
+          BAGUETTE_GPG_PASSPHRASE: ${{ secrets.BAGUETTE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BAGUETTE_GPG_PASSPHRASE}" ]; then
+            echo "::error::secret BAGUETTE_GPG_PASSPHRASE is not set (see keys/README.md)"
+            exit 1
+          fi
+          # Flat staging dir == exactly the release asset set. pacman asks
+          # the Server URL for baguette.db(.sig) and <pkg>(.sig); the
+          # .tar.zst spellings are kept for humans/mirrors. repo-add creates
+          # baguette.db/.files as symlinks; the artifact round-trip flattens
+          # them — recreate from the tarball names if they got dropped.
+          for n in db files; do
+            if [ ! -f "out/repo/baguette.${n}" ]; then
+              cp "out/repo/baguette.${n}.tar.zst" "out/repo/baguette.${n}"
+            fi
+          done
+          mkdir -p publish
+          cp -L out/repo/baguette.db out/repo/baguette.files \
+                out/repo/baguette.db.tar.zst out/repo/baguette.files.tar.zst \
+                out/repo/*.pkg.tar.zst publish/
+          for f in publish/*; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                --local-user "${FPR}" --detach-sign --no-armor "${f}" \
+                <<<"${BAGUETTE_GPG_PASSPHRASE}"
+          done
+          gpg --verify publish/baguette.db.sig publish/baguette.db
+          cp keys/baguette.pub publish/
+          ls -l publish/
+
+      - name: Publish to rolling release repo-x86_64
+        run: |
+          set -euo pipefail
+          if ! gh release view repo-x86_64 --json name >/dev/null 2>&1; then
+            gh release create repo-x86_64 \
+              --title 'pacman repo (x86_64, rolling)' \
+              --latest=false \
+              --notes "Rolling pacman repository for the [baguette] packages.
+
+          Usage (in the guest):
+          \`\`\`
+          [baguette]
+          SigLevel = Required
+          Server = https://github.com/${GH_REPO}/releases/download/repo-x86_64
+          \`\`\`
+          Import the signing key first — see keys/README.md and README.md."
+          fi
+          gh release upload repo-x86_64 publish/* --clobber
+          # Prune assets that are no longer part of the repo (old pkgvers).
+          # Done AFTER upload so the freshly-signed db never points at
+          # missing files. --paginate: the asset list can outgrow one page.
+          release_id="$(gh api "repos/${GH_REPO}/releases/tags/repo-x86_64" --jq '.id')"
+          gh api --paginate "repos/${GH_REPO}/releases/${release_id}/assets" \
+            --jq '.[].name' | while IFS= read -r asset; do
+            if [ ! -e "publish/${asset}" ]; then
+              echo "pruning stale asset: ${asset}"
+              gh release delete-asset repo-x86_64 "${asset}" --yes
+            fi
+          done

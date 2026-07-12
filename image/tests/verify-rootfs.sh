@@ -3,23 +3,38 @@
 # "Tests". Works rootless: everything that must resolve names inside the
 # target (getent, visudo, pacman) runs in a userns chroot of the rootfs.
 #
-# Usage: verify-rootfs.sh [--dev-user NAME] [--skip-baguette-repo] <rootfs-dir>
+# Usage: verify-rootfs.sh [--dev-user NAME] [--skip-baguette-repo] \
+#                          [--guest-repo-url URL] <rootfs-dir>
 #   --dev-user NAME        rootfs was built with image/build.sh --dev-user NAME
 #                          (expect that user; otherwise assert NO uid >= 1000)
 #   --skip-baguette-repo   rootfs was built without the [baguette] packages;
 #                          package-dependent asserts are SKIPped
+#   --guest-repo-url URL   rootfs was built with image/build.sh
+#                          --guest-repo-url URL: assert the [baguette] entry
+#                          (SigLevel = Required, Server = URL) is in the
+#                          guest /etc/pacman.conf and the repo public key
+#                          (keys/baguette.pub; override: GUEST_REPO_KEY env)
+#                          is in the target keyring and locally signed.
+#                          Without it: assert NO [baguette] entry leaked in.
 #
 # Output: one "PASS|FAIL|SKIP  <assert>" line each; exit 1 if any FAIL.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$(dirname "${HERE}")")"
+
 DEV_USER=""
 SKIP_BAGUETTE=0
+GUEST_REPO_URL=""
+GUEST_REPO_KEY="${GUEST_REPO_KEY:-${REPO_ROOT}/keys/baguette.pub}"
 ROOTFS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dev-user)   shift; DEV_USER="${1%%:*}" ;;
         --dev-user=*) arg="${1#--dev-user=}"; DEV_USER="${arg%%:*}" ;;
+        --guest-repo-url)   shift; GUEST_REPO_URL="$1" ;;
+        --guest-repo-url=*) GUEST_REPO_URL="${1#--guest-repo-url=}" ;;
         --skip-baguette-repo) SKIP_BAGUETTE=1 ;;
         -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
         -*) echo "error: unknown option: $1" >&2; exit 2 ;;
@@ -28,7 +43,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ -n "${ROOTFS}" ] || { echo "usage: $0 [--dev-user NAME] [--skip-baguette-repo] <rootfs-dir>" >&2; exit 2; }
+[ -n "${ROOTFS}" ] || { echo "usage: $0 [--dev-user NAME] [--skip-baguette-repo] [--guest-repo-url URL] <rootfs-dir>" >&2; exit 2; }
 ROOTFS="$(cd "${ROOTFS}" && pwd)"
 [ -d "${ROOTFS}/etc" ] || { echo "error: ${ROOTFS} does not look like a rootfs (no etc/)" >&2; exit 2; }
 
@@ -53,7 +68,7 @@ check() {
 }
 
 echo "== verify-rootfs: ${ROOTFS}"
-echo "== mode: dev-user='${DEV_USER:-<none>}' skip-baguette-repo=${SKIP_BAGUETTE}"
+echo "== mode: dev-user='${DEV_USER:-<none>}' skip-baguette-repo=${SKIP_BAGUETTE} guest-repo-url='${GUEST_REPO_URL:-<none>}'"
 
 if [ "${SKIP_BAGUETTE}" -eq 0 ] && \
    ! find "${ROOTFS}/var/lib/pacman/local" -maxdepth 1 -name 'baguette-base-*' 2>/dev/null | grep -q .; then
@@ -115,6 +130,54 @@ check "in-target pacman keyring populated (pacman-key trustdb)" \
 # Server lines commented; the build installs a working one
 check "/etc/pacman.d/mirrorlist has an active Server line" \
     grep -Eq '^Server[[:space:]]*=' "${ROOTFS}/etc/pacman.d/mirrorlist"
+
+# guest [baguette] repo wiring (image/build.sh --guest-repo-url):
+# with a URL, the final pacman.conf must carry the signed-repo entry and the
+# repo key must be trusted in the target keyring; without one, no [baguette]
+# entry may leak into the image (the local build repo is unsigned).
+baguette_section="$(sed -n '/^\[baguette\]/,/^\[/p' "${ROOTFS}/etc/pacman.conf" 2>/dev/null || true)"
+if [ -z "${GUEST_REPO_URL}" ]; then
+    if [ -z "${baguette_section}" ]; then
+        pass "no [baguette] entry in guest /etc/pacman.conf (local build)"
+    else
+        fail "no [baguette] entry in guest /etc/pacman.conf (local build; found one)"
+    fi
+else
+    if [ -n "${baguette_section}" ]; then
+        pass "[baguette] entry present in guest /etc/pacman.conf"
+    else
+        fail "[baguette] entry present in guest /etc/pacman.conf"
+    fi
+    if printf '%s\n' "${baguette_section}" \
+       | grep -Eq '^SigLevel[[:space:]]*=[[:space:]]*Required[[:space:]]*$'; then
+        pass "[baguette] SigLevel is 'Required'"
+    else
+        fail "[baguette] SigLevel is 'Required'"
+    fi
+    if printf '%s\n' "${baguette_section}" | grep -Fxq "Server = ${GUEST_REPO_URL}"; then
+        pass "[baguette] Server is ${GUEST_REPO_URL}"
+    else
+        fail "[baguette] Server is ${GUEST_REPO_URL}"
+    fi
+    if [ ! -f "${GUEST_REPO_KEY}" ] || ! command -v gpg >/dev/null; then
+        fail "repo public key readable for keyring check (${GUEST_REPO_KEY}; set GUEST_REPO_KEY / install gpg)"
+    else
+        repo_fpr="$(gpg --batch --with-colons --show-keys "${GUEST_REPO_KEY}" \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+        keyline="$(in_chroot gpg --homedir /etc/pacman.d/gnupg --batch \
+            --with-colons --list-keys "${repo_fpr}" 2>/dev/null | grep '^pub:' || true)"
+        if [ -n "${keyline}" ]; then
+            pass "repo key ${repo_fpr} present in target pacman keyring"
+        else
+            fail "repo key ${repo_fpr} present in target pacman keyring"
+        fi
+        # validity f(ull)/u(ltimate) proves the lsign by the pacman master key
+        case "${keyline}" in
+            pub:f:*|pub:u:*) pass "repo key locally signed (validity: $(printf '%s' "${keyline}" | cut -d: -f2))" ;;
+            *) fail "repo key locally signed (validity: $(printf '%s' "${keyline}" | cut -d: -f2))" ;;
+        esac
+    fi
+fi
 
 # maitred invokes /usr/sbin/useradd by absolute path (usr-merge must satisfy it)
 check "/usr/sbin/useradd resolves and is executable (in chroot)" \

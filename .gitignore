@@ -1,5 +1,12 @@
 out/
 build/
+# keys/: ONLY baguette.pub + README.md are ever committed — block common
+# private-key spellings as a safety net (see keys/README.md)
+keys/*.asc
+keys/*.gpg
+keys/*.key
+keys/*.sec
+keys/secring*
 *.img
 *.img.zst
 *.img.zstd
