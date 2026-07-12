@@ -80,7 +80,7 @@ image first runs `pacman -Sy`:
 3. Image builds on main follow automatically (`workflow_run` chains the
    `image` workflow after every successful packages publish; also weekly
    cron / manual dispatch). They pass
-   `--guest-repo-url https://github.com/OWNER/REPO/releases/download/repo-x86_64`
+   `--guest-repo-url https://github.com/afq984/arch-baguette/releases/download/repo-x86_64`
    so the resulting guests can `pacman -Syu` the baguette packages.
 
 ## Rotation (manual, documented — no expiry to force it)
@@ -94,7 +94,7 @@ image first runs `pacman -Sy`:
    it manually** before their next `-Syu`:
 
    ```sh
-   curl -LO https://github.com/OWNER/REPO/releases/download/repo-x86_64/baguette.pub
+   curl -LO https://github.com/afq984/arch-baguette/releases/download/repo-x86_64/baguette.pub
    sudo pacman-key --add baguette.pub
    sudo pacman-key --lsign-key <new fingerprint>
    ```

@@ -20,8 +20,6 @@ pinned to a reviewed upstream commit.
 - **Single rootless build path** — the same script builds locally without
   root/docker/loop-mounts and in CI.
 
-> Throughout, replace `OWNER/REPO` with the GitHub repository this project
-> is hosted at (CI fills in `${{ github.repository }}` automatically).
 
 ## Install on a Chromebook
 
@@ -30,7 +28,7 @@ since ChromeOS 143; on 147+ the `#crostini-containerless` flag is on by
 default).
 
 1. Download `baguette_arch_rootfs.img.zst` from the
-   [latest release](https://github.com/OWNER/REPO/releases/latest) into the
+   [latest release](https://github.com/afq984/arch-baguette/releases/latest) into the
    ChromeOS **Downloads** folder. (Optional: check it against the published
    `.sha256`; `manifest.txt` lists every package in the image.)
 2. Open crosh (Ctrl+Alt+T) and create + start the VM:
@@ -92,7 +90,7 @@ per-milestone repo to switch.
 ## Adding the [baguette] repo to an existing Arch install
 
 ```sh
-curl -LO https://github.com/OWNER/REPO/releases/download/repo-x86_64/baguette.pub
+curl -LO https://github.com/afq984/arch-baguette/releases/download/repo-x86_64/baguette.pub
 sudo pacman-key --add baguette.pub
 gpg --show-keys baguette.pub          # note the fingerprint, then:
 sudo pacman-key --lsign-key <FINGERPRINT>
@@ -101,7 +99,7 @@ sudo tee -a /etc/pacman.conf <<'EOF'
 
 [baguette]
 SigLevel = Required
-Server = https://github.com/OWNER/REPO/releases/download/repo-x86_64
+Server = https://github.com/afq984/arch-baguette/releases/download/repo-x86_64
 EOF
 
 sudo pacman -Syu baguette-base cros-sommelier cros-garcon cros-wayland \
