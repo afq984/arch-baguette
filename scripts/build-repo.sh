@@ -16,6 +16,29 @@ db_name=baguette
 
 mkdir -p "${out_packages}" "${out_repo}" "${out_sources}"
 
+tmp="$(mktemp -d)"
+trap 'rm -rf "${tmp}"' EXIT
+
+# --- makepkg config: force !debug ---------------------------------------------
+
+# The package set must not depend on the host's makepkg.conf: archlinux:latest
+# (CI) ships `debug` in OPTIONS, so `makepkg --packagelist` advertises a
+# $pkgbase-debug split package — but none is ever produced for these
+# config-only packages (nothing to strip), which broke the repo assembly
+# below. Derive a config that replays the system config (+ drop-ins, exactly
+# as makepkg would) and appends !debug — the last OPTIONS entry wins. Setting
+# MAKEPKG_CONF also skips per-user configs, keeping builds hermetic.
+makepkg_conf="${tmp}/makepkg.conf"
+cat >"${makepkg_conf}" <<'EOF'
+source /etc/makepkg.conf
+for _conf in /etc/makepkg.conf.d/*.conf; do
+    [[ -r ${_conf} ]] && source "${_conf}"
+done
+unset _conf
+OPTIONS+=('!debug')
+EOF
+export MAKEPKG_CONF="${makepkg_conf}"
+
 # --- build all packages -----------------------------------------------------
 
 built_pkgs=()
@@ -60,8 +83,6 @@ repo-add --new "${out_repo}/${db_name}.db.tar.zst" "${repo_pkgs[@]}"
 # Refresh the db into a throwaway dbpath (fakeroot satisfies pacman's root
 # check for -Sy; nothing system-wide is touched) and resolve every package
 # URL out of it. Proves db integrity + package visibility end to end.
-tmp="$(mktemp -d)"
-trap 'rm -rf "${tmp}"' EXIT
 cat >"${tmp}/pacman.conf" <<EOF
 [options]
 Architecture = auto
