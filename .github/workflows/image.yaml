@@ -98,11 +98,13 @@ jobs:
 
       - name: Install host dependencies (apt)
         run: |
+          # makepkg: Debian splits pacman — pacman-key sources
+          # /usr/share/makepkg/util/*.sh, which the makepkg package owns.
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             --no-install-recommends \
-            arch-install-scripts pacman-package-manager archlinux-keyring \
-            zstd btrfs-progs guestfs-tools
+            arch-install-scripts pacman-package-manager makepkg \
+            archlinux-keyring zstd btrfs-progs guestfs-tools
 
       - name: Install btrfs-progs >= 6.8 (static)
         run: |
