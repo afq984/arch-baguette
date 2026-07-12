@@ -111,6 +111,11 @@ fi
 check "in-target pacman keyring populated (pacman-key trustdb)" \
     test -s "${ROOTFS}/etc/pacman.d/gnupg/trustdb.gpg"
 
+# in-guest `pacman -Syu` must function: stock pacman-mirrorlist ships all
+# Server lines commented; the build installs a working one
+check "/etc/pacman.d/mirrorlist has an active Server line" \
+    grep -Eq '^Server[[:space:]]*=' "${ROOTFS}/etc/pacman.d/mirrorlist"
+
 # maitred invokes /usr/sbin/useradd by absolute path (usr-merge must satisfy it)
 check "/usr/sbin/useradd resolves and is executable (in chroot)" \
     in_chroot test -x /usr/sbin/useradd
@@ -238,6 +243,32 @@ else
         pass "sudoers has no %wheel grant"
     fi
     check "sudoers config parses (visudo -c in chroot)" in_chroot visudo -c
+fi
+# /etc/sudoers.d itself must keep the sudo package's 0750 (baguette-base
+# 0.1.0-1 shipped it 0755 -> pacman "directory permissions differ" warning)
+if [ "${SKIP_BAGUETTE}" -eq 1 ]; then
+    skip "/etc/sudoers.d directory mode is 0750 (--skip-baguette-repo)"
+else
+    sudoersd_mode="$(stat -c %a "${ROOTFS}/etc/sudoers.d" 2>/dev/null)"
+    if [ "${sudoersd_mode}" = "750" ]; then
+        pass "/etc/sudoers.d directory mode is 0750"
+    else
+        fail "/etc/sudoers.d directory mode is 0750 (got: ${sudoersd_mode:-missing})"
+    fi
+fi
+
+# sftp-server shim: maitred/garcon use the Debian path /usr/lib/openssh/
+# sftp-server; Arch's openssh ships /usr/lib/ssh/sftp-server. baguette-base
+# >= 0.1.0-2 ships a relative symlink that must RESOLVE with openssh installed.
+if [ "${SKIP_BAGUETTE}" -eq 1 ]; then
+    skip "/usr/lib/openssh/sftp-server shim resolves (--skip-baguette-repo)"
+else
+    if [ -L "${ROOTFS}/usr/lib/openssh/sftp-server" ] \
+       && in_chroot test -x /usr/lib/openssh/sftp-server; then
+        pass "/usr/lib/openssh/sftp-server shim resolves (-> $(readlink "${ROOTFS}/usr/lib/openssh/sftp-server"))"
+    else
+        fail "/usr/lib/openssh/sftp-server shim resolves (got: $(readlink "${ROOTFS}/usr/lib/openssh/sftp-server" 2>/dev/null || echo '<missing>'))"
+    fi
 fi
 
 # /mnt layout (replicates official image exactly)

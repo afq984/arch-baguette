@@ -280,6 +280,14 @@ as_root rm -f "${ROOTFS}/configure-rootfs.sh"
 # manage /run/resolv.conf at runtime).
 as_root ln -sfnT /run/resolv.conf "${ROOTFS}/etc/resolv.conf"
 
+# Working in-guest mirrorlist so `pacman -Syu` functions after first boot —
+# the stock pacman-mirrorlist package ships every Server line commented out.
+# Reuse the exact server list the build itself used.
+# TODO(phase D): also configure the [baguette] repo in the guest's
+# /etc/pacman.conf once the CI-hosted repo has a public URL + signing key
+# (until then guest updates cover core/extra only).
+as_root install -m644 "${WORKDIR}/mirrorlist" "${ROOTFS}/etc/pacman.d/mirrorlist"
+
 # ---------------------------------------------------------------------------
 # [6/9] Enable units via presets
 # ---------------------------------------------------------------------------
