@@ -1,0 +1,4 @@
+# Members of the sudo group (granted by ChromeOS via maitred SetUpUser) may
+# run anything without a password, matching the official Baguette image.
+# Deliberately no %wheel grant: sudo access is controlled by the host.
+%sudo	ALL=(ALL:ALL) NOPASSWD: ALL

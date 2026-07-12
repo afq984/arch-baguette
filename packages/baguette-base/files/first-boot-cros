@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Arch adaptation of the official Baguette first-boot script
+# (platform2/vm_tools/baguette_image/src/data/usr/local/bin/first-boot-cros).
+#
+# Grows the root filesystem to the full disk concierge allocated, then
+# regenerates the ssh host keys so every VM instance gets unique keys.
+# Errors fail loud (no blanket `|| true`): the unit logs to journal+console.
+set -euo pipefail
+
+btrfs filesystem resize max /
+sync
+
+# The image is built without ssh host keys; `-f` keeps the rm idempotent
+# when there is nothing to delete. Debian runs `dpkg-reconfigure
+# openssh-server` here; `ssh-keygen -A` is the Arch equivalent, run only if
+# openssh is actually installed.
+rm -fv /etc/ssh/ssh_host_*
+if command -v ssh-keygen >/dev/null; then
+  ssh-keygen -A
+fi
+sync

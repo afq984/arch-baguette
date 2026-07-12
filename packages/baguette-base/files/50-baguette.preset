@@ -1,0 +1,10 @@
+# Units the Baguette image must have enabled. The image build applies this
+# with `systemctl --root=<rootfs> preset-all`; installing baguette-base on a
+# running system does NOT enable anything by itself (no install scriptlets).
+enable opt-google-cros\x2dcontainers.mount
+enable maitred.service
+enable vshd.service
+enable first-boot-cros.service
+enable cros-port-listener.service
+enable dbus.service
+enable systemd-timesyncd.service

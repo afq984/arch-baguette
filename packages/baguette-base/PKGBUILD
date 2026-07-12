@@ -1,0 +1,91 @@
+# Maintainer: arch-baguette-v2 authors <afg984@gmail.com>
+#
+# ChromeOS Baguette guest glue. Content parity source of truth:
+# platform2/vm_tools/baguette_image/src/data/ (official Debian image data).
+# Files are byte-identical to the official ones except where noted:
+#   - first-boot-cros{,.service}: /usr/local/bin -> /usr/lib/baguette,
+#     dpkg-reconfigure openssh-server -> ssh-keygen -A, fail-loud semantics.
+#   - update-cros-list{,.service} is NOT ported: it rewrites the apt
+#     sources.list milestone, which has no pacman equivalent (repo updates
+#     come via pacman -Syu of the [baguette] repo instead).
+#
+# namcap waivers:
+#   - "E: File referenced in $startdir": all sources live in files/ next to
+#     this PKGBUILD (mandated repo layout); makepkg's source=() cannot
+#     reference files in a subdirectory, so package() reads $startdir/files
+#     directly. The files are versioned in the same repository as the
+#     PKGBUILD, so there is no integrity gap.
+#   - "W: Directory ... is empty" (/mnt/chromeos/fonts, /mnt/shared,
+#     /opt/google/cros-containers): deliberate mountpoints, must exist for
+#     read-only-rootfs boots and for maitred's virtiofs font mount.
+#   - "W: File (mnt/...) exists in a non-standard directory": the ChromeOS
+#     /mnt layout is the whole point; replicates the official image.
+#   - "W: File (etc/sudoers.d/10-baguette) does not have the world readable
+#     bit set": sudoers files must be 0440 (visudo-validated).
+#   - "W: Dependency included, but may not be needed" (btrfs-progs, sudo,
+#     systemd): runtime requirements of the shipped files (btrfs resize in
+#     first-boot-cros, sudoers.d drop-in, unit/sysusers/preset dirs),
+#     invisible to namcap's static analysis.
+
+pkgname=baguette-base
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='ChromeOS Baguette guest integration glue (maitred/vshd units, contract groups, sudoers, /mnt layout)'
+arch=('any')
+url='https://chromium.googlesource.com/chromiumos/platform2/+/HEAD/vm_tools/baguette_image/'
+license=('BSD-3-Clause')
+depends=('bash' 'btrfs-progs' 'sudo' 'systemd')
+backup=('etc/maitred/50-mount-fonts.textproto'
+        'etc/profile.d/10-baguette-envs.sh'
+        'etc/sudoers.d/10-baguette')
+# All sources live in files/ next to this PKGBUILD, versioned in the same
+# repository. makepkg's source=() cannot reference files in a subdirectory
+# (local entries are resolved by basename against $startdir), so package()
+# installs straight from $startdir/files; integrity is guaranteed by the
+# repo VCS, which is the source of truth these checksums would be made from.
+
+package() {
+  cd "$startdir/files"
+
+  # systemd system units (vendor dir). The mount unit's on-disk name contains
+  # a literal backslash: systemd escapes the '-' in /opt/google/cros-containers
+  # as \x2d.
+  install -Dm644 maitred.service vshd.service first-boot-cros.service \
+    -t "$pkgdir/usr/lib/systemd/system/"
+  install -Dm644 opt-google-cros-containers.mount \
+    "$pkgdir"'/usr/lib/systemd/system/opt-google-cros\x2dcontainers.mount'
+
+  # Preset enabling every unit the image needs; applied by the image build
+  # via `systemctl --root=<rootfs> preset-all`.
+  install -Dm644 50-baguette.preset \
+    -t "$pkgdir/usr/lib/systemd/system-preset/"
+
+  # First-boot helper (btrfs grow + ssh host key regeneration).
+  install -Dm755 first-boot-cros "$pkgdir/usr/lib/baguette/first-boot-cros"
+
+  # maitred config is read from /etc (matches the official image).
+  install -Dm644 50-mount-fonts.textproto -t "$pkgdir/etc/maitred/"
+
+  # Login environment (DBUS/XDG/USER + sommelier wait loop).
+  install -Dm644 10-baguette-envs.sh -t "$pkgdir/etc/profile.d/"
+
+  # Forward journal to console so `vmc start` shows boot logs.
+  install -Dm644 50-console.conf -t "$pkgdir/usr/lib/systemd/journald.conf.d/"
+
+  # Contract groups maitred's SetUpUser requires (floppy netdev plugdev sudo tss).
+  install -Dm644 baguette.sysusers "$pkgdir/usr/lib/sysusers.d/baguette.conf"
+
+  # Passwordless sudo for the host-managed sudo group only.
+  install -Dm440 10-baguette.sudoers "$pkgdir/etc/sudoers.d/10-baguette"
+
+  # Mountpoints and ChromeOS /mnt layout:
+  #   /opt/google/cros-containers  <- host cros-vm-tools image (mount unit)
+  #   /mnt/chromeos/fonts          <- virtiofs fonts (maitred textproto)
+  #   /mnt/shared                  <- host shared files
+  #   /mnt/chromeos/shared         -> /mnt/shared (Crostini-compat alias)
+  install -dm755 "$pkgdir/mnt/chromeos/fonts" "$pkgdir/mnt/shared" \
+    "$pkgdir/opt/google/cros-containers"
+  ln -s /mnt/shared "$pkgdir/mnt/chromeos/shared"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

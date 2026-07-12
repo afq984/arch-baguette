@@ -1,0 +1,10 @@
+# Groups maitred's SetUpUser contract requires beyond the Arch defaults.
+# The host requests: audio cdrom dialout disk floppy kvm netdev plugdev sudo
+# tss video; Arch's systemd sysusers already provides audio cdrom dialout
+# disk kvm video. `g` lines are idempotent, so tss coexisting with tpm2-tss
+# (which also creates it) is fine.
+g floppy -
+g netdev -
+g plugdev -
+g sudo -
+g tss -

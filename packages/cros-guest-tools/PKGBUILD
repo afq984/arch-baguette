@@ -1,0 +1,154 @@
+# Maintainer: arch-baguette-v2 authors <afg984@gmail.com>
+#
+# ChromeOS guest tools for Baguette VMs, split-packaged to mirror the
+# upstream Debian package set (see each */BUILD in the source tree).
+# All heavy binaries live on the host-mounted cros-vm-tools filesystem at
+# /opt/google/cros-containers; these packages ship only unit files, config
+# and symlinks, so they are arch=('any') and track the host milestone
+# automatically.
+#
+# The upstream commit is pinned; bump _commit (and let pkgver() recompute)
+# to uprev. sha256sums=('SKIP') is required for git sources: the full commit
+# SHA in the fragment is the integrity pin.
+#
+# Differences from upstream Debian packaging, on purpose:
+#   - cros-sommelier ships /usr/bin/sommelier{,.elf} as plain symlinks and
+#     the default.target.wants links for sommelier@0/1 + sommelier-x@0/1
+#     directly (upstream splits those into cros-sommelier-config's postinst
+#     and update-alternatives; pacman packages must not rely on scriptlets).
+#   - Debian /etc/skel and package-manager integration files are not shipped:
+#     skel.sommelierrc, skel.weston.ini, skel.cros-garcon.conf,
+#     cros-garcon-override.conf (apt/PackageKit config),
+#     garcon-{packagekit,synaptic} polkit rules — apt/synaptic/PackageKit do
+#     not exist on Arch and user dotfiles are provisioned by maitred SetUpUser
+#     from a pristine /etc/skel.
+#
+# namcap waivers:
+#   - cros-sommelier "E: Symlink (usr/bin/sommelier{,.elf}) points to
+#     non-existing /opt/google/cros-containers/bin/...": intentionally
+#     dangling; the target is the host-mounted cros-vm-tools filesystem,
+#     mounted at runtime by baguette-base's mount unit.
+#   - "W: Dependency included, but may not be needed" (systemd, dbus,
+#     xorg-xauth, xxd): runtime requirements of the shipped unit files
+#     (udev/systemd dirs, dbus activation, xauth/xxd in sommelier-x@
+#     ExecStart), invisible to namcap's static analysis.
+
+pkgbase=cros-guest-tools
+pkgname=(cros-sommelier cros-garcon cros-wayland cros-port-listener
+         cros-notificationd)
+_commit=072b588ae6b9ea8d05fde6b4795d0c2a32a060e4
+pkgver=20260508.r496.g072b588
+pkgrel=1
+pkgdesc='ChromeOS integration for Baguette/Crostini VM guests'
+arch=('any')
+url='https://chromium.googlesource.com/chromiumos/containers/cros-container-guest-tools'
+license=('BSD-3-Clause')
+# Besides git, mirror every split package's depends here so makepkg's
+# build-time dependency check covers them (namcap: "Split PKGBUILD needs
+# additional makedepends to work properly").
+makedepends=('git' 'bash' 'dbus' 'systemd' 'xorg-xauth' 'xxd')
+source=("cros-container-guest-tools::git+${url}#commit=${_commit}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd cros-container-guest-tools
+  printf '%s.r%s.g%s' \
+    "$(git log -1 --format=%cd --date=format:%Y%m%d)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short=7 HEAD)"
+}
+
+package_cros-sommelier() {
+  pkgdesc='Sommelier Wayland proxy integration for ChromeOS VM guests'
+  depends=('bash' 'systemd' 'xorg-xauth' 'xxd')
+  optdepends=('xorg-xdpyinfo: Xft.dpi HiDPI detection in sommelierrc'
+              'xorg-xrdb: Xft.dpi HiDPI detection in sommelierrc'
+              'xorg-xsetroot: default left_ptr cursor in sommelierrc'
+              'xorg-xwayland: X11 application support')
+  backup=('etc/sommelierrc' 'etc/profile.d/sommelier.sh')
+  cd cros-container-guest-tools
+
+  install -Dm644 'cros-sommelier/sommelier@.service' \
+    'cros-sommelier/sommelier-x@.service' -t "$pkgdir/usr/lib/systemd/user/"
+  install -Dm644 cros-sommelier/sommelier.sh -t "$pkgdir/etc/profile.d/"
+  install -Dm644 cros-sommelier/sommelierrc "$pkgdir/etc/sommelierrc"
+
+  # The real sommelier lives on the host-mounted cros-vm-tools filesystem.
+  install -dm755 "$pkgdir/usr/bin"
+  ln -s /opt/google/cros-containers/bin/sommelier "$pkgdir/usr/bin/sommelier"
+  ln -s /opt/google/cros-containers/bin/sommelier.elf \
+    "$pkgdir/usr/bin/sommelier.elf"
+
+  # Enable wayland + X11 proxies for the default (@0) and low-density (@1)
+  # displays in every user session (upstream cros-sommelier-config postinst).
+  install -dm755 "$pkgdir/usr/lib/systemd/user/default.target.wants"
+  local i
+  for i in 0 1; do
+    ln -s '../sommelier@.service' \
+      "$pkgdir/usr/lib/systemd/user/default.target.wants/sommelier@${i}.service"
+    ln -s '../sommelier-x@.service' \
+      "$pkgdir/usr/lib/systemd/user/default.target.wants/sommelier-x@${i}.service"
+  done
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
+
+package_cros-garcon() {
+  pkgdesc='Garcon bridge integration (app/URL forwarding) for ChromeOS VM guests'
+  depends=('bash' 'systemd')
+  cd cros-container-guest-tools
+
+  install -Dm755 cros-garcon/garcon-url-handler \
+    cros-garcon/garcon-terminal-handler -t "$pkgdir/usr/bin/"
+  install -Dm644 cros-garcon/garcon_host_browser.desktop \
+    -t "$pkgdir/usr/share/applications/"
+  install -Dm644 cros-garcon/cros-garcon.service \
+    -t "$pkgdir/usr/lib/systemd/user/"
+
+  # Enabled in every user session (upstream ships this same wants-symlink).
+  install -dm755 "$pkgdir/usr/lib/systemd/user/default.target.wants"
+  ln -s ../cros-garcon.service \
+    "$pkgdir/usr/lib/systemd/user/default.target.wants/cros-garcon.service"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
+
+package_cros-wayland() {
+  pkgdesc='Virtwl device udev rules for ChromeOS VM guests'
+  depends=('systemd')
+  cd cros-container-guest-tools
+
+  install -Dm644 cros-wayland/10-cros-virtwl.rules \
+    -t "$pkgdir/usr/lib/udev/rules.d/"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
+
+package_cros-port-listener() {
+  pkgdesc='Port forwarding listener for ChromeOS VM guests'
+  depends=('systemd')
+  cd cros-container-guest-tools
+
+  install -Dm644 cros-port-listener/10-cros-port-listener.rules \
+    -t "$pkgdir/usr/lib/udev/rules.d/"
+  install -Dm644 cros-port-listener/cros-port-listener.service \
+    -t "$pkgdir/usr/lib/systemd/system/"
+  # Enablement comes from baguette-base's 50-baguette.preset (applied at
+  # image build time), not from an install scriptlet.
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
+
+package_cros-notificationd() {
+  pkgdesc='Desktop notification forwarding to the ChromeOS UI'
+  depends=('dbus' 'systemd')
+  cd cros-container-guest-tools
+
+  install -Dm644 cros-notificationd/cros-notificationd.service \
+    -t "$pkgdir/usr/lib/systemd/user/"
+  # D-Bus activated (org.freedesktop.Notifications); no wants-symlink.
+  install -Dm644 cros-notificationd/org.freedesktop.Notifications.service \
+    -t "$pkgdir/usr/share/dbus-1/services/"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
