@@ -1,0 +1,9 @@
+out/
+build/
+*.img
+*.img.zst
+*.img.zstd
+*.pkg.tar.*
+packages/*/src/
+packages/*/pkg/
+packages/*/*.log
