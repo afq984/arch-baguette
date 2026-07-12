@@ -45,9 +45,13 @@ These were established experimentally on this machine (see
 - maitred `SetUpUser` **hard-rejects** the request if any host-requested group
   is missing (`getgrnam` check). The host requests the Debian group set:
   `audio cdrom dialout disk floppy kvm netdev plugdev sudo tss video`.
-  Arch's systemd sysusers provides `audio cdrom dialout disk kvm video`;
-  the image must additionally provide `floppy netdev plugdev sudo tss`
-  (tss normally arrives via tpm2-tss; do not rely on it silently — assert it).
+  Verified on a real pacstrapped rootfs (2026-07): Arch provides
+  `audio disk kvm video` (systemd) and `floppy` (gid 94, filesystem pkg's
+  arch.conf) — it does NOT provide `cdrom`/`dialout` (Arch uses
+  `optical`/`uucp` instead). baguette-base sysusers must therefore add
+  `cdrom dialout netdev plugdev sudo tss` and must NOT redeclare `floppy`
+  (conflicts with arch.conf's gid 94). tss also arrives via tpm2-tss;
+  the duplicate `g tss` is idempotent. Assert all 11 in tests.
 - maitred invokes `/usr/sbin/useradd` by absolute path; Arch's usr-merge
   symlink (`/usr/sbin` → `bin`) satisfies it. Assert in tests.
 - Official image `/mnt` layout (replicate exactly): real dirs

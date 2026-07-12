@@ -1,0 +1,33 @@
+# pacman.conf template consumed by image/build.sh (NOT a drop-in config).
+#
+# build.sh substitutes the @TOKENS@ below and, with --skip-baguette-repo,
+# deletes the block between the BEGIN/END baguette markers.
+#
+# Security posture (DESIGN.md): core/extra keep full signature verification
+# against a build-local keyring populated from the host's archlinux keyring;
+# only the local [baguette] file:// repo is unsigned (CI signing is phase D).
+# Never weaken core/extra SigLevel.
+
+[options]
+Architecture = auto
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+ParallelDownloads = 5
+HoldPkg = pacman glibc
+GPGDir = @GPGDIR@
+# NOTE: pacstrap ignores CacheDir from -C configs (only -P honors it); the
+# cache is seeded/evacuated around pacstrap by build.sh (hardlink trick).
+# CacheDir is still set so direct `pacman -C <this>` invocations behave.
+CacheDir = @CACHEDIR@
+
+[core]
+Include = @MIRRORLIST@
+
+[extra]
+Include = @MIRRORLIST@
+
+# BEGIN baguette repo (removed by build.sh --skip-baguette-repo)
+[baguette]
+SigLevel = Optional TrustAll
+Server = file://@BAGUETTE_REPO@
+# END baguette repo
