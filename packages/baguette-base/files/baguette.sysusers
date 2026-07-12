@@ -1,9 +1,12 @@
-# Groups maitred's SetUpUser contract requires beyond the Arch defaults.
-# The host requests: audio cdrom dialout disk floppy kvm netdev plugdev sudo
-# tss video; Arch's systemd sysusers already provides audio cdrom dialout
-# disk kvm video. `g` lines are idempotent, so tss coexisting with tpm2-tss
-# (which also creates it) is fine.
-g floppy -
+# Groups maitred's SetUpUser contract requires beyond what an Arch rootfs
+# provides. The host requests: audio cdrom dialout disk floppy kvm netdev
+# plugdev sudo tss video. Arch ships audio/disk/kvm/video (systemd sysusers)
+# and floppy (gid 94, filesystem pkg's arch.conf — do not redeclare it here
+# or systemd-sysusers logs a conflict warning); it does NOT provide
+# cdrom/dialout (Arch uses optical/uucp instead). `g` lines are idempotent,
+# so tss coexisting with tpm2-tss (which also creates it) is fine.
+g cdrom -
+g dialout -
 g netdev -
 g plugdev -
 g sudo -

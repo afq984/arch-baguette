@@ -21,7 +21,11 @@
 #   - "W: File (mnt/...) exists in a non-standard directory": the ChromeOS
 #     /mnt layout is the whole point; replicates the official image.
 #   - "W: File (etc/sudoers.d/10-baguette) does not have the world readable
-#     bit set": sudoers files must be 0440 (visudo-validated).
+#     bit set" (and the 0750 sudoers.d dir): sudoers files must be 0440 and
+#     /etc/sudoers.d is 0750 upstream (visudo-validated).
+#   - "E: Symlink (usr/lib/openssh/sftp-server) points to non-existing
+#     ../ssh/sftp-server": Debian-path compat shim, dangling until openssh
+#     is installed (the image always installs openssh).
 #   - "W: Dependency included, but may not be needed" (btrfs-progs, sudo,
 #     systemd): runtime requirements of the shipped files (btrfs resize in
 #     first-boot-cros, sudoers.d drop-in, unit/sysusers/preset dirs),
@@ -29,7 +33,7 @@
 
 pkgname=baguette-base
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='ChromeOS Baguette guest integration glue (maitred/vshd units, contract groups, sudoers, /mnt layout)'
 arch=('any')
 url='https://chromium.googlesource.com/chromiumos/platform2/+/HEAD/vm_tools/baguette_image/'
@@ -72,11 +76,23 @@ package() {
   # Forward journal to console so `vmc start` shows boot logs.
   install -Dm644 50-console.conf -t "$pkgdir/usr/lib/systemd/journald.conf.d/"
 
-  # Contract groups maitred's SetUpUser requires (floppy netdev plugdev sudo tss).
+  # Contract groups maitred's SetUpUser requires beyond the Arch defaults
+  # (cdrom dialout netdev plugdev sudo tss; floppy already comes from the
+  # filesystem package's arch.conf).
   install -Dm644 baguette.sysusers "$pkgdir/usr/lib/sysusers.d/baguette.conf"
 
-  # Passwordless sudo for the host-managed sudo group only.
-  install -Dm440 10-baguette.sudoers "$pkgdir/etc/sudoers.d/10-baguette"
+  # Passwordless sudo for the host-managed sudo group only. /etc/sudoers.d
+  # is 0750 in the sudo/filesystem packages; match it so pacman does not
+  # warn "directory permissions differ".
+  install -dm750 "$pkgdir/etc/sudoers.d"
+  install -m440 10-baguette.sudoers "$pkgdir/etc/sudoers.d/10-baguette"
+
+  # Debian-path compat shim: ChromeOS file-sharing tooling may hardcode
+  # Debian's sftp-server location (the legacy arch-baguette script and the
+  # proven dev-workflow image both shipped it). Dangling until openssh is
+  # installed; the image always installs openssh.
+  install -dm755 "$pkgdir/usr/lib/openssh"
+  ln -s ../ssh/sftp-server "$pkgdir/usr/lib/openssh/sftp-server"
 
   # Mountpoints and ChromeOS /mnt layout:
   #   /opt/google/cros-containers  <- host cros-vm-tools image (mount unit)

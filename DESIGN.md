@@ -129,8 +129,9 @@ Debian data files) and the units written inline by
   Arch paths.
 - `/etc/maitred/50-mount-fonts.textproto` (maitred config is read from /etc —
   exception to the vendor-dir rule, matches official).
-- `sysusers.d/baguette.conf`: `g floppy`, `g netdev`, `g plugdev`, `g sudo`,
-  `g tss` (idempotent if tpm2-tss also creates it).
+- `sysusers.d/baguette.conf`: `g cdrom`, `g dialout`, `g netdev`, `g plugdev`,
+  `g sudo`, `g tss` (idempotent if tpm2-tss also creates it). No `floppy` —
+  Arch's filesystem package already provides it (gid 94).
 - `sudoers.d/10-baguette`: `%sudo ALL=(ALL:ALL) NOPASSWD: ALL` **only**
   (no %wheel grant), mode 0440, in `/etc/sudoers.d/`.
 - journald drop-in `ForwardToConsole=yes`

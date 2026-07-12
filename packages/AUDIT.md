@@ -9,7 +9,7 @@ Comparison of the union of files installed by the six built packages against
   (cros-container-guest-tools main HEAD at implementation time,
   pkgver `20260508.r496.g072b588`).
 - Audited artifacts: `tar -tvf` of all `out/packages/*.pkg.tar.zst`
-  (baguette-base 0.1.0-1, cros-{sommelier,garcon,wayland,port-listener,notificationd}
+  (baguette-base 0.1.0-2, cros-{sommelier,garcon,wayland,port-listener,notificationd}
   20260508.r496.g072b588-1).
 - "byte-identical" below was verified with `diff`/`cmp` against the parity
   source file.
@@ -30,7 +30,7 @@ Comparison of the union of files installed by the six built packages against
 | `usr/local/bin/update-cros-list` | — | — | dropped: rewrites the apt `cros.list` milestone; no pacman equivalent (repo updates arrive via `pacman -Syu`, DESIGN "milestone matching") |
 | `usr/local/lib/systemd/system/update-cros-list.service` | — | — | dropped: see above |
 | `setup_in_guest.sh`: mkdir `/mnt/chromeos/fonts`, `/mnt/shared`; `ln -s /mnt/shared /mnt/chromeos(/shared)`; mountpoint `/opt/google/cros-containers` | baguette-base | same paths | shipped in the package tar as empty dirs + symlink `/mnt/chromeos/shared → /mnt/shared` (verified present in `tar -tvf`) |
-| `setup_in_guest.sh`: groups via Debian defaults (host requests audio cdrom dialout disk floppy kvm netdev plugdev sudo tss video) | baguette-base | `/usr/lib/sysusers.d/baguette.conf` | `g floppy/netdev/plugdev/sudo/tss` (Arch already ships the rest); applied with `systemd-sysusers --root` in test: all 5 created |
+| `setup_in_guest.sh`: groups via Debian defaults (host requests audio cdrom dialout disk floppy kvm netdev plugdev sudo tss video) | baguette-base | `/usr/lib/sysusers.d/baguette.conf` | `g cdrom/dialout/netdev/plugdev/sudo/tss`. Verified on a real pacstrapped rootfs: Arch ships audio/disk/kvm/video (systemd) and floppy (gid 94, filesystem pkg's arch.conf) but NOT cdrom/dialout (Arch uses optical/uucp). floppy deliberately not redeclared (sysusers conflict warning against arch.conf). `systemd-sysusers --root` test alongside arch.conf: all 6 created, floppy from arch.conf, zero conflict warnings |
 | `setup_in_guest.sh`: `systemctl enable maitred update-cros-list vshd opt-google-cros\x2dcontainers.mount first-boot-cros` | baguette-base | `/usr/lib/systemd/system-preset/50-baguette.preset` | preset lists mount, maitred, vshd, first-boot-cros, cros-port-listener, dbus, systemd-timesyncd (update-cros-list dropped, see above). `systemctl --root preset-all` verified: all four shipped units enabled, incl. the `\x2d` mount unit |
 
 Debian `CROS_PACKAGES` not ported: `baguette-motd` (cosmetic MOTD),
@@ -75,11 +75,14 @@ shipped — defaults from the unit files apply).
 Old-script items outside steps 6–8 that touch the same ground (for
 completeness): `groupadd` loop → sysusers.d (table A); `/usr/sbin/usermod`
 symlink → unnecessary on Arch (usr-merge `/usr/sbin → bin` provides it,
-DESIGN "verified facts"); `/usr/lib/openssh/sftp-server` symlink → dropped
-(only Debian's cros-sftp references that path; cros-sftp is not part of the
-Baguette package set); user creation/chpasswd/linger → runtime job of maitred
-`SetUpUser` (or `image/build.sh --dev-user`); hostname/hosts/locale/
-machine-id/pacman-key/resolv.conf → image build scope.
+DESIGN "verified facts"); `/usr/lib/openssh/sftp-server` → shipped by
+baguette-base as relative symlink `../ssh/sftp-server` (Debian-path compat:
+ChromeOS file-sharing tooling may hardcode the Debian sftp-server location;
+the legacy script and the proven dev-workflow image both included it;
+dangling until openssh is installed, and the image always installs openssh);
+user creation/chpasswd/linger → runtime job of maitred `SetUpUser` (or
+`image/build.sh --dev-user`); hostname/hosts/locale/machine-id/pacman-key/
+resolv.conf → image build scope.
 
 ## C. Upstream guest-tools files deliberately not shipped
 
@@ -100,9 +103,16 @@ machine-id/pacman-key/resolv.conf → image build scope.
   waivers documented at the top of each PKGBUILD (dangling `/opt/google/...`
   symlinks by design, deliberate empty mountpoint dirs and `/mnt` layout,
   sudoers 0440, runtime-only deps, `$startdir` for the `files/` layout).
-- sudoers: `visudo -c -f` → "parsed OK"; mode in tar `-r--r-----`.
-- sysusers: `systemd-sysusers --root=<extracted pkg>` created
-  floppy/netdev/plugdev/sudo/tss.
+- sudoers: `visudo -c -f` → "parsed OK"; mode in tar `-r--r-----`; the
+  `/etc/sudoers.d/` directory itself is 0750 in the tar (`drwxr-x---`),
+  matching the sudo/filesystem packages so pacman emits no
+  "directory permissions differ" warning.
+- sysusers: `systemd-sysusers --root=<extracted pkg>` with Arch's
+  `arch.conf` alongside created cdrom/dialout/netdev/plugdev/sudo/tss
+  (floppy provided by arch.conf at gid 94) with zero conflict warnings.
+- sftp compat shim: `usr/lib/openssh/sftp-server -> ../ssh/sftp-server`
+  present in tar (intentionally dangling until openssh is installed —
+  namcap waiver).
 - preset: `systemctl --root=<extracted pkg> preset-all` enabled
   `opt-google-cros\x2dcontainers.mount` (backslash name matches — verified),
   maitred, vshd, first-boot-cros.
