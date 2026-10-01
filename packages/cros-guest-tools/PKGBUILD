@@ -36,8 +36,8 @@
 pkgbase=cros-guest-tools
 pkgname=(cros-sommelier cros-garcon cros-wayland cros-port-listener
          cros-notificationd)
-_commit=072b588ae6b9ea8d05fde6b4795d0c2a32a060e4
-pkgver=20260508.r496.g072b588
+_commit=191fb50e62aa90a92aaf42e51944df4740900596
+pkgver=20260930.r501.g191fb50
 pkgrel=1
 pkgdesc='ChromeOS integration for Baguette/Crostini VM guests'
 arch=('any')
