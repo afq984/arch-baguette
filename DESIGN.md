@@ -122,11 +122,13 @@ Debian data files) and the units written inline by
 `/home/r/baguette/arch-baguette/build-arch-baguette.sh`. Ships:
 
 - `maitred.service`, `vshd.service`, `opt-google-cros\x2dcontainers.mount`
-  (What=LABEL=cros-vm-tools, ro), `first-boot-cros.service` +
-  `/usr/lib/baguette/first-boot-cros` script (btrfs resize max /, regenerate
-  ssh host keys **without** `|| true` blanket — fail loud, but ssh-keygen only
-  if openssh present), all byte-equivalent to official semantics adapted to
-  Arch paths.
+  (What=LABEL=cros-vm-tools, ro), `first-boot-cros.service` (ordered
+  `Before=maitred.service`, self-disables via `systemctl --no-reload disable`)
+  + `/usr/lib/baguette/first-boot-cros` script (`btrfs filesystem resize max /`
+  + `rm -fv /etc/ssh/ssh_host_*` **without** `|| true` blanket — fail loud;
+  omits full-system `sync` and eager `ssh-keygen -A`, relying on Arch's
+  `sshdgenkeys.service` on demand if `sshd` is enabled so first boot finishes
+  before `maitred`'s 20 s `SetUpUser` deadline), adapted to Arch paths.
 - `/etc/maitred/50-mount-fonts.textproto` (maitred config is read from /etc —
   exception to the vendor-dir rule, matches official).
 - `sysusers.d/baguette.conf`: `g cdrom`, `g dialout`, `g netdev`, `g plugdev`,
@@ -203,7 +205,11 @@ this repo. Requirements:
 - `image/tests/verify-rootfs.sh <rootfs-dir>`: userns-chroot asserts —
   all 11 contract groups resolve; `/usr/sbin/useradd` resolves; enabled units
   (system + user wants-symlinks) present; `/etc/machine-id` empty; no
-  `ssh_host_*`; no passwd entries uid ≥ 1000 (unless --dev-user build);
+  `ssh_host_*` (`sshd.service` + `sshdgenkeys.service` disabled by default,
+  `sshdgenkeys.service` present for on-demand host key generation);
+  `first-boot-cros` grows `/` and scrubs `ssh_host_*` without `ssh-keygen` or
+  `sync`, ordered `Before=maitred.service` with `--no-reload` self-disable;
+  no passwd entries uid ≥ 1000 (unless --dev-user build);
   sudoers file mode 0440 & visudo-parses; `/mnt` layout; empty pacman cache;
   profile.d files present; sommelier symlinks dangling-but-correct.
 - `image/tests/verify-image.sh <img>`: btrfs check; default subvol is

@@ -9,7 +9,7 @@ Comparison of the union of files installed by the six built packages against
   (cros-container-guest-tools main HEAD at implementation time,
   pkgver `20260508.r496.g072b588`).
 - Audited artifacts: `tar -tvf` of all `out/packages/*.pkg.tar.zst`
-  (baguette-base 0.1.0-2, cros-{sommelier,garcon,wayland,port-listener,notificationd}
+  (baguette-base 0.1.0-3, cros-{sommelier,garcon,wayland,port-listener,notificationd}
   20260508.r496.g072b588-1).
 - "byte-identical" below was verified with `diff`/`cmp` against the parity
   source file.
@@ -21,8 +21,8 @@ Comparison of the union of files installed by the six built packages against
 | `usr/local/lib/systemd/system/maitred.service` | baguette-base | `/usr/lib/systemd/system/maitred.service` | byte-identical (PATH env incl. `/opt/google/cros-containers/bin` kept exactly; `/usr/sbin`,`/sbin`,`/bin` resolve via Arch usr-merge) |
 | `usr/local/lib/systemd/system/vshd.service` | baguette-base | `/usr/lib/systemd/system/vshd.service` | byte-identical |
 | `usr/local/lib/systemd/system/opt-google-cros\x2dcontainers.mount` | baguette-base | `/usr/lib/systemd/system/opt-google-cros\x2dcontainers.mount` | byte-identical (What=LABEL=cros-vm-tools, Options=ro, TimeoutSec=10; literal `\x2d` in filename verified in tar) |
-| `usr/local/lib/systemd/system/first-boot-cros.service` | baguette-base | `/usr/lib/systemd/system/first-boot-cros.service` | adapted: ExecStart → `/usr/lib/baguette/first-boot-cros`; rest identical |
-| `usr/local/bin/first-boot-cros` | baguette-base | `/usr/lib/baguette/first-boot-cros` | adapted: `set -euo pipefail` (fail loud, no `\|\| true`); `dpkg-reconfigure openssh-server` → `ssh-keygen -A` guarded by `command -v`; `rm -fv` so a keyless image doesn't fail; btrfs resize + syncs kept |
+| `usr/local/lib/systemd/system/first-boot-cros.service` | baguette-base | `/usr/lib/systemd/system/first-boot-cros.service` | adapted: ExecStart → `/usr/lib/baguette/first-boot-cros`, `Before=maitred.service`, `systemctl --no-reload disable` (avoids synchronous PID 1 `daemon-reload` during first boot) |
+| `usr/local/bin/first-boot-cros` | baguette-base | `/usr/lib/baguette/first-boot-cros` | adapted: `set -euo pipefail` (fail loud, no `\|\| true`); `btrfs filesystem resize max /` + `rm -fv /etc/ssh/ssh_host_*`; drops full-system `sync` and `dpkg-reconfigure openssh-server` / `ssh-keygen -A` (Arch's `sshdgenkeys.service` generates keys on demand if `sshd` is enabled) |
 | `usr/local/lib/systemd/journald.conf.d/50-console.conf` | baguette-base | `/usr/lib/systemd/journald.conf.d/50-console.conf` | byte-identical (`ForwardToConsole=yes`) |
 | `etc/maitred/50-mount-fonts.textproto` | baguette-base | `/etc/maitred/50-mount-fonts.textproto` | byte-identical, shipped as a plain 0644 file. (Upstream `setup_in_guest.sh` uses `install -t /etc/maitred/50-mount-fonts.textproto`, which actually creates a *directory* of that name — looks like an upstream bug; the old Arch script and we ship a file, and fonts mounting is verified working.) |
 | `etc/profile.d/10-baguette-envs.sh` | baguette-base | `/etc/profile.d/10-baguette-envs.sh` | byte-identical (DBUS/XDG/USER env + sommelier wait loop) |
@@ -62,7 +62,7 @@ shipped — defaults from the unit files apply).
 | `/etc/systemd/system/maitred.service` | baguette-base | `/usr/lib/systemd/system/…` | vendor dir; official PATH restored (old script had inserted `/usr/local/*` entries) |
 | `/etc/systemd/system/vshd.service` | baguette-base | `/usr/lib/systemd/system/…` | vendor dir; byte-identical to official |
 | `/usr/local/bin/first-boot-cros` (with `\|\| true` on every line) | baguette-base | `/usr/lib/baguette/first-boot-cros` | fail-loud rewrite per DESIGN (see table A) |
-| `/etc/systemd/system/first-boot-cros.service` | baguette-base | `/usr/lib/systemd/system/…` | vendor dir; ExecStart path updated |
+| `/etc/systemd/system/first-boot-cros.service` | baguette-base | `/usr/lib/systemd/system/…` | vendor dir; ExecStart path updated, `Before=maitred.service`, `systemctl --no-reload disable` |
 | `/etc/maitred/50-mount-fonts.textproto` | baguette-base | same | byte-identical to official |
 | `/etc/profile.d/10-baguette-envs.sh` (script's `:-`-guarded variant) | baguette-base | same | replaced by the official byte-identical version |
 | `/etc/sudoers.d/10-cros-nopasswd` (`%sudo` **and** `%wheel`) | baguette-base | `/etc/sudoers.d/10-baguette` | `%sudo` only — DESIGN explicitly drops the `%wheel` grant |

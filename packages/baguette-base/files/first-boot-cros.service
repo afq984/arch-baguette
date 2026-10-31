@@ -1,11 +1,19 @@
 [Unit]
 Description=First boot script
+# Complete the online btrfs rootfs grow and self-disable under StartVm's 300 s
+# startup budget before maitred announces VM readiness and starts concierge's
+# tight 20 s SetUpUser gRPC deadline (and before useradd writes to a --shrink
+# rootfs). Pure ordering: once disabled, subsequent boots do not pull this in.
+Before=maitred.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/lib/baguette/first-boot-cros
-ExecStartPost=/usr/bin/systemctl disable first-boot-cros.service
+# --no-reload avoids a synchronous PID 1 daemon-reload (which re-runs system
+# generators and stalled D-Bus/logind SetUserLinger by 40-120 s under CPU
+# contention); unlinking the wants symlink takes effect on the next boot.
+ExecStartPost=/usr/bin/systemctl --no-reload disable first-boot-cros.service
 StandardOutput=journal+console
 StandardError=journal+console
 
