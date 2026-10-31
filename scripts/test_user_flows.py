@@ -699,6 +699,11 @@ def verify_guest_user_identity(
         )
 
 
+def _fmt_rel_t(rel_sec: float) -> str:
+    sign = "+" if rel_sec >= 0.0 else "-"
+    return f"t{sign}{abs(rel_sec):6.1f}s"
+
+
 def classify_initial_terminal_failure(
     initial_buffer: str,
     entries: list[TimelineEntry],
@@ -706,18 +711,17 @@ def classify_initial_terminal_failure(
 ) -> None:
     """Allowlists ONLY the single proven slow-runner initial Terminal timeout; hard-fails everything else.
 
-    Recovery via a fresh Terminal tab is permitted if and only if ALL hold:
-      (a) `initial_buffer.strip()` equals `KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR`:
-          `"Launching vmshell failed: Error starting crostini for terminal: 50 (CONTAINER_SETUP_FAILED)"`.
-      (b) Host concierge/Chrome logs show the exact matching cause for that Terminal launch
-          (`SetUpVmUser` call #2 after `InstallerClosed`):
-            - exactly one `SetUpVmUserFailed` entry, for `call #2`, with `"SetUpUser RPC failed: Deadline Exceeded"`,
-            - exactly one `SetUpBaguetteUserFailed` entry with `"Failed to set up baguette user: Deadline Exceeded"`,
-            - exactly one `RestartCrostiniFailed` entry with
-              `'Failed to restart Crostini with error code: 50, container: (type:6:BAGUETTE vm:"termina" container:"penguin")'`.
-      (c) Using the log timestamps (`rel_sec`) of those failure entries, `SetUpVmUser` call #2 and
-          all three failure log entries occurred after `InstallerClosed` and strictly before
-          the validated `ContainerStarted` signal (and before `ContainerReadyLog` if present).
+    Recovery via a fresh Terminal tab is permitted if and only if ALL hold, using
+    single-clock-domain ordering comparisons (never comparing host `CLOCK_MONOTONIC` UI/D-Bus
+    timestamps directly against ChromeOS VM `CLOCK_REALTIME` log timestamps):
+      (a) `initial_buffer.strip()` equals `KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR`.
+      (b) Host `CLOCK_MONOTONIC` domain (`ui`/`dbus`): `InstallerClosed` occurred strictly
+          before `ContainerStarted` (`ic_rel < container_started_rel_sec`).
+      (c) ChromeOS VM `CLOCK_REALTIME` log domain (`concierge`/`chrome`/`cicerone`):
+          `SetUpVmUser` call #1 started and completed (`SetUpVmUserDone` call #1),
+          `SetUpVmUser` call #2 started at/after call #1 completed, the exact 3 error-50
+          deadline-exceeded log entries occurred at/after call #2 started, and all 3 occurred
+          strictly before `ContainerReadyLog` (`vm_cicerone` container startup completion).
     """
     cleaned_buf = initial_buffer.strip()
     if cleaned_buf != KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR:
@@ -733,8 +737,39 @@ def classify_initial_terminal_failure(
             f"Expected exactly 1 InstallerClosed entry in timeline, found {len(installer_closed)}"
         )
     ic_rel = installer_closed[0].rel_sec
+    if not (ic_rel < container_started_rel_sec):
+        raise RuntimeError(
+            f"InstallerClosed ({_fmt_rel_t(ic_rel)}) did not occur strictly before "
+            f"ContainerStarted ({_fmt_rel_t(container_started_rel_sec)})"
+        )
 
     setup_calls = [e for e in entries if e.source == "concierge" and e.name == "SetUpVmUser"]
+    call1_entries = [e for e in setup_calls if e.detail.startswith("call #1:")]
+    if len(call1_entries) != 1:
+        raise RuntimeError(
+            f"Expected SetUpVmUser call #1 in concierge logs, found {len(call1_entries)} "
+            f"(all SetUpVmUser calls: {setup_calls!r})"
+        )
+    call1_done_entries = [
+        e
+        for e in entries
+        if e.source == "concierge"
+        and e.name == "SetUpVmUserDone"
+        and e.detail.startswith("call #1 ")
+    ]
+    if len(call1_done_entries) != 1:
+        raise RuntimeError(
+            f"Expected SetUpVmUserDone for call #1 in concierge logs, "
+            f"found {len(call1_done_entries)}: {call1_done_entries!r}"
+        )
+    call1_rel = call1_entries[0].rel_sec
+    call1_done_rel = call1_done_entries[0].rel_sec
+    if not (call1_rel <= call1_done_rel):
+        raise RuntimeError(
+            f"SetUpVmUser call #1 completion ({_fmt_rel_t(call1_done_rel)}) preceded "
+            f"call #1 start ({_fmt_rel_t(call1_rel)})"
+        )
+
     call2_entries = [e for e in setup_calls if e.detail.startswith("call #2:")]
     if len(call2_entries) != 1:
         raise RuntimeError(
@@ -742,10 +777,10 @@ def classify_initial_terminal_failure(
             f"found {len(call2_entries)} (all SetUpVmUser calls: {setup_calls!r})"
         )
     call2_rel = call2_entries[0].rel_sec
-    if not (ic_rel <= call2_rel < container_started_rel_sec):
+    if not (call1_done_rel <= call2_rel):
         raise RuntimeError(
-            f"SetUpVmUser call #2 timestamp t+{call2_rel:.1f}s is not between "
-            f"InstallerClosed (t+{ic_rel:.1f}s) and ContainerStarted (t+{container_started_rel_sec:.1f}s)"
+            f"SetUpVmUser call #2 ({_fmt_rel_t(call2_rel)}) did not occur at/after "
+            f"installer SetUpVmUser call #1 completion ({_fmt_rel_t(call1_done_rel)})"
         )
 
     setup_vm_failed = [
@@ -785,19 +820,26 @@ def classify_initial_terminal_failure(
         )
 
     container_ready_logs = [
-        e for e in entries if e.source == "cicerone" and e.name == "ContainerReadyLog"
+        e
+        for e in entries
+        if e.source == "cicerone"
+        and e.name == "ContainerReadyLog"
+        and "container penguin" in e.detail
+        and "VM termina" in e.detail
     ]
-    upper_bound_rel = container_started_rel_sec
-    if container_ready_logs:
-        upper_bound_rel = min(upper_bound_rel, container_ready_logs[0].rel_sec)
+    if len(container_ready_logs) != 1:
+        raise RuntimeError(
+            "Expected exactly 1 cicerone ContainerReadyLog for termina/penguin in VM logs, "
+            f"got: {container_ready_logs!r}"
+        )
+    ready_log_rel = container_ready_logs[0].rel_sec
 
     for fail_entry in (setup_vm_failed[0], baguette_failed[0], restart_failed[0]):
-        if not (ic_rel <= fail_entry.rel_sec < upper_bound_rel):
+        if not (call2_rel <= fail_entry.rel_sec < ready_log_rel):
             raise RuntimeError(
-                f"Failure log {fail_entry.name} at t+{fail_entry.rel_sec:.1f}s did not occur "
-                f"between InstallerClosed (t+{ic_rel:.1f}s) and container readiness "
-                f"(t+{upper_bound_rel:.1f}s / ContainerStarted t+{container_started_rel_sec:.1f}s): "
-                f"{fail_entry!r}"
+                f"Failure log {fail_entry.name} at {_fmt_rel_t(fail_entry.rel_sec)} did not occur "
+                f"between SetUpVmUser call #2 ({_fmt_rel_t(call2_rel)}) and "
+                f"ContainerReadyLog ({_fmt_rel_t(ready_log_rel)}): {fail_entry!r}"
             )
 
 
@@ -1163,6 +1205,18 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
         ci_run2_entries,
         container_started_rel_sec=150.0,
     )
+    # Bug #1 regression check: 1.5s UI poll + host-vs-VM clock offset where InstallerClosed
+    # (host monotonic t+127.9s) is stamped slightly after SetUpVmUser call #2 (VM realtime t+126.5s)
+    # MUST still be accepted because each clock domain is internally ordered.
+    poll_skew_entries = [
+        TimelineEntry(127.9, e.source, e.name, e.detail) if e.name == "InstallerClosed" else e
+        for e in ci_run2_entries
+    ]
+    classify_initial_terminal_failure(
+        KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+        poll_skew_entries,
+        container_started_rel_sec=150.0,
+    )
 
     for neg_desc, neg_buf, neg_entries, neg_cs_rel in [
         (
@@ -1178,10 +1232,38 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
             150.0,
         ),
         (
-            "failure occurred after ContainerStarted",
+            "InstallerClosed at/after ContainerStarted (host monotonic domain)",
             KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
             ci_run2_entries,
-            140.0,
+            106.0,
+        ),
+        (
+            "failure occurred at/after ContainerReadyLog (VM log domain)",
+            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+            [
+                TimelineEntry(145.0, e.source, e.name, e.detail)
+                if e.name == "ContainerReadyLog"
+                else e
+                for e in ci_run2_entries
+            ],
+            150.0,
+        ),
+        (
+            "SetUpVmUser call #2 preceded call #1 completion",
+            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+            [
+                TimelineEntry(55.0, e.source, e.name, e.detail)
+                if (e.name == "SetUpVmUser" and e.detail.startswith("call #2:"))
+                else e
+                for e in ci_run2_entries
+            ],
+            150.0,
+        ),
+        (
+            "missing ContainerReadyLog",
+            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+            [e for e in ci_run2_entries if e.name != "ContainerReadyLog"],
+            150.0,
         ),
         (
             "missing log correlation (no RestartCrostiniFailed)",
@@ -1210,6 +1292,23 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
             pass
         else:
             raise AssertionError(f"Expected RuntimeError for negative classifier test: {neg_desc}")
+
+    # Bug #2 check: on_vm_starting_up callback fires once on VmStartingUpSignal for 'termina'
+    starting_up_hits: list[str] = []
+    cb_rec = InitTimelineRecorder(
+        None,  # type: ignore[arg-type]
+        "deadbeef",
+        on_vm_starting_up=lambda: starting_up_hits.append("hit"),
+    )
+    vm_starting_raw = conc.VmStartingUpSignal(
+        name="termina",
+        owner_id="deadbeef",
+        vm_type=conc.VmInfo.VmType.BAGUETTE,
+        cid=32,
+    ).SerializeToString()
+    cb_rec._handle_dbus_signal("org.chromium.VmConcierge", "VmStartingUpSignal", vm_starting_raw)
+    cb_rec._handle_dbus_signal("org.chromium.VmConcierge", "VmStartingUpSignal", vm_starting_raw)
+    assert starting_up_hits == ["hit"], starting_up_hits
 
     # 6. Unit-test verify_guest_user_identity (positive + negative cases)
     good_groups_str = "terminauser audio cdrom dialout disk floppy kvm netdev sudo tss video"
@@ -1253,37 +1352,43 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
     # 7. Verify guest boot diagnostic parser and monotonic clock timeline anchoring
     dummy_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
     dummy_rec.t_install_vm_epoch = 1000.0
+    unit_blocks = "\n\n".join(
+        [
+            "Id=first-boot-cros.service\nActiveState=inactive\nSubState=dead\nResult=success\n"
+            "InactiveExitTimestampMonotonic=12400000\nActiveEnterTimestampMonotonic=28400000\n"
+            "ExecMainStartTimestampMonotonic=12450000\nExecMainExitTimestampMonotonic=28390000\nExecMainStatus=0",
+            "Id=maitred.service\nActiveState=active\nSubState=running\nResult=success\n"
+            "InactiveExitTimestampMonotonic=12420000\nActiveEnterTimestampMonotonic=12500000\n"
+            "ExecMainStartTimestampMonotonic=12480000\nExecMainExitTimestampMonotonic=0\nExecMainStatus=0",
+            *[
+                f"Id={u}\nActiveState=active\nSubState=running\nResult=success\n"
+                "InactiveExitTimestampMonotonic=12000000\nActiveEnterTimestampMonotonic=13000000\n"
+                "ExecMainStartTimestampMonotonic=12100000\nExecMainExitTimestampMonotonic=0\nExecMainStatus=0"
+                for u in (
+                    "vshd.service",
+                    "systemd-logind.service",
+                    "ldconfig.service",
+                    "user-runtime-dir@1000.service",
+                    "user@1000.service",
+                )
+            ],
+        ]
+    )
     sample_guest_diag = (
         "===GUEST_CLOCK_SYNC===\n"
         "uptime_sec=30.00\n"
         "epoch_sec=1030.500000000\n"
         "===GUEST_STAT_MTIMES===\n"
         "/etc/passwd|1016|1970-01-01 00:16:56.250000000 +0000|uid=0 gid=0 mode=644\n"
+        "/etc/group|1016|1970-01-01 00:16:56.300000000 +0000|uid=0 gid=0 mode=644\n"
         "/home/terminauser|1017|1970-01-01 00:16:57.500000000 +0000|uid=1000 gid=1000 mode=700\n"
         "/var/lib/systemd/linger/terminauser|1018|1970-01-01 00:16:58.750000000 +0000|uid=0 gid=0 mode=644\n"
+        "/dev/.container_token|1019|1970-01-01 00:16:59.000000000 +0000|uid=0 gid=0 mode=644\n"
         "===GUEST_LIST_JOBS===\n"
         "No jobs running.\n"
         "===GUEST_SYSTEMD_UNIT_SHOW===\n"
-        "Id=first-boot-cros.service\n"
-        "ActiveState=inactive\n"
-        "SubState=dead\n"
-        "Result=success\n"
-        "InactiveExitTimestampMonotonic=12400000\n"
-        "ActiveEnterTimestampMonotonic=28400000\n"
-        "ExecMainStartTimestampMonotonic=12450000\n"
-        "ExecMainExitTimestampMonotonic=28390000\n"
-        "ExecMainStatus=0\n"
-        "\n"
-        "Id=maitred.service\n"
-        "ActiveState=active\n"
-        "SubState=running\n"
-        "Result=success\n"
-        "InactiveExitTimestampMonotonic=12420000\n"
-        "ActiveEnterTimestampMonotonic=12500000\n"
-        "ExecMainStartTimestampMonotonic=12480000\n"
-        "ExecMainExitTimestampMonotonic=0\n"
-        "ExecMainStatus=0\n"
-        "===GUEST_ANALYZE===\n"
+        + unit_blocks
+        + "\n===GUEST_ANALYZE===\n"
         "Startup finished in 1.2s (kernel) + 1.5s (userspace) = 2.7s\n"
         "===GUEST_CRITICAL_CHAIN===\n"
         "multi-user.target @1.5s\n"
@@ -1346,7 +1451,42 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
     assert abs(by_name["UseraddDone"].rel_sec - 16.0) < 1e-3, by_name["UseraddDone"]
     assert abs(by_name["GarconLog"].rel_sec - 20.0) < 1e-3, by_name["GarconLog"]
     mtime_entries = [e for e in dummy_rec.all_entries() if e.name == "GuestFileMtime"]
-    assert len(mtime_entries) == 3, mtime_entries
+    assert len(mtime_entries) == 5, mtime_entries
+
+    # Bug #3 check: strict=True rejects corrupt clock sync, MISSING required path, missing list-jobs, or missing unit
+    for bad_g_desc, bad_g_diag, bad_g_exc in [
+        (
+            "corrupt uptime_sec",
+            sample_guest_diag.replace("uptime_sec=30.00", "uptime_sec=not_a_float"),
+            ValueError,
+        ),
+        (
+            "MISSING /dev/.container_token",
+            sample_guest_diag.replace(
+                "/dev/.container_token|1019|1970-01-01 00:16:59.000000000 +0000|uid=0 gid=0 mode=644",
+                "/dev/.container_token|MISSING",
+            ),
+            RuntimeError,
+        ),
+        (
+            "empty GUEST_LIST_JOBS",
+            sample_guest_diag.replace("No jobs running.\n", ""),
+            RuntimeError,
+        ),
+        (
+            "missing user@1000.service in GUEST_SYSTEMD_UNIT_SHOW",
+            sample_guest_diag.replace("Id=user@1000.service", "Id=other.service"),
+            RuntimeError,
+        ),
+    ]:
+        bad_g_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
+        bad_g_rec.t_install_vm_epoch = 1000.0
+        try:
+            bad_g_rec._parse_guest_diagnostics(bad_g_diag, first_host_setup_user_rel=14.0, strict=True)
+        except bad_g_exc:
+            pass
+        else:
+            raise AssertionError(f"Expected {bad_g_exc.__name__} on {bad_g_desc}")
 
     # Also verify non-strict guest diagnostics parsing when user session hasn't started yet
     partial_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
@@ -1756,6 +1896,30 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
                 host_mem_avail_mib=1000.0,
             ),
         ),
+        (
+            "missing meminfo_Shmem in ChromeOS sample",
+            lambda: parse_cros_resource_block(
+                "\n".join(x for x in sample_block_0.splitlines() if not x.startswith("meminfo_Shmem=")),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            ),
+        ),
+        (
+            "missing vmstat_oom_kill in ChromeOS sample",
+            lambda: parse_cros_resource_block(
+                "\n".join(
+                    x for x in sample_block_0.splitlines() if not x.startswith("vmstat_oom_kill=")
+                ),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            ),
+        ),
     ]:
         try:
             neg_res_fn()
@@ -1763,6 +1927,74 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
             pass
         else:
             raise AssertionError(f"Expected ValueError on negative resource parser test: {neg_res_desc}")
+
+    # Bug #4 check: _select_sample_indices caps strictly at <=32 rows while preserving {0, peak, N-1},
+    # and skipped-sample pswpout spikes appear in the next displayed row's delta.
+    for test_n in (33, 45, 60, 89):
+        many_samples = [
+            dataclasses.replace(
+                rs0,
+                mono_ts=100.0 + i,
+                rel_sec=float(i),
+                uptime_sec=50.0 + i,
+                load1=99.0 if i == 17 else 0.4,
+                pswpout=10 + (500 if i >= 16 else 0),
+            )
+            for i in range(test_n)
+        ]
+        sel = _select_sample_indices(many_samples, max_rows=32)
+        assert len(sel) <= 32, (test_n, len(sel))
+        assert sel[0] == 0 and sel[-1] == test_n - 1 and 17 in sel, (test_n, sel)
+        if test_n == 89:
+            # Verify sample 16 is skipped while sample 17 IS shown, and sample 17's row reports +500
+            assert 16 not in sel and 17 in sel, sel
+            ds_out = "\n".join(
+                summarize_resource_diagnostics(
+                    host_info_amd, many_samples, install_mono=100.0, strict=True
+                )
+            )
+            assert "pswp=+0/+500" in ds_out, ds_out
+
+    # Bug #6 check: _pid_matches_qemu matches qemu-system-*, kvm, custom --qemu-bin, and rejects kthreads/other procs
+    with tempfile.TemporaryDirectory() as fake_proc_str:
+        fp = Path(fake_proc_str)
+        for pid_num, comm_txt, cmdline_bytes in [
+            (101, "qemu-system-x86", b"/usr/bin/qemu-system-x86_64\x00-enable-kvm\x00"),
+            (102, "kvm", b"/usr/bin/kvm\x00-m\x004G\x00"),
+            (103, "my-custom-vmm", b"/opt/vmm/my-custom-vmm\x00-daemonize\x00"),
+            (104, "kvm-pit/101", b""),  # kernel thread: empty cmdline
+            (105, "python3", b"python3\x00-m\x00http.server\x00"),
+        ]:
+            d = fp / str(pid_num)
+            d.mkdir()
+            (d / "comm").write_text(comm_txt + "\n", encoding="utf-8")
+            (d / "cmdline").write_bytes(cmdline_bytes)
+        assert _pid_matches_qemu(101, "qemu-system-x86_64", proc_root=fp)
+        assert _pid_matches_qemu(102, "/usr/bin/kvm", proc_root=fp)
+        assert _pid_matches_qemu(103, "/opt/vmm/my-custom-vmm", proc_root=fp)
+        assert not _pid_matches_qemu(104, "/usr/bin/kvm", proc_root=fp)
+        assert not _pid_matches_qemu(105, "qemu-system-x86_64", proc_root=fp)
+
+    # Bug #7 check: negative pre-Install timestamps format cleanly as `t-   X.Xs` and in-flight SetUpVmUser is recorded
+    assert _fmt_rel_t(-2.4) == "t-   2.4s", _fmt_rel_t(-2.4)
+
+    class _FakeLogVM:
+        def ssh(self, cmd: str, **_kw: Any) -> Any:
+            if "/var/log/messages" in cmd:
+                out = (
+                    "2026-10-30T16:00:08.500000Z localhost vm_concierge[100]: Found existing disk at /x\n"
+                    "2026-10-30T16:00:15.000000Z localhost vm_concierge[100]: Received request: SetUpVmUser\n"
+                )
+            else:
+                out = ""
+            return subprocess.CompletedProcess(["ssh"], 0, stdout=out, stderr="")
+
+    inflight_rec = InitTimelineRecorder(_FakeLogVM(), "deadbeef")  # type: ignore[arg-type]
+    inflight_rec.t_install_vm_epoch = parse_rfc3339_utc("2026-10-30T16:00:10.000000Z")
+    inflight_rec.scrape_host_logs()
+    rep_txt = inflight_rec.format_report()
+    assert "t-   1.5s  [concierge] FoundExistingDisk:" in rep_txt, rep_txt
+    assert "t+   5.0s  [concierge] SetUpVmUserInFlight: call #1 still in flight" in rep_txt, rep_txt
 
     log(
         "Self-test passed! Extracted README commands:\n"
@@ -1815,12 +2047,22 @@ def assert_host_kvm_available() -> None:
 
 def ensure_testing_rsa(cache_dir: Path) -> Path:
     key_path = cache_dir / "testing_rsa"
-    if not key_path.exists():
+    if not (key_path.is_file() and key_path.stat().st_size > 0):
         log(f"Downloading public ChromeOS testing_rsa key to {key_path}...")
         cache_dir.mkdir(parents=True, exist_ok=True)
         with urllib.request.urlopen(TESTING_RSA_GITILES_URL, timeout=30) as resp:
-            raw_b64 = resp.read()
-        key_path.write_bytes(base64.b64decode(raw_b64))
+            decoded = base64.b64decode(resp.read())
+        if not decoded:
+            raise RuntimeError(f"Downloaded empty testing_rsa key from {TESTING_RSA_GITILES_URL}")
+        fd, tmp_name = tempfile.mkstemp(prefix=".testing_rsa.", dir=cache_dir)
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(decoded)
+            tmp_path.chmod(0o600)
+            os.replace(tmp_path, key_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
     key_path.chmod(0o600)
     return key_path
 
@@ -1830,17 +2072,24 @@ def ensure_cros_image(cache_dir: Path, meta: dict[str, Any]) -> Path:
     cros_release = str(meta["cros_release"])
     img_dir = cache_dir / f"{board}-{cros_release}"
     img_path = img_dir / "chromiumos_test_image.bin"
-    if img_path.exists():
+    if img_path.is_file() and img_path.stat().st_size > 0:
         log(f"Using cached ChromeOS image: {img_path}")
         return img_path
 
     img_dir.mkdir(parents=True, exist_ok=True)
+    img_path.unlink(missing_ok=True)
     url = f"{GCS_ARCHIVE_ROOT}/{board}/{cros_release}/chromiumos_test_image.tar.xz"
-    log(f"Stream-extracting {url} into {img_dir} (sparse)...")
-    cmd = f"curl -fL --retry 3 '{url}' | tar --sparse -xJ -C '{img_dir}'"
-    subprocess.run(["bash", "-o", "pipefail", "-c", cmd], check=True)
-    if not img_path.exists():
-        raise FileNotFoundError(f"Expected {img_path} after extracting {url}")
+    log(f"Stream-extracting {url} into {img_dir} (sparse, atomic)...")
+    with tempfile.TemporaryDirectory(prefix=".extract-", dir=img_dir) as stage_dir_str:
+        stage_dir = Path(stage_dir_str)
+        cmd = f"curl -fL --retry 3 '{url}' | tar --sparse -xJ -C '{stage_dir}'"
+        subprocess.run(["bash", "-o", "pipefail", "-c", cmd], check=True)
+        staged_img = stage_dir / "chromiumos_test_image.bin"
+        if not staged_img.is_file() or staged_img.stat().st_size <= 0:
+            raise FileNotFoundError(
+                f"Expected non-empty {staged_img.name} after extracting {url}"
+            )
+        os.replace(staged_img, img_path)
     return img_path
 
 
@@ -2717,11 +2966,12 @@ def parse_cros_resource_block(
         "SwapFree",
         "Dirty",
         "Writeback",
+        "Shmem",
     ):
         if req_mem not in meminfo:
             raise ValueError(f"Missing meminfo_{req_mem} in ChromeOS resource sample")
 
-    for req_vm in ("pgpgin", "pgpgout", "pswpin", "pswpout", "pgmajfault"):
+    for req_vm in ("pgpgin", "pgpgout", "pswpin", "pswpout", "pgmajfault", "oom_kill"):
         if req_vm not in vmstat:
             raise ValueError(f"Missing vmstat_{req_vm} in ChromeOS resource sample")
 
@@ -2766,13 +3016,13 @@ def parse_cros_resource_block(
         swap_free_kib=meminfo["SwapFree"],
         dirty_kib=meminfo["Dirty"],
         writeback_kib=meminfo["Writeback"],
-        shmem_kib=meminfo.get("Shmem", 0),
+        shmem_kib=meminfo["Shmem"],
         pgpgin=vmstat["pgpgin"],
         pgpgout=vmstat["pgpgout"],
         pswpin=vmstat["pswpin"],
         pswpout=vmstat["pswpout"],
         pgmajfault=vmstat["pgmajfault"],
-        oom_kill=vmstat.get("oom_kill", 0),
+        oom_kill=vmstat["oom_kill"],
         zram=zram,
         crosvm_procs=tuple(crosvm_procs),
         host_cpu=host_cpu,
@@ -2990,26 +3240,20 @@ def summarize_resource_diagnostics(
     profile_str = "; ".join(bottleneck_tags) if bottleneck_tags else "no major CPU/memory/IO stall observed"
     out.append(f"Observed resource profile: {profile_str}")
 
-    # Compact per-sample table (cap to <=32 rows on very long runs while keeping first, peak, and last).
-    if len(window_samples) <= 32:
-        chosen_indices = list(range(len(window_samples)))
-    else:
-        stride = max(1, (len(window_samples) - 1) // 30)
-        chosen_set = set(range(0, len(window_samples), stride))
-        chosen_set.add(0)
-        chosen_set.add(len(window_samples) - 1)
-        chosen_indices = sorted(chosen_set)
+    # Compact per-sample table (strictly <=32 rows while keeping first, peak pressure, and last,
+    # with deltas computed across each displayed interval rather than unshown intermediate samples).
+    chosen_indices = _select_sample_indices(window_samples, max_rows=32)
 
     out.append(f"[periodic samples ({len(chosen_indices)}/{len(window_samples)} shown, relative to Install click)]")
-    for idx in chosen_indices:
+    for pos, idx in enumerate(chosen_indices):
         cur = window_samples[idx]
-        if idx == 0:
+        if pos == 0:
             c_cpu_str = "baseline"
             h_stl_str = "base"
             pswp_str = "+0/+0"
             cvm_cpu_str = "base"
         else:
-            prv = window_samples[idx - 1]
+            prv = window_samples[chosen_indices[pos - 1]]
             cd = compute_cpu_delta_pct(prv.cros_cpu, cur.cros_cpu)
             hd = compute_cpu_delta_pct(prv.host_cpu, cur.host_cpu)
             c_cpu_str = f"{cd.busy_pct:4.1f}%(iow={cd.iowait_pct:.1f}%,stl={cd.steal_pct:.1f}%)"
@@ -3029,6 +3273,39 @@ def summarize_resource_diagnostics(
             f"host_stl={h_stl_str}"
         )
     return out
+
+
+def _select_sample_indices(
+    window_samples: list[CrosResourceSample], max_rows: int = 32
+) -> list[int]:
+    n = len(window_samples)
+    if max_rows < 2:
+        raise ValueError(f"max_rows must be >=2, got {max_rows}")
+    if n <= max_rows:
+        return list(range(n))
+    peak_idx = max(
+        range(n),
+        key=lambda i: (
+            window_samples[i].psi_cpu.some.avg10
+            + window_samples[i].psi_memory.some.avg10
+            + window_samples[i].psi_io.some.avg10,
+            window_samples[i].load1,
+        ),
+    )
+    chosen: set[int] = {0, n - 1, peak_idx}
+    if len(chosen) > max_rows:
+        return [0, n - 1]
+    even_budget = max_rows - (1 if peak_idx not in (0, n - 1) else 0)
+    for slot in range(even_budget):
+        idx = round(slot * (n - 1) / (even_budget - 1))
+        chosen.add(idx)
+    ordered = sorted(chosen)
+    while len(ordered) > max_rows:
+        for cand in ordered[1:-1]:
+            if cand != peak_idx:
+                ordered.remove(cand)
+                break
+    return ordered
 
 
 class InitTimelineRecorder:
@@ -3076,6 +3353,8 @@ class InitTimelineRecorder:
         self._resource_samples: list[CrosResourceSample] = []
         self._final_res_snapshot_taken = False
         self._stop_requested = False
+        self._collected_sections: set[str] = set()
+        self._first_host_setup_user_rel: float | None = None
         self.readonly_summary_lines: list[str] = []
         self.resource_summary_lines: list[str] = []
         self.guest_summary_lines: list[str] = []
@@ -3283,7 +3562,7 @@ class InitTimelineRecorder:
         now = mono_ts if mono_ts is not None else time.monotonic()
         if self.t_install_mono is None:
             return 0.0
-        return max(0.0, now - self.t_install_mono)
+        return now - self.t_install_mono
 
     def record_ui(self, name: str, detail: str) -> float:
         self.check_no_fatal_error()
@@ -3605,7 +3884,7 @@ class InitTimelineRecorder:
                 continue
             epoch = parse_rfc3339_utc(parts[0])
             rel = (
-                max(0.0, epoch - self.t_install_vm_epoch)
+                epoch - self.t_install_vm_epoch
                 if self.t_install_vm_epoch is not None
                 else 0.0
             )
@@ -3678,6 +3957,17 @@ class InitTimelineRecorder:
                     TimelineEntry(rel, "cicerone", "RegisterVshSession", msg_body)
                 )
 
+        if pending_setup_user is not None:
+            seq_idx, start_rel = pending_setup_user
+            new_host_entries.append(
+                TimelineEntry(
+                    start_rel,
+                    "concierge",
+                    "SetUpVmUserInFlight",
+                    f"call #{seq_idx} still in flight at log scrape (no completion or RPC error logged yet)",
+                )
+            )
+
         self.chrome_excerpt = self.vm.ssh(
             f"set -o pipefail; test -r /var/log/chrome/chrome; "
             f"tail -n +{self.chrome_line_cursor + 1} /var/log/chrome/chrome | "
@@ -3691,7 +3981,7 @@ class InitTimelineRecorder:
                 continue
             epoch = parse_rfc3339_utc(parts[0])
             rel = (
-                max(0.0, epoch - self.t_install_vm_epoch)
+                epoch - self.t_install_vm_epoch
                 if self.t_install_vm_epoch is not None
                 else 0.0
             )
@@ -3947,6 +4237,11 @@ class InitTimelineRecorder:
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
         )
 
+        id_check_cmd = (
+            f"id {self.expected_username} 2>&1; "
+            if strict_dbus
+            else f"id {self.expected_username} 2>&1 || true; "
+        )
         steps: list[tuple[str, int, str]] = [
             (
                 "unit_timing_and_stat",
@@ -3966,7 +4261,7 @@ class InitTimelineRecorder:
                 + " /dev/.container_token /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ed25519_key; do "
                 + 'if [ -e "$p" ]; then TZ=UTC0 stat -c "%n|%Y|%y|uid=%u gid=%g mode=%a" "$p"; '
                 + 'else echo "$p|MISSING"; fi; done; '
-                + f"id {self.expected_username} 2>&1 || true; "
+                + id_check_cmd
                 + 'echo "===GUEST_LIST_JOBS==="; '
                 + "systemctl list-jobs --no-pager 2>&1; "
                 + 'echo "===GUEST_SYSTEMD_UNIT_SHOW==="; '
@@ -4148,69 +4443,94 @@ class InitTimelineRecorder:
         # Collect host + ChromeOS VM periodic resource diagnostics FIRST (over SSH + host /proc,
         # completely independent of the Arch guest) so even if a later D-Bus/UMA/guest query fails,
         # the timeline report always includes the resource summary.
-        self.resource_summary_lines.clear()
-        if strict_dbus:
-            self._collect_resource_diagnostics(strict_dbus=True)
-        else:
-            try:
-                self._collect_resource_diagnostics(strict_dbus=False)
-            except Exception as exc:
-                self.resource_summary_lines.append(f"Resource diagnostics error: {exc}")
+        if "resources" not in self._collected_sections:
+            self.resource_summary_lines.clear()
+            if strict_dbus:
+                self._collect_resource_diagnostics(strict_dbus=True)
+            else:
+                try:
+                    self._collect_resource_diagnostics(strict_dbus=False)
+                except Exception as exc:
+                    self.resource_summary_lines.append(f"Resource diagnostics error: {exc}")
+            self._collected_sections.add("resources")
 
         if strict_dbus:
             self.check_no_fatal_error()
             self.verify_required_dbus_signal_sequence()
 
-        self.readonly_summary_lines.clear()
-
-        with self._lock:
-            ic_entries = [e for e in self._entries if e.source == "ui" and e.name == "InstallerClosed"]
-            cs_rel = self.container_started_rel_sec
-        if ic_entries and cs_rel is not None:
-            ic_rel = ic_entries[0].rel_sec
-            self.readonly_summary_lines.append(
-                f"InstallerClosed vs ContainerStarted: installer_closed=t+{ic_rel:.1f}s "
-                f"container_started=t+{cs_rel:.1f}s "
-                f"(installer_closed_before_container_started={ic_rel < cs_rel})"
-            )
+        if "header" not in self._collected_sections:
+            self.readonly_summary_lines.clear()
+            with self._lock:
+                ic_entries = [
+                    e for e in self._entries if e.source == "ui" and e.name == "InstallerClosed"
+                ]
+                cs_rel = self.container_started_rel_sec
+            if ic_entries and cs_rel is not None:
+                ic_rel = ic_entries[0].rel_sec
+                self.readonly_summary_lines.append(
+                    f"InstallerClosed vs ContainerStarted: installer_closed={_fmt_rel_t(ic_rel).strip()} "
+                    f"container_started={_fmt_rel_t(cs_rel).strip()} "
+                    f"(installer_closed_before_container_started={ic_rel < cs_rel})"
+                )
+            self._collected_sections.add("header")
 
         # 1. Read-only D-Bus queries: GetVmInfo, ListVms, ListRunningContainers, GetGarconSessionInfo
-        if strict_dbus:
-            self._collect_readonly_dbus_snapshot(strict_dbus=True)
-        else:
-            try:
-                self._collect_readonly_dbus_snapshot(strict_dbus=False)
-            except Exception as exc:
-                self.readonly_summary_lines.append(f"Read-only D-Bus snapshot error: {exc}")
+        if "readonly_dbus" not in self._collected_sections:
+            ro_start = len(self.readonly_summary_lines)
+            if strict_dbus:
+                try:
+                    self._collect_readonly_dbus_snapshot(strict_dbus=True)
+                except Exception:
+                    del self.readonly_summary_lines[ro_start:]
+                    raise
+            else:
+                try:
+                    self._collect_readonly_dbus_snapshot(strict_dbus=False)
+                except Exception as exc:
+                    self.readonly_summary_lines.append(f"Read-only D-Bus snapshot error: {exc}")
+            self._collected_sections.add("readonly_dbus")
 
         # 2. Chrome UMA histograms via CDP (read-only, raw counts/buckets without timeout inference)
-        if strict_dbus:
-            self._collect_uma_histograms(strict_dbus=True)
-        else:
-            try:
-                self._collect_uma_histograms(strict_dbus=False)
-            except Exception as exc:
-                self.readonly_summary_lines.append(f"UMA histogram query error: {exc}")
+        if "uma" not in self._collected_sections:
+            uma_start = len(self.readonly_summary_lines)
+            if strict_dbus:
+                try:
+                    self._collect_uma_histograms(strict_dbus=True)
+                except Exception:
+                    del self.readonly_summary_lines[uma_start:]
+                    raise
+            else:
+                try:
+                    self._collect_uma_histograms(strict_dbus=False)
+                except Exception as exc:
+                    self.readonly_summary_lines.append(f"UMA histogram query error: {exc}")
+            self._collected_sections.add("uma")
 
         # 3. Scrape /var/log/messages and /var/log/chrome/chrome since start()
-        if strict_dbus:
-            first_host_setup_user_rel = self.scrape_host_logs()
-        else:
-            try:
-                first_host_setup_user_rel = self.scrape_host_logs()
-            except Exception as exc:
-                first_host_setup_user_rel = None
-                self.readonly_summary_lines.append(f"Host log scrape error: {exc}")
+        if "host_logs" not in self._collected_sections:
+            if strict_dbus:
+                self._first_host_setup_user_rel = self.scrape_host_logs()
+            else:
+                try:
+                    self._first_host_setup_user_rel = self.scrape_host_logs()
+                except Exception as exc:
+                    self._first_host_setup_user_rel = None
+                    self.readonly_summary_lines.append(f"Host log scrape error: {exc}")
+            self._collected_sections.add("host_logs")
 
         # 4. Post-hoc read-only guest boot & user-session diagnostics via root vsh
-        self.guest_summary_lines.clear()
-        if strict_dbus:
-            self._collect_guest_diagnostics(first_host_setup_user_rel, strict_dbus=True)
-        else:
-            try:
-                self._collect_guest_diagnostics(first_host_setup_user_rel, strict_dbus=False)
-            except Exception as exc:
-                self.guest_summary_lines.append(f"Guest diagnostics error: {exc}")
+        if "guest_diag" not in self._collected_sections:
+            self.guest_summary_lines.clear()
+            if strict_dbus:
+                self._collect_guest_diagnostics(self._first_host_setup_user_rel, strict_dbus=True)
+            else:
+                try:
+                    self._collect_guest_diagnostics(
+                        self._first_host_setup_user_rel, strict_dbus=False
+                    )
+                except Exception as exc:
+                    self.guest_summary_lines.append(f"Guest diagnostics error: {exc}")
+            self._collected_sections.add("guest_diag")
 
     def _parse_guest_diagnostics(
         self,
@@ -4227,7 +4547,7 @@ class InitTimelineRecorder:
             elif cur_sec is not None:
                 sections[cur_sec].append(line)
 
-        # Parse guest /proc/uptime + date -u +%s.%N clock sync if present
+        # Parse guest /proc/uptime + date -u +%s.%N clock sync
         guest_uptime_sec: float | None = None
         guest_epoch_sec: float | None = None
         for cline in sections.get("GUEST_CLOCK_SYNC", []):
@@ -4236,12 +4556,24 @@ class InitTimelineRecorder:
                 try:
                     guest_uptime_sec = float(cline.split("=", 1)[1])
                 except ValueError:
-                    pass
+                    if strict:
+                        raise
             elif cline.startswith("epoch_sec="):
                 try:
                     guest_epoch_sec = float(cline.split("=", 1)[1])
                 except ValueError:
-                    pass
+                    if strict:
+                        raise
+        if strict and (
+            guest_uptime_sec is None
+            or guest_uptime_sec <= 0
+            or guest_epoch_sec is None
+            or guest_epoch_sec <= 0
+        ):
+            raise RuntimeError(
+                "Guest diagnostics GUEST_CLOCK_SYNC missing valid positive uptime_sec/epoch_sec: "
+                f"uptime_sec={guest_uptime_sec!r} epoch_sec={guest_epoch_sec!r}"
+            )
 
         parsed_json: list[dict] = []
         first_guest_setup_mono: float | None = None
@@ -4257,7 +4589,20 @@ class InitTimelineRecorder:
                 continue
             parsed_json.append(obj)
             msg = str(obj.get("MESSAGE", ""))
-            mono_us = int(obj.get("__MONOTONIC_TIMESTAMP", 0) or 0)
+            raw_mono = obj.get("__MONOTONIC_TIMESTAMP")
+            if raw_mono in (None, ""):
+                if strict:
+                    raise ValueError(
+                        f"Guest journal JSON entry missing __MONOTONIC_TIMESTAMP: {obj!r}"
+                    )
+                mono_us = 0
+            else:
+                try:
+                    mono_us = int(raw_mono)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise
+                    mono_us = 0
             if (
                 first_guest_setup_mono is None
                 and "Received request to setup a new user" in msg
@@ -4283,11 +4628,27 @@ class InitTimelineRecorder:
 
         # Summarize and project GUEST_STAT_MTIMES (nanosecond UTC mtimes of /etc/passwd, /home/terminauser, linger, etc.)
         stat_lines = [ln.strip() for ln in sections.get("GUEST_STAT_MTIMES", []) if ln.strip()]
+        if strict and not stat_lines:
+            raise RuntimeError("Guest diagnostics section 'GUEST_STAT_MTIMES' is missing or empty")
+        required_guest_paths = {
+            "/etc/passwd",
+            "/etc/group",
+            f"/home/{self.expected_username}",
+            f"/var/lib/systemd/linger/{self.expected_username}",
+            "/dev/.container_token",
+        }
+        seen_valid_paths: set[str] = set()
         if stat_lines:
             self.guest_summary_lines.append("[guest filesystem mtimes & user identity]")
             for sln in stat_lines:
                 self.guest_summary_lines.append(f"  {sln}")
                 parts = sln.split("|")
+                if len(parts) == 2 and parts[1] == "MISSING":
+                    if strict and parts[0] in required_guest_paths:
+                        raise RuntimeError(
+                            f"Required guest path {parts[0]!r} reported MISSING in GUEST_STAT_MTIMES"
+                        )
+                    continue
                 if len(parts) == 4 and parts[1] != "MISSING":
                     fpath, epoch_int_s, human_utc, meta_s = parts
                     mtime_epoch: float | None = None
@@ -4305,13 +4666,17 @@ class InitTimelineRecorder:
                         try:
                             mtime_epoch = float(epoch_int_s)
                         except ValueError:
+                            if strict:
+                                raise
                             mtime_epoch = None
+                    if mtime_epoch is not None:
+                        seen_valid_paths.add(fpath)
                     if (
                         mtime_epoch is not None
                         and self.t_install_vm_epoch is not None
                         and mtime_epoch >= self.t_install_vm_epoch - 2.0
                     ):
-                        rel = max(0.0, mtime_epoch - self.t_install_vm_epoch)
+                        rel = mtime_epoch - self.t_install_vm_epoch
                         g_tag = ""
                         if guest_boot_epoch is not None:
                             g_tag = f"(guest+{max(0.0, mtime_epoch - guest_boot_epoch):.2f}s) "
@@ -4325,9 +4690,17 @@ class InitTimelineRecorder:
                                 f"{g_tag}{fpath} mtime={human_utc.strip()} ({meta_s})",
                             )
                         )
+        if strict:
+            missing_req_paths = sorted(required_guest_paths - seen_valid_paths)
+            if missing_req_paths:
+                raise RuntimeError(
+                    f"GUEST_STAT_MTIMES missing required guest paths: {missing_req_paths!r}"
+                )
 
-        # Summarize GUEST_LIST_JOBS if present
+        # Summarize GUEST_LIST_JOBS
         job_lines = [ln.strip() for ln in sections.get("GUEST_LIST_JOBS", []) if ln.strip()]
+        if strict and not job_lines:
+            raise RuntimeError("Guest diagnostics section 'GUEST_LIST_JOBS' is missing or empty")
         if job_lines:
             self.guest_summary_lines.append("[systemctl list-jobs (system)]")
             for jln in job_lines[:30]:
@@ -4335,6 +4708,32 @@ class InitTimelineRecorder:
 
         # Parse and summarize GUEST_SYSTEMD_UNIT_SHOW monotonic timestamps
         unit_show_raw = "\n".join(sections.get("GUEST_SYSTEMD_UNIT_SHOW", [])).strip()
+        if strict and not unit_show_raw:
+            raise RuntimeError(
+                "Guest diagnostics section 'GUEST_SYSTEMD_UNIT_SHOW' is missing or empty"
+            )
+        expected_units = {
+            "first-boot-cros.service",
+            "maitred.service",
+            "vshd.service",
+            "systemd-logind.service",
+            "ldconfig.service",
+            "user-runtime-dir@1000.service",
+            "user@1000.service",
+        }
+        seen_units: set[str] = set()
+
+        def _parse_mono_prop(props_map: dict[str, str], prop_key: str) -> int:
+            raw_val = props_map.get(prop_key, "").strip()
+            if not raw_val:
+                return 0
+            try:
+                return int(raw_val)
+            except ValueError:
+                if strict:
+                    raise
+                return 0
+
         if unit_show_raw:
             self.guest_summary_lines.append("[systemd unit monotonic timing (systemctl show)]")
             for block in re.split(r"\n\s*\n", unit_show_raw):
@@ -4346,14 +4745,15 @@ class InitTimelineRecorder:
                 unit_id = props.get("Id", "")
                 if not unit_id:
                     continue
+                seen_units.add(unit_id)
                 act_state = props.get("ActiveState", "")
                 sub_state = props.get("SubState", "")
                 result = props.get("Result", "")
                 exec_status = props.get("ExecMainStatus", "")
-                inact_exit_us = int(props.get("InactiveExitTimestampMonotonic", "0") or "0")
-                act_enter_us = int(props.get("ActiveEnterTimestampMonotonic", "0") or "0")
-                exec_start_us = int(props.get("ExecMainStartTimestampMonotonic", "0") or "0")
-                exec_exit_us = int(props.get("ExecMainExitTimestampMonotonic", "0") or "0")
+                inact_exit_us = _parse_mono_prop(props, "InactiveExitTimestampMonotonic")
+                act_enter_us = _parse_mono_prop(props, "ActiveEnterTimestampMonotonic")
+                exec_start_us = _parse_mono_prop(props, "ExecMainStartTimestampMonotonic")
+                exec_exit_us = _parse_mono_prop(props, "ExecMainExitTimestampMonotonic")
                 start_us = exec_start_us or inact_exit_us
                 end_us = exec_exit_us or act_enter_us
                 start_s = start_us / 1_000_000.0
@@ -4370,7 +4770,7 @@ class InitTimelineRecorder:
                     )
                 host_window = ""
                 if guest_boot_rel_sec is not None and start_us > 0:
-                    h_start = max(0.0, guest_boot_rel_sec + start_s)
+                    h_start = guest_boot_rel_sec + start_s
                     new_guest_entries.append(
                         TimelineEntry(
                             h_start,
@@ -4380,8 +4780,10 @@ class InitTimelineRecorder:
                         )
                     )
                     if end_us >= start_us and end_us > 0:
-                        h_end = max(0.0, guest_boot_rel_sec + end_s)
-                        host_window = f" host=t+{h_start:.1f}s..t+{h_end:.1f}s"
+                        h_end = guest_boot_rel_sec + end_s
+                        host_window = (
+                            f" host={_fmt_rel_t(h_start).strip()}..{_fmt_rel_t(h_end).strip()}"
+                        )
                         if exec_exit_us > 0:
                             new_guest_entries.append(
                                 TimelineEntry(
@@ -4392,11 +4794,17 @@ class InitTimelineRecorder:
                                 )
                             )
                     else:
-                        host_window = f" host=t+{h_start:.1f}s..(running)"
+                        host_window = f" host={_fmt_rel_t(h_start).strip()}..(running)"
                 self.guest_summary_lines.append(
                     f"  {unit_id}: state={act_state}/{sub_state} result={result} "
                     f"guest=+{start_s:.3f}s..+{end_s:.3f}s (dur={dur_str}{act_dur_extra}, exit_status={exec_status})"
                     f"{host_window}"
+                )
+        if strict:
+            missing_units = sorted(expected_units - seen_units)
+            if missing_units:
+                raise RuntimeError(
+                    f"GUEST_SYSTEMD_UNIT_SHOW missing expected systemd units: {missing_units!r}"
                 )
 
         for label, key, max_lines in (
@@ -4421,7 +4829,7 @@ class InitTimelineRecorder:
             for ln in sec_lines[:max_lines]:
                 self.guest_summary_lines.append(f"  {ln}")
 
-        # Project key guest journal events onto the unified t+X.Xs timeline
+        # Project key guest journal events onto the unified t+X.Xs / t-X.Xs timeline
         setup_user_guest_seq = 0
         for obj in parsed_json:
             msg = str(obj.get("MESSAGE", ""))
@@ -4429,13 +4837,31 @@ class InitTimelineRecorder:
             syslog_id = str(obj.get("SYSLOG_IDENTIFIER", ""))
             unit = str(obj.get("_SYSTEMD_UNIT", "") or obj.get("UNIT", ""))
             ident = f"{comm} {syslog_id} {unit}".lower()
-            rt_us = int(obj.get("__REALTIME_TIMESTAMP", 0) or 0)
-            mono_us = int(obj.get("__MONOTONIC_TIMESTAMP", 0) or 0)
+            raw_rt = obj.get("__REALTIME_TIMESTAMP")
+            if raw_rt in (None, ""):
+                rt_us = 0
+            else:
+                try:
+                    rt_us = int(raw_rt)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise
+                    rt_us = 0
+            raw_mono = obj.get("__MONOTONIC_TIMESTAMP")
+            if raw_mono in (None, ""):
+                mono_us = 0
+            else:
+                try:
+                    mono_us = int(raw_mono)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise
+                    mono_us = 0
             g_mono = mono_us / 1_000_000.0
             if guest_boot_rel_sec is not None and mono_us > 0:
-                rel = max(0.0, guest_boot_rel_sec + g_mono)
+                rel = guest_boot_rel_sec + g_mono
             elif rt_us and self.t_install_vm_epoch is not None:
-                rel = max(0.0, (rt_us / 1_000_000.0) - self.t_install_vm_epoch)
+                rel = (rt_us / 1_000_000.0) - self.t_install_vm_epoch
             else:
                 continue
             tag = f"(guest+{g_mono:.2f}s) "
@@ -4542,7 +4968,7 @@ class InitTimelineRecorder:
         sorted_entries = self.all_entries()
         lines = ["=== INITIALIZATION TIMELINE (relative to Install click) ==="]
         for e in sorted_entries:
-            lines.append(f"  t+{e.rel_sec:6.1f}s  [{e.source:<9}] {e.name}: {e.detail}")
+            lines.append(f"  {_fmt_rel_t(e.rel_sec)}  [{e.source:<9}] {e.name}: {e.detail}")
         lines.append("  --- Runner & ChromeOS Resource Diagnostics (read-only) ---")
         if self.resource_summary_lines:
             for r_line in self.resource_summary_lines:
@@ -4600,15 +5026,12 @@ class HostQemuCpuThrottler:
         if self.initial_delay_sec > 0 and self._stop_event.wait(timeout=self.initial_delay_sec):
             return
         assert self.quota_pct is not None
-        effective_quota_pct = (
-            max(5, self.quota_pct - 2) if self.initial_delay_sec == 0.0 else self.quota_pct
-        )
         log(
-            f"  [throttle] Throttling host QEMU PID {pid} to {effective_quota_pct}% CPU duty cycle "
-            f"(requested={self.quota_pct}%, initial_delay={self.initial_delay_sec:.1f}s)..."
+            f"  [throttle] Throttling host QEMU PID {pid} to {self.quota_pct}% CPU duty cycle "
+            f"(initial_delay={self.initial_delay_sec:.1f}s)..."
         )
         period = 0.100  # 100 ms period so Chrome's 4s timers still wake promptly
-        run_slice = period * (effective_quota_pct / 100.0)
+        run_slice = period * (self.quota_pct / 100.0)
         stop_slice = period - run_slice
         try:
             while not self._stop_event.is_set():
@@ -4631,6 +5054,32 @@ class HostQemuCpuThrottler:
             self._stop_event.set()
             self._thread.join(timeout=2.0)
             self._thread = None
+
+
+def _pid_matches_qemu(pid: int, qemu_bin: str, proc_root: Path = Path("/proc")) -> bool:
+    """Returns True iff `/proc/<pid>` is a live userland QEMU/KVM process matching `qemu_bin`."""
+    proc_dir = proc_root / str(pid)
+    comm_path = proc_dir / "comm"
+    cmdline_path = proc_dir / "cmdline"
+    try:
+        if not comm_path.exists():
+            return False
+        comm = comm_path.read_text(encoding="utf-8", errors="replace").strip()
+        raw_cmdline = cmdline_path.read_bytes() if cmdline_path.exists() else b""
+    except OSError:
+        return False
+    # Kernel threads (e.g. `kvm-irqfd-clean`, `kvm-pit/...`) have empty `/proc/<pid>/cmdline`.
+    if not raw_cmdline:
+        return False
+    argv0 = raw_cmdline.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    argv0_name = Path(argv0).name
+    expected_name = Path(qemu_bin).name
+    return bool(
+        (expected_name and (argv0_name == expected_name or comm == expected_name[:15]))
+        or argv0_name.startswith(("qemu-system", "qemu-kvm"))
+        or argv0_name in ("kvm", "qemu-kvm")
+        or comm.startswith(("qemu-system", "qemu-kvm"))
+    )
 
 
 class ChromeOSVM:
@@ -4865,14 +5314,14 @@ class ChromeOSVM:
         if self.pid_file.exists():
             try:
                 pid = int(self.pid_file.read_text().strip())
-                comm_path = Path(f"/proc/{pid}/comm")
-                if comm_path.exists() and comm_path.read_text().strip().startswith("qemu-system"):
+                proc_dir = Path(f"/proc/{pid}")
+                if _pid_matches_qemu(pid, self.qemu_bin):
                     os.kill(pid, signal.SIGCONT)
                     os.kill(pid, signal.SIGTERM)
                     deadline = time.monotonic() + 5.0
-                    while time.monotonic() < deadline and comm_path.exists():
+                    while time.monotonic() < deadline and proc_dir.exists():
                         time.sleep(0.2)
-                    if comm_path.exists():
+                    if proc_dir.exists():
                         os.kill(pid, signal.SIGKILL)
                     log(f"Terminated QEMU PID {pid}.")
             except (ProcessLookupError, PermissionError, ValueError, OSError):
@@ -5440,18 +5889,7 @@ dbus-send --system --type=method_call --print-reply \
                         timeout=30.0,
                         op_desc="Crostini-Installer:poll_status",
                     )
-                    if isinstance(status, dict):
-                        if status.get("installing"):
-                            last_status["installing"] = status["installing"]
-                        if status.get("err"):
-                            last_status["err"] = status["err"]
-                            raise RuntimeError(
-                                f"`chrome://crostini-installer` failed with UI error: {status['err']} "
-                                f"(last progress: {last_status.get('installing')!r})"
-                            )
-                except RuntimeError as exc:
-                    if "`chrome://crostini-installer` failed with UI error:" in str(exc):
-                        raise
+                except (CDPError, CDPTimeoutError):
                     # If the installer dialog closed while `eval_js` was in flight, the next loop
                     # iteration handles `not installer_open`; if it is still open, fail immediately.
                     still_open = any(
@@ -5460,13 +5898,16 @@ dbus-send --system --type=method_call --print-reply \
                     )
                     if still_open:
                         raise
-                except Exception:
-                    still_open = any(
-                        "chrome://crostini-installer" in x.get("url", "")
-                        for x in self.list_cdp_targets()
-                    )
-                    if still_open:
-                        raise
+                    status = None
+                if isinstance(status, dict):
+                    if status.get("installing"):
+                        last_status["installing"] = status["installing"]
+                    if status.get("err"):
+                        last_status["err"] = status["err"]
+                        raise RuntimeError(
+                            f"`chrome://crostini-installer` failed with UI error: {status['err']} "
+                            f"(last progress: {last_status.get('installing')!r})"
+                        )
                 time.sleep(1.5)
             ctx = installer_conn._ctx(
                 "Crostini-Installer:wait_for_finish",
@@ -5788,10 +6229,12 @@ dbus-send --system --type=method_call --print-reply \
             self,
             h,
             expected_username=username,
-            on_vm_started=throttler.start,
+            on_vm_starting_up=throttler.start if self.throttle_from_vm_start else None,
+            on_vm_started=None if self.throttle_from_vm_start else throttler.start,
         )
         crosh = self.open_crosh_tab("Termina-Crosh")
         failed = False
+        report_logged = False
         try:
             self.set_step("step1:vmc_create")
             log("Step 1: Running `vmc create` command from README.md in crosh...")
@@ -5830,19 +6273,21 @@ dbus-send --system --type=method_call --print-reply \
                 f"`{readme_cmds.termina_reentry_vsh}` -> `id -nu` == {username!r}",
             )
 
-            self.set_step("step5:stop_and_collect")
-            log("Step 5: Collecting read-only D-Bus/UMA timeline & verifying in-guest systemd state...")
+            self.set_step("step5:verify_guest_and_collect")
+            log("Step 5: Verifying in-guest systemd/user state & collecting read-only D-Bus/UMA timeline...")
+            self.verify_guest_user_session("termina", expected_username=username)
             timeline.stop_and_collect(strict_dbus=True)
             log("\n" + timeline.format_report(include_raw_logs=False))
-            self.verify_guest_user_session("termina", expected_username=username)
+            report_logged = True
         except Exception:
             failed = True
             throttler.stop()
-            try:
-                timeline.stop_and_collect(strict_dbus=False)
-                log("\n" + timeline.format_report(include_raw_logs=True))
-            except Exception as diag_exc:
-                log(f"Failed collecting timeline diagnostics: {diag_exc}")
+            if not report_logged:
+                try:
+                    timeline.stop_and_collect(strict_dbus=False)
+                    log("\n" + timeline.format_report(include_raw_logs=True))
+                except Exception as diag_exc:
+                    log(f"Failed collecting timeline diagnostics: {diag_exc}")
             raise
         finally:
             throttler.stop()
@@ -5920,7 +6365,7 @@ def main() -> int:
         "--qemu-cpu-quota-pct",
         type=int,
         default=None,
-        help="Optional host-side CPU duty-cycle quota (5..100%%) applied during installer to simulate slow CI runners",
+        help="Optional host-side CPU duty-cycle quota (5..99%%) applied 3s after VmStartedSignal (or immediately at VmStartingUpSignal with --qemu-throttle-from-vm-start) to simulate slow CI runners",
     )
     parser.add_argument(
         "--qemu-throttle-from-vm-start",
