@@ -54,6 +54,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -1380,6 +1381,389 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
         else:
             raise AssertionError("Expected ValueError when second code block is missing")
 
+    # 8. Verify CDPConnection & CroshTab error/timeout wrapping (never bare websocket TimeoutError)
+    class WebSocketTimeoutException(Exception):
+        """Matches websocket-client's WebSocketTimeoutException (subclasses Exception, not TimeoutError)."""
+
+    class WebSocketConnectionClosedException(Exception):
+        pass
+
+    class _FakeWS:
+        def __init__(self, responses: list[Any], connected: bool = True) -> None:
+            self._responses = list(responses)
+            self.connected = connected
+            self.sent: list[str] = []
+            self.last_timeout: float | None = None
+
+        def settimeout(self, t: float) -> None:
+            self.last_timeout = t
+
+        def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+        def recv(self) -> str:
+            if not self._responses:
+                self.connected = False
+                return ""
+            nxt = self._responses.pop(0)
+            if isinstance(nxt, BaseException):
+                raise nxt
+            return str(nxt)
+
+        def close(self) -> None:
+            self.connected = False
+
+    fake_tgt = {
+        "id": "9F2A1B",
+        "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:41234/devtools/page/9F2A1B",
+    }
+
+    # 8a. Connect timeout wraps WebSocketTimeoutException -> CDPTimeoutError with full context
+    try:
+        CDPConnection.from_target(
+            fake_tgt,
+            label="Terminal-App-Initial",
+            timeout=12.0,
+            step_getter=lambda: "step3:observe_initial_terminal",
+            connect_fn=lambda *_a, **_kw: (_ for _ in ()).throw(
+                WebSocketTimeoutException("Connection timed out")
+            ),
+        )
+    except CDPTimeoutError as exc:
+        msg = str(exc)
+        for req_tok in (
+            "WebSocket.connect",
+            "Terminal-App-Initial",
+            "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+            "9F2A1B",
+            "step3:observe_initial_terminal",
+            "waited=",
+        ):
+            assert req_tok in msg, (req_tok, msg)
+    else:
+        raise AssertionError("Expected CDPTimeoutError on WebSocket connect timeout")
+
+    # 8b. CroshTab.get_text recv WebSocketTimeoutException -> CDPTimeoutError (exact ci-pr5-run1 crash mode)
+    hung_conn = CDPConnection.from_target(
+        fake_tgt,
+        label="Terminal-App-Initial",
+        timeout=30.0,
+        step_getter=lambda: "step3:observe_initial_terminal",
+        connect_fn=lambda *_a, **_kw: _FakeWS([WebSocketTimeoutException("")]),
+    )
+    hung_tab = CroshTab("Terminal-App-Initial", hung_conn)
+    try:
+        hung_tab.get_text()
+    except CDPTimeoutError as exc:
+        msg = str(exc)
+        for req_tok in (
+            "Terminal-App-Initial.get_text",
+            "Runtime.evaluate#1",
+            "target='Terminal-App-Initial'",
+            "url='chrome-untrusted://terminal/html/terminal.html?command=vmshell'",
+            "target_id='9F2A1B'",
+            "step='step3:observe_initial_terminal'",
+            "waited=",
+        ):
+            assert req_tok in msg, (req_tok, msg)
+    else:
+        raise AssertionError("Expected CDPTimeoutError on CroshTab.get_text recv timeout")
+
+    # 8c. Socket disconnect / protocol error / JS exception -> CDPError with full context
+    for cdp_err_desc, ws_frames, call_kind in [
+        (
+            "unexpected WebSocket close",
+            [WebSocketConnectionClosedException("socket is already closed")],
+            "call",
+        ),
+        (
+            "CDP protocol error",
+            [json.dumps({"id": 1, "error": {"code": -32000, "message": "Target closed"}})],
+            "call",
+        ),
+        (
+            "JavaScript exceptionDetails",
+            [
+                json.dumps(
+                    {
+                        "id": 1,
+                        "result": {
+                            "exceptionDetails": {"text": "Uncaught TypeError: null"},
+                        },
+                    }
+                )
+            ],
+            "eval_js",
+        ),
+    ]:
+        err_conn = CDPConnection.from_target(
+            fake_tgt,
+            label="Crostini-Installer",
+            timeout=15.0,
+            step_getter=lambda: "step2:wait_installer_complete",
+            connect_fn=lambda *_a, _f=ws_frames, **_kw: _FakeWS(_f),
+        )
+        try:
+            if call_kind == "call":
+                err_conn.call("DOM.getDocument", op_desc="Installer:getDocument")
+            else:
+                err_conn.eval_js("window.boom()", op_desc="Installer:poll_status")
+        except CDPError as exc:
+            msg = str(exc)
+            for req_tok in (
+                "target='Crostini-Installer'",
+                "target_id='9F2A1B'",
+                "step='step2:wait_installer_complete'",
+                "waited=",
+            ):
+                assert req_tok in msg, (cdp_err_desc, req_tok, msg)
+        else:
+            raise AssertionError(f"Expected CDPError on {cdp_err_desc}")
+
+    # 8d. CroshTab.wait_for predicate timeout -> CDPTimeoutError with target, step, waited, and buffer
+    wait_frames = [
+        json.dumps({"id": i, "result": {"result": {"value": "[===  ] Starting VM..."}}})
+        for i in range(1, 20)
+    ]
+    wait_conn = CDPConnection.from_target(
+        fake_tgt,
+        label="Termina-Crosh",
+        timeout=10.0,
+        step_getter=lambda: "step4:crosh_vsh_reentry",
+        connect_fn=lambda *_a, **_kw: _FakeWS(wait_frames),
+    )
+    wait_tab = CroshTab("Termina-Crosh", wait_conn)
+    try:
+        wait_tab.wait_for(lambda txt: "crosh>" in txt, timeout=0.15, desc="crosh> prompt")
+    except CDPTimeoutError as exc:
+        msg = str(exc)
+        for req_tok in (
+            "Termina-Crosh.wait_for(crosh> prompt)",
+            "target='Termina-Crosh'",
+            "target_id='9F2A1B'",
+            "step='step4:crosh_vsh_reentry'",
+            "waited=",
+            "[===  ] Starting VM...",
+        ):
+            assert req_tok in msg, (req_tok, msg)
+    else:
+        raise AssertionError("Expected CDPTimeoutError on CroshTab.wait_for timeout")
+
+    # 9. Verify Host + ChromeOS VM periodic resource diagnostics parsers & strict/non-strict contract
+    host_info_amd = parse_host_runner_info(
+        "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\n",
+        "MemTotal:       16384000 kB\nMemAvailable:   12288000 kB\n",
+        4,
+    )
+    assert host_info_amd.vendor_id == "AuthenticAMD"
+    assert "EPYC 7763" in host_info_amd.model_name
+    assert host_info_amd.nproc == 4
+    assert abs(host_info_amd.mem_total_mib - 16000.0) < 1e-3
+
+    c0 = parse_proc_stat_cpu_line("cpu  100 10 50 800 20 5 5 10 30 0\n", "test0", clk_tck=100)
+    c1 = parse_proc_stat_cpu_line("cpu  250 10 100 830 50 5 5 50 80 0\n", "test1", clk_tck=100)
+    cdelta = compute_cpu_delta_pct(c0, c1)
+    # Total ticks: c0 = 1000, c1 = 1300 -> dt = 300; busy delta = (370 - 170) = 200 (66.67%),
+    # iowait delta = 30 (10.0%), steal delta = 40 (13.33%, 0.40s), idle delta = 30 (10.0%).
+    assert abs(cdelta.busy_pct - (200.0 / 3.0)) < 1e-2, cdelta
+    assert abs(cdelta.iowait_pct - 10.0) < 1e-2, cdelta
+    assert abs(cdelta.steal_pct - (40.0 / 3.0)) < 1e-2, cdelta
+    assert abs(cdelta.steal_sec - 0.40) < 1e-3, cdelta
+
+    sample_block_0 = "\n".join(
+        [
+            CROS_RESOURCE_SAMPLE_BEGIN,
+            "epoch_sec=2000.000",
+            "nproc=2",
+            "clk_tck=100",
+            "uptime_sec=50.00",
+            "loadavg=0.40 0.20 0.10 1/240 1200",
+            "stat_cpu=cpu  500 0 200 9200 50 10 10 30 0 0",
+            "psi_cpu=some avg10=1.50 avg60=0.50 avg300=0.10 total=100000",
+            "psi_memory=some avg10=0.00 avg60=0.00 avg300=0.00 total=10000",
+            "psi_memory=full avg10=0.00 avg60=0.00 avg300=0.00 total=5000",
+            "psi_io=some avg10=0.20 avg60=0.10 avg300=0.00 total=200000",
+            "psi_io=full avg10=0.10 avg60=0.05 avg300=0.00 total=150000",
+            "zram_mm_stat=10485760 4194304 5242880 0 5242880 100 0",
+            "meminfo_MemTotal=4096000",
+            "meminfo_MemAvailable=2800000",
+            "meminfo_Cached=900000",
+            "meminfo_SwapTotal=6144000",
+            "meminfo_SwapFree=6133760",
+            "meminfo_Dirty=512",
+            "meminfo_Writeback=0",
+            "meminfo_Shmem=65536",
+            "vmstat_pgpgin=10000",
+            "vmstat_pgpgout=5000",
+            "vmstat_pswpin=0",
+            "vmstat_pswpout=10",
+            "vmstat_pgmajfault=25",
+            "vmstat_oom_kill=0",
+            CROS_RESOURCE_SAMPLE_END,
+        ]
+    )
+    sample_block_1 = "\n".join(
+        [
+            CROS_RESOURCE_SAMPLE_BEGIN,
+            "epoch_sec=2010.000",
+            "nproc=2",
+            "clk_tck=100",
+            "uptime_sec=60.00",
+            "loadavg=3.20 1.50 0.60 4/280 1450",
+            "stat_cpu=cpu  1900 0 500 9350 150 10 10 80 1100 0",
+            "psi_cpu=some avg10=48.00 avg60=15.00 avg300=4.00 total=3600000",
+            "psi_cpu=full avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+            "psi_memory=some avg10=6.50 avg60=2.00 avg300=0.50 total=610000",
+            "psi_memory=full avg10=2.10 avg60=0.80 avg300=0.20 total=205000",
+            "psi_io=some avg10=18.40 avg60=5.00 avg300=1.00 total=1700000",
+            "psi_io=full avg10=12.00 avg60=3.50 avg300=0.70 total=1150000",
+            "zram_mm_stat=104857600 31457280 35651584 0 36700160 400 12",
+            "meminfo_MemTotal=4096000",
+            "meminfo_MemAvailable=420000",
+            "meminfo_Cached=550000",
+            "meminfo_SwapTotal=6144000",
+            "meminfo_SwapFree=5900000",
+            "meminfo_Dirty=16384",
+            "meminfo_Writeback=4096",
+            "meminfo_Shmem=98304",
+            "vmstat_pgpgin=25000",
+            "vmstat_pgpgout=48000",
+            "vmstat_pswpin=120",
+            "vmstat_pswpout=960",
+            "vmstat_pgmajfault=140",
+            "vmstat_oom_kill=0",
+            "crosvm_proc=2401:crosvm:1150:819200:204800:R",
+            "crosvm_proc=2412:v_block:250:131072:16384:S",
+            CROS_RESOURCE_SAMPLE_END,
+        ]
+    )
+    rs0 = parse_cros_resource_block(
+        sample_block_0,
+        mono_ts=99.0,
+        rel_sec=-1.0,
+        host_cpu=c0,
+        host_load1=1.2,
+        host_mem_avail_mib=12000.0,
+    )
+    rs1 = parse_cros_resource_block(
+        sample_block_1,
+        mono_ts=109.0,
+        rel_sec=9.0,
+        host_cpu=c1,
+        host_load1=2.4,
+        host_mem_avail_mib=11500.0,
+    )
+    res_lines = summarize_resource_diagnostics(
+        host_info_amd, [rs0, rs1], install_mono=100.0, strict=True
+    )
+    joined_res = "\n".join(res_lines)
+    assert "vendor=AuthenticAMD" in joined_res, joined_res
+    assert "steal=13.33%" in joined_res, joined_res
+    assert "cpu_some=3.50s (35.0%, pk10=48.0)" in joined_res, joined_res
+    assert "io_some=1.50s (15.0%, pk10=18.4)" in joined_res, joined_res
+    assert "peak_procs=2 cpu_avg=140.0% cpu_peak=140.0%" in joined_res, joined_res
+    assert "CPU-contention" in joined_res and "IO-stall" in joined_res, joined_res
+    assert "[periodic samples (2/2 shown" in joined_res, joined_res
+
+    # Strict mode MUST fail on <2 samples or sampler warnings; non-strict mode MUST NOT raise
+    for bad_strict_desc, bad_strict_kwargs in [
+        ("only 1 sample", {"host_info": host_info_amd, "samples": [rs0], "install_mono": 100.0}),
+        (
+            "sampler warning present",
+            {
+                "host_info": host_info_amd,
+                "samples": [rs0, rs1],
+                "install_mono": 100.0,
+                "sampler_warnings": ["ssh exited rc=255"],
+            },
+        ),
+        (
+            "missing host_info",
+            {"host_info": None, "samples": [rs0, rs1], "install_mono": 100.0},
+        ),
+    ]:
+        try:
+            summarize_resource_diagnostics(**bad_strict_kwargs, strict=True)  # type: ignore[arg-type]
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(
+                f"Expected RuntimeError in strict resource summary check: {bad_strict_desc}"
+            )
+        non_strict_out = summarize_resource_diagnostics(**bad_strict_kwargs, strict=False)  # type: ignore[arg-type]
+        assert len(non_strict_out) >= 1
+
+    # Negative parser checks for host/ChromeOS resource parsers
+    for neg_res_desc, neg_res_fn in [
+        (
+            "missing CPU vendor_id",
+            lambda: parse_host_runner_info("model name : X\n", "MemTotal: 100 kB\nMemAvailable: 50 kB\n", 2),
+        ),
+        (
+            "short /proc/stat line",
+            lambda: parse_proc_stat_cpu_line("cpu 1 2 3\n", "bad_stat"),
+        ),
+        (
+            "missing psi_io in ChromeOS sample",
+            lambda: parse_cros_resource_block(
+                "\n".join(x for x in sample_block_0.splitlines() if not x.startswith("psi_io=")),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            ),
+        ),
+        (
+            "missing meminfo_MemAvailable in ChromeOS sample",
+            lambda: parse_cros_resource_block(
+                "\n".join(
+                    x for x in sample_block_0.splitlines() if not x.startswith("meminfo_MemAvailable=")
+                ),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            ),
+        ),
+        (
+            "malformed crosvm_proc entry",
+            lambda: parse_cros_resource_block(
+                sample_block_0.replace(
+                    CROS_RESOURCE_SAMPLE_END,
+                    "crosvm_proc=bad:entry\n" + CROS_RESOURCE_SAMPLE_END,
+                ),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            ),
+        ),
+        (
+            "unexpected key in ChromeOS sample",
+            lambda: parse_cros_resource_block(
+                sample_block_0.replace(
+                    CROS_RESOURCE_SAMPLE_END,
+                    "mystery_field=123\n" + CROS_RESOURCE_SAMPLE_END,
+                ),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            ),
+        ),
+    ]:
+        try:
+            neg_res_fn()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError on negative resource parser test: {neg_res_desc}")
+
     log(
         "Self-test passed! Extracted README commands:\n"
         f"  Setup create:       {cmds.termina_create}\n"
@@ -1460,41 +1844,216 @@ def ensure_cros_image(cache_dir: Path, meta: dict[str, Any]) -> Path:
     return img_path
 
 
+class CDPError(RuntimeError):
+    """Structured Chrome DevTools Protocol error including operation, target, step, and elapsed wait."""
+
+
+class CDPTimeoutError(TimeoutError):
+    """Structured Chrome DevTools Protocol timeout including operation, target, step, and elapsed wait."""
+
+
+def _is_ws_timeout_exc(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError) and isinstance(
+        exc.reason, (TimeoutError, socket.timeout)
+    ):
+        return True
+    cls_name = exc.__class__.__name__
+    if "Timeout" in cls_name:
+        return True
+    msg_low = str(exc).lower()
+    return "timed out" in msg_low or "timeout" in msg_low
+
+
+def format_cdp_error_context(
+    *,
+    operation: str,
+    target_label: str,
+    target_url: str,
+    target_id: str,
+    step: str,
+    elapsed_sec: float,
+    timeout_sec: float,
+) -> str:
+    return (
+        f"operation={operation!r} target={target_label!r} "
+        f"url={target_url!r} target_id={target_id!r} "
+        f"step={step!r} waited={elapsed_sec:.2f}s (timeout={timeout_sec:.1f}s)"
+    )
+
+
 class CDPConnection:
     """Thin synchronous Chrome DevTools Protocol client over `websocket-client`."""
 
-    def __init__(self, ws_url: str, timeout: float = 30.0) -> None:
-        import websocket  # Imported lazily so `--self-test` can run even before venv setup if needed
-
-        self.ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+    def __init__(
+        self,
+        ws_url: str,
+        timeout: float = 45.0,
+        *,
+        target_label: str = "cdp-target",
+        target_url: str = "",
+        target_id: str = "",
+        step_getter: Callable[[], str] | None = None,
+        connect_fn: Callable[..., Any] | None = None,
+    ) -> None:
+        self.ws_url = ws_url
+        self.default_timeout = timeout
+        self.target_label = target_label
+        self.target_url = target_url or ws_url
+        if target_id:
+            self.target_id = target_id
+        elif "/devtools/" in ws_url:
+            self.target_id = ws_url.rstrip("/").rsplit("/", 1)[-1]
+        else:
+            self.target_id = "<unknown>"
+        self._step_getter = step_getter
         self._next_id = 0
         self.events: list[dict] = []
+
+        t0 = time.monotonic()
+        try:
+            if connect_fn is not None:
+                self.ws = connect_fn(ws_url, timeout=timeout, suppress_origin=True)
+            else:
+                import websocket  # Imported lazily so `--self-test` can run even before venv setup if needed
+
+                self.ws = websocket.create_connection(
+                    ws_url, timeout=timeout, suppress_origin=True
+                )
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            ctx = self._ctx("WebSocket.connect", elapsed, timeout)
+            if _is_ws_timeout_exc(exc):
+                raise CDPTimeoutError(
+                    f"CDP WebSocket connect timed out ({ctx}): {type(exc).__name__}: {exc}"
+                ) from exc
+            raise CDPError(
+                f"CDP WebSocket connect failed ({ctx}): {type(exc).__name__}: {exc}"
+            ) from exc
+
+    @classmethod
+    def from_target(
+        cls,
+        tgt: dict[str, Any],
+        *,
+        label: str,
+        timeout: float = 45.0,
+        step_getter: Callable[[], str] | None = None,
+        connect_fn: Callable[..., Any] | None = None,
+    ) -> CDPConnection:
+        return cls(
+            str(tgt["webSocketDebuggerUrl"]),
+            timeout=timeout,
+            target_label=label,
+            target_url=str(tgt.get("url", "")),
+            target_id=str(tgt.get("id", "")),
+            step_getter=step_getter,
+            connect_fn=connect_fn,
+        )
+
+    def current_step(self) -> str:
+        if self._step_getter is not None:
+            return self._step_getter()
+        return "<unspecified-step>"
+
+    def _ctx(self, operation: str, elapsed_sec: float, timeout_sec: float) -> str:
+        return format_cdp_error_context(
+            operation=operation,
+            target_label=self.target_label,
+            target_url=self.target_url,
+            target_id=self.target_id,
+            step=self.current_step(),
+            elapsed_sec=elapsed_sec,
+            timeout_sec=timeout_sec,
+        )
 
     def call(
         self,
         method: str,
         params: dict | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
         allow_error: bool = False,
+        op_desc: str | None = None,
     ) -> dict:
+        eff_timeout = self.default_timeout if timeout is None else timeout
         self._next_id += 1
         req_id = self._next_id
-        self.ws.settimeout(timeout)
-        self.ws.send(json.dumps({"id": req_id, "method": method, "params": params or {}}))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            raw = self.ws.recv()
+        op = f"{op_desc} [{method}#{req_id}]" if op_desc else f"{method}#{req_id}"
+        t0 = time.monotonic()
+        deadline = t0 + eff_timeout
+        payload = json.dumps({"id": req_id, "method": method, "params": params or {}})
+        try:
+            self.ws.settimeout(eff_timeout)
+            self.ws.send(payload)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            ctx = self._ctx(f"{op} (send)", elapsed, eff_timeout)
+            if _is_ws_timeout_exc(exc):
+                raise CDPTimeoutError(
+                    f"CDP send timed out ({ctx}): {type(exc).__name__}: {exc}"
+                ) from exc
+            raise CDPError(
+                f"CDP send failed ({ctx}): {type(exc).__name__}: {exc}"
+            ) from exc
+
+        empty_frames = 0
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                elapsed = time.monotonic() - t0
+                raise CDPTimeoutError(
+                    f"Timed out waiting for CDP response ({self._ctx(op, elapsed, eff_timeout)})"
+                )
+            try:
+                self.ws.settimeout(max(0.05, rem))
+                raw = self.ws.recv()
+            except Exception as exc:
+                elapsed = time.monotonic() - t0
+                ctx = self._ctx(f"{op} (recv)", elapsed, eff_timeout)
+                if _is_ws_timeout_exc(exc):
+                    raise CDPTimeoutError(
+                        f"Timed out waiting for CDP response ({ctx}): {type(exc).__name__}: {exc}"
+                    ) from exc
+                raise CDPError(
+                    f"CDP WebSocket recv failed ({ctx}): {type(exc).__name__}: {exc}"
+                ) from exc
+
             if not raw:
+                empty_frames += 1
+                if not getattr(self.ws, "connected", True) or empty_frames >= 8:
+                    elapsed = time.monotonic() - t0
+                    raise CDPError(
+                        f"CDP WebSocket closed/EOF while waiting for response "
+                        f"({self._ctx(f'{op} (recv)', elapsed, eff_timeout)})"
+                    )
                 continue
-            msg = json.loads(raw)
+            empty_frames = 0
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                elapsed = time.monotonic() - t0
+                raise CDPError(
+                    f"Malformed JSON frame from CDP ({self._ctx(op, elapsed, eff_timeout)}): {raw[:200]!r}"
+                ) from exc
             if msg.get("id") == req_id:
                 if "error" in msg and not allow_error:
-                    raise RuntimeError(f"CDP {method} error: {msg['error']}")
+                    elapsed = time.monotonic() - t0
+                    raise CDPError(
+                        f"CDP protocol error ({self._ctx(op, elapsed, eff_timeout)}): {msg['error']}"
+                    )
                 return msg.get("result", msg)
             self.events.append(msg)
-        raise TimeoutError(f"Timed out waiting for CDP response to {method} (id={req_id})")
 
-    def eval_js(self, expression: str, await_promise: bool = False, timeout: float = 30.0):
+    def eval_js(
+        self,
+        expression: str,
+        await_promise: bool = False,
+        timeout: float | None = None,
+        op_desc: str | None = None,
+    ) -> Any:
+        eff_timeout = self.default_timeout if timeout is None else timeout
+        t0 = time.monotonic()
         res = self.call(
             "Runtime.evaluate",
             {
@@ -1502,10 +2061,15 @@ class CDPConnection:
                 "returnByValue": True,
                 "awaitPromise": await_promise,
             },
-            timeout=timeout,
+            timeout=eff_timeout,
+            op_desc=op_desc,
         )
         if "exceptionDetails" in res:
-            raise RuntimeError(f"JS exception: {res['exceptionDetails']}")
+            elapsed = time.monotonic() - t0
+            op = op_desc or "Runtime.evaluate"
+            raise CDPError(
+                f"CDP JavaScript exception ({self._ctx(op, elapsed, eff_timeout)}): {res['exceptionDetails']}"
+            )
         return res.get("result", {}).get("value")
 
     def close(self) -> None:
@@ -1522,7 +2086,7 @@ class CroshTab:
         self.label = label
         self.conn = conn
 
-    def get_text(self) -> str:
+    def get_text(self, timeout: float | None = None) -> str:
         js = """(() => {
             if (!window.term_ || !window.term_.term || !window.term_.term.buffer) return '';
             const buf = window.term_.term.buffer.active;
@@ -1534,11 +2098,22 @@ class CroshTab:
             while (lines.length && lines[lines.length - 1] === '') lines.pop();
             return lines.join('\\n');
         })()"""
-        return self.conn.eval_js(js) or ""
+        return (
+            self.conn.eval_js(
+                js,
+                timeout=timeout,
+                op_desc=f"{self.label}.get_text (read xterm buffer)",
+            )
+            or ""
+        )
 
     def send_line(self, line: str) -> None:
         """Types a command line into xterm.js and presses Enter."""
-        self.conn.call("Page.bringToFront")
+        short_cmd = line if len(line) <= 48 else (line[:45] + "...")
+        self.conn.call(
+            "Page.bringToFront",
+            op_desc=f"{self.label}.send_line(Page.bringToFront)",
+        )
         # Use xterm.js's native paste() to feed the exact string through term.onData
         # -> io.onVTKeystroke -> chrome.terminalPrivate.sendInput without triggering
         # libapps terminal_emulator.js keyCode collisions on ASCII 34/36/39/45/46,
@@ -1548,7 +2123,8 @@ class CroshTab:
                 window.term_.term.focus();
                 window.term_.term.paste({json.dumps(line)});
                 return true;
-            }})()"""
+            }})()""",
+            op_desc=f"{self.label}.send_line(xterm.paste {short_cmd!r})",
         )
         time.sleep(0.1)
         self.conn.call(
@@ -1562,6 +2138,7 @@ class CroshTab:
                 "text": "\r",
                 "unmodifiedText": "\r",
             },
+            op_desc=f"{self.label}.send_line(Enter rawKeyDown)",
         )
         self.conn.call(
             "Input.dispatchKeyEvent",
@@ -1572,18 +2149,29 @@ class CroshTab:
                 "key": "Enter",
                 "code": "Enter",
             },
+            op_desc=f"{self.label}.send_line(Enter keyUp)",
         )
 
     def wait_for(self, predicate, timeout: float = 120.0, desc: str = "output") -> str:
-        deadline = time.monotonic() + timeout
+        t0 = time.monotonic()
+        deadline = t0 + timeout
         last = ""
-        while time.monotonic() < deadline:
-            last = self.get_text()
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            per_call_timeout = min(self.conn.default_timeout, max(5.0, rem))
+            last = self.get_text(timeout=per_call_timeout)
             if predicate(last):
                 return last
-            time.sleep(0.5)
-        raise TimeoutError(
-            f"Timed out waiting for {desc} in {self.label}. Last terminal buffer:\n{last}"
+            sleep_sec = min(0.5, max(0.0, deadline - time.monotonic()))
+            if sleep_sec <= 0:
+                break
+            time.sleep(sleep_sec)
+        elapsed = time.monotonic() - t0
+        ctx = self.conn._ctx(f"{self.label}.wait_for({desc})", elapsed, timeout)
+        raise CDPTimeoutError(
+            f"Timed out waiting for {desc} ({ctx}). Last terminal buffer:\n{last}"
         )
 
     def run_crosh_cmd(self, cmd: str, timeout: float = 180.0, check_no_error: bool = True) -> str:
@@ -1617,8 +2205,834 @@ class TimelineEntry:
     detail: str
 
 
+@dataclasses.dataclass(frozen=True)
+class HostRunnerInfo:
+    vendor_id: str
+    model_name: str
+    nproc: int
+    mem_total_mib: float
+    mem_avail_mib: float
+
+
+@dataclasses.dataclass(frozen=True)
+class CpuStatCounters:
+    user: int
+    nice: int
+    system: int
+    idle: int
+    iowait: int
+    irq: int
+    softirq: int
+    steal: int
+    clk_tck: int = 100
+
+    @property
+    def busy_ticks(self) -> int:
+        # In Linux fs/proc/stat.c, `guest` and `guest_nice` are already included in `user` and `nice`.
+        return self.user + self.nice + self.system + self.irq + self.softirq
+
+    @property
+    def total_ticks(self) -> int:
+        return self.busy_ticks + self.idle + self.iowait + self.steal
+
+
+@dataclasses.dataclass(frozen=True)
+class CpuDeltaPct:
+    busy_pct: float
+    iowait_pct: float
+    steal_pct: float
+    idle_pct: float
+    steal_sec: float
+
+
+@dataclasses.dataclass(frozen=True)
+class PsiMetricLine:
+    avg10: float
+    avg60: float
+    avg300: float
+    total_us: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PsiResource:
+    some: PsiMetricLine
+    full: PsiMetricLine | None
+
+
+@dataclasses.dataclass(frozen=True)
+class ZramMmStat:
+    orig_data_bytes: int
+    compr_data_bytes: int
+    mem_used_total_bytes: int
+    mem_used_max_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
+class CrosvmProcStat:
+    pid: int
+    comm: str
+    cpu_ticks: int
+    vm_rss_kib: int
+    rss_anon_kib: int
+    state: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CrosResourceSample:
+    mono_ts: float
+    rel_sec: float
+    epoch_sec: float
+    uptime_sec: float
+    nproc: int
+    clk_tck: int
+    load1: float
+    load5: float
+    load15: float
+    running_threads: str
+    cros_cpu: CpuStatCounters
+    psi_cpu: PsiResource
+    psi_memory: PsiResource
+    psi_io: PsiResource
+    mem_total_kib: int
+    mem_avail_kib: int
+    cached_kib: int
+    swap_total_kib: int
+    swap_free_kib: int
+    dirty_kib: int
+    writeback_kib: int
+    shmem_kib: int
+    pgpgin: int
+    pgpgout: int
+    pswpin: int
+    pswpout: int
+    pgmajfault: int
+    oom_kill: int
+    zram: ZramMmStat | None
+    crosvm_procs: tuple[CrosvmProcStat, ...]
+    host_cpu: CpuStatCounters
+    host_load1: float
+    host_mem_avail_mib: float
+
+
+CROS_RESOURCE_SAMPLE_BEGIN = "===CROS_RES_SAMPLE_BEGIN==="
+CROS_RESOURCE_SAMPLE_END = "===CROS_RES_SAMPLE_END==="
+
+# Read-only ChromeOS VM resource snapshot script executed via `python3 -u` over SSH
+# (zero child process forks per sample and immune to mawk sandbox restrictions).
+_CROS_RESOURCE_PY_SCRIPT = r"""
+import os, sys, time
+
+NPROC = os.cpu_count() or 1
+CLK_TCK = int(os.sysconf("SC_CLK_TCK"))
+MEM_KEYS = {
+    "MemTotal", "MemAvailable", "Buffers", "Cached",
+    "SwapTotal", "SwapFree", "Dirty", "Writeback", "AnonPages", "Shmem",
+}
+VMSTAT_KEYS = {"pgpgin", "pgpgout", "pswpin", "pswpout", "pgmajfault", "oom_kill"}
+
+def emit_once() -> None:
+    out = [
+        "===CROS_RES_SAMPLE_BEGIN===",
+        f"epoch_sec={time.time():.9f}",
+        f"nproc={NPROC}",
+        f"clk_tck={CLK_TCK}",
+    ]
+    with open("/proc/uptime", "r", encoding="utf-8") as f:
+        out.append("uptime_sec=" + f.read().split()[0])
+    with open("/proc/loadavg", "r", encoding="utf-8") as f:
+        out.append("loadavg=" + " ".join(f.read().split()[:5]))
+    with open("/proc/stat", "r", encoding="utf-8") as f:
+        out.append("stat_cpu=" + f.readline().strip())
+    for p in ("cpu", "memory", "io"):
+        pp = f"/proc/pressure/{p}"
+        if os.path.exists(pp):
+            with open(pp, "r", encoding="utf-8") as f:
+                for pl in f.read().splitlines():
+                    if pl.strip():
+                        out.append(f"psi_{p}={pl.strip()}")
+        else:
+            out.append(f"psi_{p}=MISSING")
+    zp = "/sys/block/zram0/mm_stat"
+    if os.path.exists(zp):
+        with open(zp, "r", encoding="utf-8") as f:
+            out.append("zram_mm_stat=" + " ".join(f.read().split()))
+    else:
+        out.append("zram_mm_stat=NONE")
+    with open("/proc/meminfo", "r", encoding="utf-8") as f:
+        for ml in f:
+            parts = ml.split()
+            if len(parts) >= 2:
+                k = parts[0].rstrip(":")
+                if k in MEM_KEYS:
+                    out.append(f"meminfo_{k}={parts[1]}")
+    with open("/proc/vmstat", "r", encoding="utf-8") as f:
+        for vl in f:
+            parts = vl.split()
+            if len(parts) >= 2 and parts[0] in VMSTAT_KEYS:
+                out.append(f"vmstat_{parts[0]}={parts[1]}")
+    for ent in os.listdir("/proc"):
+        if not ent.isdigit():
+            continue
+        try:
+            with open(f"/proc/{ent}/stat", "r", encoding="utf-8", errors="replace") as f:
+                st = f.read().strip()
+            lp = st.find("(")
+            rp = st.rfind(") ")
+            if lp < 0 or rp < 0:
+                continue
+            comm = st[lp + 1 : rp]
+            with open(f"/proc/{ent}/cmdline", "rb") as f:
+                raw_cl = f.read(512)
+            argv0 = raw_cl.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            if not (comm.startswith("crosvm") or argv0 == "crosvm" or argv0.endswith("/crosvm")):
+                continue
+            rest = st[rp + 2 :].split()
+            state = rest[0]
+            ticks = int(rest[11]) + int(rest[12])
+            rss = 0
+            anon = 0
+            with open(f"/proc/{ent}/status", "r", encoding="utf-8", errors="replace") as f:
+                for sl in f:
+                    if sl.startswith("VmRSS:"):
+                        rss = int(sl.split()[1])
+                    elif sl.startswith("RssAnon:"):
+                        anon = int(sl.split()[1])
+            safe_comm = comm.replace(":", "_").replace(" ", "_").replace("\t", "_")
+            out.append(f"crosvm_proc={ent}:{safe_comm}:{ticks}:{rss}:{anon}:{state}")
+        except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError, OSError):
+            continue
+    out.append("===CROS_RES_SAMPLE_END===")
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+if len(sys.argv) > 1 and sys.argv[1] == "--loop":
+    interval = float(sys.argv[2])
+    while True:
+        emit_once()
+        time.sleep(interval)
+else:
+    emit_once()
+""".strip()
+
+_CROS_RESOURCE_PY_B64 = base64.b64encode(_CROS_RESOURCE_PY_SCRIPT.encode("utf-8")).decode("ascii")
+
+CROS_RESOURCE_SNAPSHOT_CMD = (
+    f"exec python3 -u -c 'import base64; exec(base64.b64decode(\"{_CROS_RESOURCE_PY_B64}\").decode(\"utf-8\"))'"
+)
+
+CROS_RESOURCE_SAMPLER_LOOP_CMD = (
+    f"exec python3 -u -c 'import base64; exec(base64.b64decode(\"{_CROS_RESOURCE_PY_B64}\").decode(\"utf-8\"))' --loop 6"
+)
+
+
+def parse_host_runner_info(cpuinfo_text: str, meminfo_text: str, nproc: int) -> HostRunnerInfo:
+    """Strictly parses host `/proc/cpuinfo`, `/proc/meminfo`, and CPU count."""
+    if nproc <= 0:
+        raise ValueError(f"Invalid host nproc={nproc}")
+    vendor_id = ""
+    model_name = ""
+    for line in cpuinfo_text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        key = k.strip()
+        val = v.strip()
+        if key == "vendor_id" and not vendor_id:
+            vendor_id = val
+        elif key == "model name" and not model_name:
+            model_name = val
+        if vendor_id and model_name:
+            break
+    if not vendor_id:
+        raise ValueError("Missing 'vendor_id' in host /proc/cpuinfo")
+    if not model_name:
+        raise ValueError("Missing 'model name' in host /proc/cpuinfo")
+
+    mem_kv: dict[str, int] = {}
+    for line in meminfo_text.splitlines():
+        if ":" not in line:
+            continue
+        k, rest = line.split(":", 1)
+        toks = rest.strip().split()
+        if toks and toks[0].isdigit():
+            mem_kv[k.strip()] = int(toks[0])
+    if "MemTotal" not in mem_kv or mem_kv["MemTotal"] <= 0:
+        raise ValueError("Missing or invalid 'MemTotal' in host /proc/meminfo")
+    if "MemAvailable" not in mem_kv:
+        raise ValueError("Missing 'MemAvailable' in host /proc/meminfo")
+    return HostRunnerInfo(
+        vendor_id=vendor_id,
+        model_name=model_name,
+        nproc=nproc,
+        mem_total_mib=mem_kv["MemTotal"] / 1024.0,
+        mem_avail_mib=mem_kv["MemAvailable"] / 1024.0,
+    )
+
+
+def parse_proc_stat_cpu_line(
+    stat_text: str, context: str, clk_tck: int = 100
+) -> CpuStatCounters:
+    """Strictly parses aggregate `cpu ...` line from `/proc/stat`."""
+    if clk_tck <= 0:
+        raise ValueError(f"{context}: invalid clk_tck={clk_tck}")
+    for line in stat_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if parts[0] == "cpu":
+            if len(parts) < 9:
+                raise ValueError(
+                    f"{context}: expected >=8 integer fields on aggregate 'cpu' line, got {stripped!r}"
+                )
+            try:
+                vals = [int(x) for x in parts[1:9]]
+            except ValueError as exc:
+                raise ValueError(f"{context}: non-integer field in {stripped!r}") from exc
+            if any(v < 0 for v in vals):
+                raise ValueError(f"{context}: negative CPU counter in {stripped!r}")
+            return CpuStatCounters(
+                user=vals[0],
+                nice=vals[1],
+                system=vals[2],
+                idle=vals[3],
+                iowait=vals[4],
+                irq=vals[5],
+                softirq=vals[6],
+                steal=vals[7],
+                clk_tck=clk_tck,
+            )
+    raise ValueError(f"{context}: missing aggregate 'cpu ' line in /proc/stat")
+
+
+def compute_cpu_delta_pct(start: CpuStatCounters, end: CpuStatCounters) -> CpuDeltaPct:
+    """Computes CPU busy/iowait/steal/idle % and stolen CPU-seconds between two `/proc/stat` snapshots."""
+    dt = end.total_ticks - start.total_ticks
+    if dt < 0:
+        raise ValueError(f"CPU total ticks went backwards: start={start.total_ticks} end={end.total_ticks}")
+    if dt == 0:
+        return CpuDeltaPct(0.0, 0.0, 0.0, 0.0, 0.0)
+    d_busy = max(0, end.busy_ticks - start.busy_ticks)
+    d_iow = max(0, end.iowait - start.iowait)
+    d_stl = max(0, end.steal - start.steal)
+    d_idl = max(0, end.idle - start.idle)
+    tck = float(end.clk_tck if end.clk_tck > 0 else 100)
+    return CpuDeltaPct(
+        busy_pct=100.0 * d_busy / dt,
+        iowait_pct=100.0 * d_iow / dt,
+        steal_pct=100.0 * d_stl / dt,
+        idle_pct=100.0 * d_idl / dt,
+        steal_sec=d_stl / tck,
+    )
+
+
+def _parse_psi_line(raw_line: str, context: str) -> tuple[str, PsiMetricLine]:
+    parts = raw_line.strip().split()
+    if len(parts) != 5 or parts[0] not in ("some", "full"):
+        raise ValueError(f"{context}: malformed PSI line {raw_line!r}")
+    kind = parts[0]
+    kv: dict[str, str] = {}
+    for tok in parts[1:]:
+        if "=" not in tok:
+            raise ValueError(f"{context}: malformed PSI token {tok!r} in {raw_line!r}")
+        k, v = tok.split("=", 1)
+        kv[k] = v
+    for req_k in ("avg10", "avg60", "avg300", "total"):
+        if req_k not in kv:
+            raise ValueError(f"{context}: missing {req_k!r} in PSI line {raw_line!r}")
+    try:
+        avg10 = float(kv["avg10"])
+        avg60 = float(kv["avg60"])
+        avg300 = float(kv["avg300"])
+        total_us = int(kv["total"])
+    except ValueError as exc:
+        raise ValueError(f"{context}: invalid numeric value in PSI line {raw_line!r}") from exc
+    if total_us < 0 or avg10 < 0.0 or avg60 < 0.0 or avg300 < 0.0:
+        raise ValueError(f"{context}: negative value in PSI line {raw_line!r}")
+    return kind, PsiMetricLine(avg10=avg10, avg60=avg60, avg300=avg300, total_us=total_us)
+
+
+def _parse_psi_resource(lines: list[str], name: str, require_full: bool) -> PsiResource:
+    ctx = f"/proc/pressure/{name}"
+    if not lines or lines == ["MISSING"]:
+        raise ValueError(f"{ctx}: missing PSI metrics")
+    by_kind: dict[str, PsiMetricLine] = {}
+    for ln in lines:
+        kind, metric = _parse_psi_line(ln, ctx)
+        if kind in by_kind:
+            raise ValueError(f"{ctx}: duplicate {kind!r} line in {lines!r}")
+        by_kind[kind] = metric
+    if "some" not in by_kind:
+        raise ValueError(f"{ctx}: missing 'some' line in {lines!r}")
+    if require_full and "full" not in by_kind:
+        raise ValueError(f"{ctx}: missing 'full' line in {lines!r}")
+    return PsiResource(some=by_kind["some"], full=by_kind.get("full"))
+
+
+def read_local_host_runner_info() -> HostRunnerInfo:
+    cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8")
+    meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+    nproc = os.cpu_count() or 0
+    return parse_host_runner_info(cpuinfo, meminfo, nproc)
+
+
+def read_local_host_dynamic_sample() -> tuple[CpuStatCounters, float, float]:
+    clk_tck = int(os.sysconf("SC_CLK_TCK"))
+    stat_txt = Path("/proc/stat").read_text(encoding="utf-8")
+    host_cpu = parse_proc_stat_cpu_line(stat_txt, "host /proc/stat", clk_tck=clk_tck)
+    load_toks = Path("/proc/loadavg").read_text(encoding="utf-8").split()
+    if len(load_toks) < 3:
+        raise ValueError(f"Malformed host /proc/loadavg: {load_toks!r}")
+    host_load1 = float(load_toks[0])
+    mem_txt = Path("/proc/meminfo").read_text(encoding="utf-8")
+    avail_kib: int | None = None
+    for line in mem_txt.splitlines():
+        if line.startswith("MemAvailable:"):
+            avail_kib = int(line.split()[1])
+            break
+    if avail_kib is None:
+        raise ValueError("Missing MemAvailable in host /proc/meminfo")
+    return host_cpu, host_load1, avail_kib / 1024.0
+
+
+def parse_cros_resource_block(
+    raw_block: str,
+    *,
+    mono_ts: float,
+    rel_sec: float,
+    host_cpu: CpuStatCounters,
+    host_load1: float,
+    host_mem_avail_mib: float,
+) -> CrosResourceSample:
+    """Strictly parses a delimited ChromeOS resource sample block."""
+    scalars: dict[str, str] = {}
+    psi_lines: dict[str, list[str]] = {"cpu": [], "memory": [], "io": []}
+    meminfo: dict[str, int] = {}
+    vmstat: dict[str, int] = {}
+    crosvm_procs: list[CrosvmProcStat] = []
+
+    for raw_ln in raw_block.splitlines():
+        ln = raw_ln.strip()
+        if not ln or ln in (CROS_RESOURCE_SAMPLE_BEGIN, CROS_RESOURCE_SAMPLE_END):
+            continue
+        if "=" not in ln:
+            raise ValueError(f"Malformed ChromeOS resource sample line (no '='): {ln!r}")
+        key, val = ln.split("=", 1)
+        if key in ("psi_cpu", "psi_memory", "psi_io"):
+            psi_lines[key.split("_", 1)[1]].append(val)
+        elif key.startswith("meminfo_"):
+            mkey = key[len("meminfo_") :]
+            try:
+                meminfo[mkey] = int(val.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid integer for {key}: {val!r}") from exc
+        elif key.startswith("vmstat_"):
+            vkey = key[len("vmstat_") :]
+            try:
+                vmstat[vkey] = int(val.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid integer for {key}: {val!r}") from exc
+        elif key == "crosvm_proc":
+            p_parts = val.split(":")
+            if len(p_parts) != 6:
+                raise ValueError(f"Malformed crosvm_proc entry: {val!r}")
+            try:
+                pid = int(p_parts[0])
+                comm = p_parts[1]
+                cpu_ticks = int(p_parts[2])
+                vm_rss_kib = int(p_parts[3])
+                rss_anon_kib = int(p_parts[4])
+                state = p_parts[5]
+            except ValueError as exc:
+                raise ValueError(f"Non-integer field in crosvm_proc entry: {val!r}") from exc
+            if pid <= 0 or cpu_ticks < 0 or vm_rss_kib < 0 or rss_anon_kib < 0 or not state:
+                raise ValueError(f"Invalid field value in crosvm_proc entry: {val!r}")
+            crosvm_procs.append(
+                CrosvmProcStat(
+                    pid=pid,
+                    comm=comm,
+                    cpu_ticks=cpu_ticks,
+                    vm_rss_kib=vm_rss_kib,
+                    rss_anon_kib=rss_anon_kib,
+                    state=state,
+                )
+            )
+        elif key in (
+            "epoch_sec",
+            "nproc",
+            "clk_tck",
+            "uptime_sec",
+            "loadavg",
+            "stat_cpu",
+            "zram_mm_stat",
+        ):
+            scalars[key] = val.strip()
+        else:
+            raise ValueError(f"Unexpected key {key!r} in ChromeOS resource sample: {ln!r}")
+
+    for req_scalar in (
+        "epoch_sec",
+        "nproc",
+        "clk_tck",
+        "uptime_sec",
+        "loadavg",
+        "stat_cpu",
+        "zram_mm_stat",
+    ):
+        if req_scalar not in scalars:
+            raise ValueError(f"Missing required field {req_scalar!r} in ChromeOS resource sample")
+
+    try:
+        epoch_sec = float(scalars["epoch_sec"])
+        nproc = int(scalars["nproc"])
+        clk_tck = int(scalars["clk_tck"])
+        uptime_sec = float(scalars["uptime_sec"])
+    except ValueError as exc:
+        raise ValueError(f"Invalid scalar number in ChromeOS resource sample: {scalars!r}") from exc
+    if epoch_sec <= 0 or nproc <= 0 or clk_tck <= 0 or uptime_sec <= 0:
+        raise ValueError(
+            f"Non-positive epoch/nproc/clk_tck/uptime in ChromeOS resource sample: {scalars!r}"
+        )
+
+    load_parts = scalars["loadavg"].split()
+    if len(load_parts) < 4 or "/" not in load_parts[3]:
+        raise ValueError(f"Malformed ChromeOS loadavg {scalars['loadavg']!r}")
+    try:
+        load1 = float(load_parts[0])
+        load5 = float(load_parts[1])
+        load15 = float(load_parts[2])
+    except ValueError as exc:
+        raise ValueError(f"Invalid float in ChromeOS loadavg {scalars['loadavg']!r}") from exc
+
+    cros_cpu = parse_proc_stat_cpu_line(scalars["stat_cpu"], "ChromeOS /proc/stat", clk_tck=clk_tck)
+    psi_cpu = _parse_psi_resource(psi_lines["cpu"], "cpu", require_full=False)
+    psi_memory = _parse_psi_resource(psi_lines["memory"], "memory", require_full=True)
+    psi_io = _parse_psi_resource(psi_lines["io"], "io", require_full=True)
+
+    for req_mem in (
+        "MemTotal",
+        "MemAvailable",
+        "Cached",
+        "SwapTotal",
+        "SwapFree",
+        "Dirty",
+        "Writeback",
+    ):
+        if req_mem not in meminfo:
+            raise ValueError(f"Missing meminfo_{req_mem} in ChromeOS resource sample")
+
+    for req_vm in ("pgpgin", "pgpgout", "pswpin", "pswpout", "pgmajfault"):
+        if req_vm not in vmstat:
+            raise ValueError(f"Missing vmstat_{req_vm} in ChromeOS resource sample")
+
+    zram_raw = scalars["zram_mm_stat"]
+    zram: ZramMmStat | None = None
+    if zram_raw != "NONE":
+        z_parts = zram_raw.split()
+        if len(z_parts) < 7:
+            raise ValueError(f"Malformed ChromeOS zram mm_stat (expected >=7 ints): {zram_raw!r}")
+        try:
+            z_ints = [int(x) for x in z_parts[:7]]
+        except ValueError as exc:
+            raise ValueError(f"Non-integer in ChromeOS zram mm_stat: {zram_raw!r}") from exc
+        if any(v < 0 for v in z_ints):
+            raise ValueError(f"Negative value in ChromeOS zram mm_stat: {zram_raw!r}")
+        zram = ZramMmStat(
+            orig_data_bytes=z_ints[0],
+            compr_data_bytes=z_ints[1],
+            mem_used_total_bytes=z_ints[2],
+            mem_used_max_bytes=z_ints[4],
+        )
+
+    return CrosResourceSample(
+        mono_ts=mono_ts,
+        rel_sec=rel_sec,
+        epoch_sec=epoch_sec,
+        uptime_sec=uptime_sec,
+        nproc=nproc,
+        clk_tck=clk_tck,
+        load1=load1,
+        load5=load5,
+        load15=load15,
+        running_threads=load_parts[3],
+        cros_cpu=cros_cpu,
+        psi_cpu=psi_cpu,
+        psi_memory=psi_memory,
+        psi_io=psi_io,
+        mem_total_kib=meminfo["MemTotal"],
+        mem_avail_kib=meminfo["MemAvailable"],
+        cached_kib=meminfo["Cached"],
+        swap_total_kib=meminfo["SwapTotal"],
+        swap_free_kib=meminfo["SwapFree"],
+        dirty_kib=meminfo["Dirty"],
+        writeback_kib=meminfo["Writeback"],
+        shmem_kib=meminfo.get("Shmem", 0),
+        pgpgin=vmstat["pgpgin"],
+        pgpgout=vmstat["pgpgout"],
+        pswpin=vmstat["pswpin"],
+        pswpout=vmstat["pswpout"],
+        pgmajfault=vmstat["pgmajfault"],
+        oom_kill=vmstat.get("oom_kill", 0),
+        zram=zram,
+        crosvm_procs=tuple(crosvm_procs),
+        host_cpu=host_cpu,
+        host_load1=host_load1,
+        host_mem_avail_mib=host_mem_avail_mib,
+    )
+
+
+def _crosvm_interval_cpu_pct(prev: CrosResourceSample, curr: CrosResourceSample) -> float:
+    dt_up = curr.uptime_sec - prev.uptime_sec
+    if dt_up <= 0.0:
+        return 0.0
+    prev_map = {p.pid: p.cpu_ticks for p in prev.crosvm_procs}
+    total_delta_ticks = 0
+    max_new_pid_ticks = dt_up * curr.clk_tck * max(1, curr.nproc) * 2.0
+    for p in curr.crosvm_procs:
+        if p.pid in prev_map and p.cpu_ticks >= prev_map[p.pid]:
+            total_delta_ticks += p.cpu_ticks - prev_map[p.pid]
+        elif p.cpu_ticks <= max_new_pid_ticks:
+            total_delta_ticks += p.cpu_ticks
+    return 100.0 * total_delta_ticks / (dt_up * float(curr.clk_tck))
+
+
+def summarize_resource_diagnostics(
+    host_info: HostRunnerInfo | None,
+    samples: list[CrosResourceSample],
+    *,
+    install_mono: float | None = None,
+    sampler_warnings: list[str] | None = None,
+    strict: bool = True,
+) -> list[str]:
+    """Formats a compact host + ChromeOS VM resource pressure summary and periodic sample table."""
+    warnings = list(sampler_warnings or [])
+    if strict:
+        if warnings:
+            raise RuntimeError(f"Resource diagnostics sampler errors: {warnings}")
+        if host_info is None:
+            raise RuntimeError("Missing host runner CPU/memory info in strict mode")
+
+    reanchored: list[CrosResourceSample] = []
+    for s in samples:
+        rel = (s.mono_ts - install_mono) if install_mono is not None else s.rel_sec
+        reanchored.append(dataclasses.replace(s, rel_sec=rel))
+
+    if strict:
+        if len(reanchored) < 2:
+            raise RuntimeError(
+                f"Expected >=2 ChromeOS resource samples for delta analysis, got {len(reanchored)}"
+            )
+        if not any(s.rel_sec >= 0.0 for s in reanchored):
+            raise RuntimeError(
+                "No ChromeOS resource samples were recorded at or after InstallClicked"
+            )
+        if reanchored[-1].uptime_sec <= reanchored[0].uptime_sec:
+            raise RuntimeError(
+                f"Non-increasing ChromeOS uptime across resource samples: "
+                f"{reanchored[0].uptime_sec} -> {reanchored[-1].uptime_sec}"
+            )
+
+    out: list[str] = []
+    if warnings:
+        out.append("[resource diagnostics warnings]")
+        for w in warnings:
+            out.append(f"  {w}")
+
+    if host_info is not None and len(reanchored) < 2:
+        out.append(
+            f"Host runner: vendor={host_info.vendor_id} model={host_info.model_name!r} "
+            f"nproc={host_info.nproc} ram_total={host_info.mem_total_mib / 1024.0:.1f}GiB "
+            f"avail={host_info.mem_avail_mib / 1024.0:.1f}GiB (samples={len(reanchored)})"
+        )
+        if not reanchored:
+            out.append("ChromeOS VM: <no resource samples collected>")
+            return out
+
+    if not reanchored:
+        out.append("Host/ChromeOS resource diagnostics: <no samples collected>")
+        return out
+
+    # Baseline is the latest sample at/just before InstallClicked (or sample[0] if all are post-Install).
+    pre_or_at_install = [s for s in reanchored if s.rel_sec <= 0.5]
+    s_base = pre_or_at_install[-1] if pre_or_at_install else reanchored[0]
+    s_end = reanchored[-1]
+    if s_end is s_base and len(reanchored) >= 2:
+        s_base = reanchored[0]
+        s_end = reanchored[-1]
+
+    window_samples = [s for s in reanchored if s.mono_ts >= s_base.mono_ts]
+    span_sec = max(0.0, s_end.uptime_sec - s_base.uptime_sec)
+
+    host_delta = (
+        compute_cpu_delta_pct(s_base.host_cpu, s_end.host_cpu)
+        if span_sec > 0
+        else CpuDeltaPct(0.0, 0.0, 0.0, 0.0, 0.0)
+    )
+    cros_delta = (
+        compute_cpu_delta_pct(s_base.cros_cpu, s_end.cros_cpu)
+        if span_sec > 0
+        else CpuDeltaPct(0.0, 0.0, 0.0, 0.0, 0.0)
+    )
+
+    if host_info is not None:
+        host_min_avail_gib = min(s.host_mem_avail_mib for s in window_samples) / 1024.0
+        host_peak_load1 = max(s.host_load1 for s in window_samples)
+        out.append(
+            f"Host runner: vendor={host_info.vendor_id} model={host_info.model_name!r} "
+            f"nproc={host_info.nproc} ram_total={host_info.mem_total_mib / 1024.0:.1f}GiB "
+            f"min_avail={host_min_avail_gib:.1f}GiB load1_peak={host_peak_load1:.2f} "
+            f"cpu_busy={host_delta.busy_pct:.1f}% iowait={host_delta.iowait_pct:.1f}% "
+            f"steal={host_delta.steal_pct:.2f}% ({host_delta.steal_sec:.2f} cpu-s)"
+        )
+
+    load1_avg = sum(s.load1 for s in window_samples) / len(window_samples)
+    load1_peak = max(s.load1 for s in window_samples)
+    mem_total_mib = s_end.mem_total_kib / 1024.0
+    out.append(
+        f"ChromeOS VM: vcpus={s_end.nproc} ram_total={mem_total_mib:.0f}MiB "
+        f"samples={len(window_samples)} span={span_sec:.1f}s "
+        f"(t{s_base.rel_sec:+.1f}s..t{s_end.rel_sec:+.1f}s) "
+        f"load1_avg={load1_avg:.2f} load1_peak={load1_peak:.2f} "
+        f"cpu_busy={cros_delta.busy_pct:.1f}% iowait={cros_delta.iowait_pct:.1f}% "
+        f"guest_steal={cros_delta.steal_pct:.2f}% ({cros_delta.steal_sec:.2f} cpu-s)"
+    )
+
+    def _psi_delta(
+        getter: Callable[[CrosResourceSample], PsiMetricLine | None],
+    ) -> tuple[float, float, float]:
+        b_m = getter(s_base)
+        e_m = getter(s_end)
+        if b_m is None or e_m is None or span_sec <= 0.0:
+            return 0.0, 0.0, 0.0
+        d_sec = max(0, e_m.total_us - b_m.total_us) / 1_000_000.0
+        pct = 100.0 * d_sec / span_sec
+        pk10 = max((getter(s).avg10 for s in window_samples if getter(s) is not None), default=0.0)
+        return d_sec, pct, pk10
+
+    cpu_s_sec, cpu_s_pct, cpu_pk10 = _psi_delta(lambda s: s.psi_cpu.some)
+    mem_s_sec, mem_s_pct, mem_s_pk10 = _psi_delta(lambda s: s.psi_memory.some)
+    mem_f_sec, mem_f_pct, mem_f_pk10 = _psi_delta(lambda s: s.psi_memory.full)
+    io_s_sec, io_s_pct, io_s_pk10 = _psi_delta(lambda s: s.psi_io.some)
+    io_f_sec, io_f_pct, io_f_pk10 = _psi_delta(lambda s: s.psi_io.full)
+    out.append(
+        f"ChromeOS PSI: cpu_some={cpu_s_sec:.2f}s ({cpu_s_pct:.1f}%, pk10={cpu_pk10:.1f}) | "
+        f"mem_some={mem_s_sec:.2f}s ({mem_s_pct:.1f}%, pk10={mem_s_pk10:.1f}) "
+        f"mem_full={mem_f_sec:.2f}s ({mem_f_pct:.1f}%, pk10={mem_f_pk10:.1f}) | "
+        f"io_some={io_s_sec:.2f}s ({io_s_pct:.1f}%, pk10={io_s_pk10:.1f}) "
+        f"io_full={io_f_sec:.2f}s ({io_f_pct:.1f}%, pk10={io_f_pk10:.1f})"
+    )
+
+    min_avail_mib = min(s.mem_avail_kib for s in window_samples) / 1024.0
+    min_avail_pct = 100.0 * min_avail_mib / max(1.0, mem_total_mib)
+    swap_total_mib = s_end.swap_total_kib / 1024.0
+    swap_used_peak_mib = max((s.swap_total_kib - s.swap_free_kib) for s in window_samples) / 1024.0
+    dirty_peak_mib = max((s.dirty_kib + s.writeback_kib) for s in window_samples) / 1024.0
+    zram_samples = [s.zram for s in window_samples if s.zram is not None]
+    if zram_samples:
+        z_orig_pk = max(z.orig_data_bytes for z in zram_samples) / (1024.0 * 1024.0)
+        z_compr_pk = max(z.compr_data_bytes for z in zram_samples) / (1024.0 * 1024.0)
+        z_used_pk = max(z.mem_used_max_bytes for z in zram_samples) / (1024.0 * 1024.0)
+        zram_str = f"orig_pk={z_orig_pk:.1f}MiB compr_pk={z_compr_pk:.1f}MiB used_max={z_used_pk:.1f}MiB"
+    else:
+        zram_str = "none"
+
+    d_pgpgin = max(0, s_end.pgpgin - s_base.pgpgin)
+    d_pgpgout = max(0, s_end.pgpgout - s_base.pgpgout)
+    d_pswpin = max(0, s_end.pswpin - s_base.pswpin)
+    d_pswpout = max(0, s_end.pswpout - s_base.pswpout)
+    d_pgmaj = max(0, s_end.pgmajfault - s_base.pgmajfault)
+    d_oom = max(0, s_end.oom_kill - s_base.oom_kill)
+    out.append(
+        f"ChromeOS mem/vmstat: avail_min={min_avail_mib:.0f}MiB ({min_avail_pct:.1f}%) "
+        f"swap_used_pk={swap_used_peak_mib:.0f}/{swap_total_mib:.0f}MiB "
+        f"zram=({zram_str}) dirty+wb_pk={dirty_peak_mib:.1f}MiB "
+        f"pgpg_in/out=+{d_pgpgin}/+{d_pgpgout}KiB "
+        f"pswp_in/out=+{d_pswpin}/+{d_pswpout} pgmajfault=+{d_pgmaj} oom_kill=+{d_oom}"
+    )
+
+    crosvm_step_pcts: list[float] = []
+    for i in range(1, len(window_samples)):
+        if window_samples[i].crosvm_procs or window_samples[i - 1].crosvm_procs:
+            crosvm_step_pcts.append(_crosvm_interval_cpu_pct(window_samples[i - 1], window_samples[i]))
+    peak_procs = max((len(s.crosvm_procs) for s in window_samples), default=0)
+    peak_proc_rss_mib = (
+        max((p.vm_rss_kib for s in window_samples for p in s.crosvm_procs), default=0) / 1024.0
+    )
+    peak_sum_anon_mib = (
+        max((sum(p.rss_anon_kib for p in s.crosvm_procs) for s in window_samples), default=0)
+        / 1024.0
+    )
+    crosvm_avg_pct = sum(crosvm_step_pcts) / len(crosvm_step_pcts) if crosvm_step_pcts else 0.0
+    crosvm_pk_pct = max(crosvm_step_pcts, default=0.0)
+    out.append(
+        f"ChromeOS crosvm: peak_procs={peak_procs} "
+        f"cpu_avg={crosvm_avg_pct:.1f}% cpu_peak={crosvm_pk_pct:.1f}% (100%=1vCPU) "
+        f"peak_proc_rss={peak_proc_rss_mib:.0f}MiB peak_sum_anon={peak_sum_anon_mib:.0f}MiB"
+    )
+
+    bottleneck_tags: list[str] = []
+    if host_delta.steal_pct >= 5.0 or cros_delta.steal_pct >= 5.0:
+        bottleneck_tags.append(
+            f"hypervisor/host steal (host={host_delta.steal_pct:.1f}%, guest={cros_delta.steal_pct:.1f}%)"
+        )
+    if cpu_s_pct >= 10.0 or cros_delta.busy_pct >= 75.0 or load1_peak >= s_end.nproc * 1.25:
+        bottleneck_tags.append(
+            f"CPU-contention (cros_busy={cros_delta.busy_pct:.1f}%, psi_cpu_some={cpu_s_pct:.1f}%, load1_pk={load1_peak:.2f}/{s_end.nproc}vCPU)"
+        )
+    if io_s_pct >= 10.0 or cros_delta.iowait_pct >= 10.0:
+        bottleneck_tags.append(
+            f"IO-stall (psi_io_some={io_s_pct:.1f}%, io_full={io_f_pct:.1f}%, iowait={cros_delta.iowait_pct:.1f}%)"
+        )
+    if mem_s_pct >= 5.0 or d_pswpout > 0 or d_oom > 0 or min_avail_pct < 12.0:
+        bottleneck_tags.append(
+            f"memory/reclaim (psi_mem_some={mem_s_pct:.1f}%, mem_full={mem_f_pct:.1f}%, pswpout=+{d_pswpout}, avail_min={min_avail_mib:.0f}MiB)"
+        )
+    profile_str = "; ".join(bottleneck_tags) if bottleneck_tags else "no major CPU/memory/IO stall observed"
+    out.append(f"Observed resource profile: {profile_str}")
+
+    # Compact per-sample table (cap to <=32 rows on very long runs while keeping first, peak, and last).
+    if len(window_samples) <= 32:
+        chosen_indices = list(range(len(window_samples)))
+    else:
+        stride = max(1, (len(window_samples) - 1) // 30)
+        chosen_set = set(range(0, len(window_samples), stride))
+        chosen_set.add(0)
+        chosen_set.add(len(window_samples) - 1)
+        chosen_indices = sorted(chosen_set)
+
+    out.append(f"[periodic samples ({len(chosen_indices)}/{len(window_samples)} shown, relative to Install click)]")
+    for idx in chosen_indices:
+        cur = window_samples[idx]
+        if idx == 0:
+            c_cpu_str = "baseline"
+            h_stl_str = "base"
+            pswp_str = "+0/+0"
+            cvm_cpu_str = "base"
+        else:
+            prv = window_samples[idx - 1]
+            cd = compute_cpu_delta_pct(prv.cros_cpu, cur.cros_cpu)
+            hd = compute_cpu_delta_pct(prv.host_cpu, cur.host_cpu)
+            c_cpu_str = f"{cd.busy_pct:4.1f}%(iow={cd.iowait_pct:.1f}%,stl={cd.steal_pct:.1f}%)"
+            h_stl_str = f"{hd.steal_pct:.1f}%"
+            pswp_str = f"+{max(0, cur.pswpin - prv.pswpin)}/+{max(0, cur.pswpout - prv.pswpout)}"
+            cvm_cpu_str = f"{_crosvm_interval_cpu_pct(prv, cur):.1f}%"
+        avail_m = cur.mem_avail_kib / 1024.0
+        swp_m = (cur.swap_total_kib - cur.swap_free_kib) / 1024.0
+        z_m = (cur.zram.mem_used_total_bytes / (1024.0 * 1024.0)) if cur.zram is not None else 0.0
+        rss_pk_m = max((p.vm_rss_kib for p in cur.crosvm_procs), default=0) / 1024.0
+        anon_sum_m = sum(p.rss_anon_kib for p in cur.crosvm_procs) / 1024.0
+        out.append(
+            f"  t{cur.rel_sec:+6.1f}s: load1={cur.load1:4.2f} cros_cpu={c_cpu_str} "
+            f"psi10(c/m/i)={cur.psi_cpu.some.avg10:.1f}/{cur.psi_memory.some.avg10:.1f}/{cur.psi_io.some.avg10:.1f} "
+            f"avail={avail_m:.0f}MiB swap={swp_m:.0f}MiB(zram={z_m:.1f}MiB) pswp={pswp_str} "
+            f"crosvm={len(cur.crosvm_procs)}p/{cvm_cpu_str}/rss={rss_pk_m:.0f}MiB(anon={anon_sum_m:.0f}MiB) "
+            f"host_stl={h_stl_str}"
+        )
+    return out
+
+
 class InitTimelineRecorder:
-    """Passive, side-effect-free recorder of VM/container initialization signals, logs, and UMA."""
+    """Passive, side-effect-free recorder of VM/container initialization signals, logs, UMA, and resource pressure."""
 
     def __init__(
         self,
@@ -1652,8 +3066,18 @@ class InitTimelineRecorder:
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._stderr_lines: list[str] = []
+        self.host_runner_info: HostRunnerInfo | None = None
+        self._res_proc: subprocess.Popen[str] | None = None
+        self._res_reader_thread: threading.Thread | None = None
+        self._res_stderr_thread: threading.Thread | None = None
+        self._res_stderr_lines: list[str] = []
+        self._res_first_sample_event = threading.Event()
+        self._res_fatal_error: Exception | None = None
+        self._resource_samples: list[CrosResourceSample] = []
+        self._final_res_snapshot_taken = False
         self._stop_requested = False
         self.readonly_summary_lines: list[str] = []
+        self.resource_summary_lines: list[str] = []
         self.guest_summary_lines: list[str] = []
         self.messages_excerpt: str = ""
         self.chrome_excerpt: str = ""
@@ -1667,13 +3091,22 @@ class InitTimelineRecorder:
         with self._lock:
             return "\n".join(self._stderr_lines).strip()
 
+    def _get_res_stderr_text(self) -> str:
+        with self._lock:
+            return "\n".join(self._res_stderr_lines).strip()
+
     def check_no_fatal_error(self) -> None:
         with self._lock:
             err = self._fatal_error
+            res_err = self._res_fatal_error
         if err is not None:
             raise RuntimeError(
                 f"Fatal D-Bus/protobuf validation error in background monitor: {err}"
             ) from err
+        if res_err is not None:
+            raise RuntimeError(
+                f"Fatal ChromeOS resource diagnostics error in background sampler: {res_err}"
+            ) from res_err
         if self._mon_proc is not None and not self._stop_requested:
             rc = self._mon_proc.poll()
             if rc is not None:
@@ -1682,9 +3115,18 @@ class InitTimelineRecorder:
                     f"dbus-monitor process exited prematurely before stop_and_collect "
                     f"(returncode={rc}, stderr={stderr_txt!r})"
                 )
+        if self._res_proc is not None and not self._stop_requested:
+            r_rc = self._res_proc.poll()
+            if r_rc is not None:
+                r_stderr = self._get_res_stderr_text()
+                raise RuntimeError(
+                    f"ChromeOS resource sampler process exited prematurely before stop_and_collect "
+                    f"(returncode={r_rc}, stderr={r_stderr!r})"
+                )
 
     def start(self) -> None:
-        """Starts background `dbus-monitor --system` on the VM and waits for `NameAcquired` before `Install`."""
+        """Starts background `dbus-monitor --system` and periodic resource sampler on the VM before `Install`."""
+        self.host_runner_info = read_local_host_runner_info()
         self.msg_line_cursor = int(
             self.vm.ssh("wc -l < /var/log/messages").stdout.strip() or "0"
         )
@@ -1708,6 +3150,18 @@ class InitTimelineRecorder:
         self._reader_thread = threading.Thread(target=self._read_events_loop, daemon=True)
         self._reader_thread.start()
 
+        self._res_proc = subprocess.Popen(
+            [*self.vm._ssh_base_cmd(), CROS_RESOURCE_SAMPLER_LOOP_CMD],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._res_stderr_thread = threading.Thread(target=self._read_res_stderr_loop, daemon=True)
+        self._res_stderr_thread.start()
+        self._res_reader_thread = threading.Thread(target=self._read_res_events_loop, daemon=True)
+        self._res_reader_thread.start()
+
         if not self._monitor_subscribed_event.wait(timeout=15.0):
             self.check_no_fatal_error()
             rc = self._mon_proc.poll()
@@ -1715,10 +3169,19 @@ class InitTimelineRecorder:
                 "Timed out waiting for dbus-monitor org.freedesktop.DBus.NameAcquired "
                 f"subscription signal (returncode={rc}, stderr={self._get_stderr_text()!r})"
             )
+        if not self._res_first_sample_event.wait(timeout=15.0):
+            self.check_no_fatal_error()
+            r_rc = self._res_proc.poll()
+            raise RuntimeError(
+                "Timed out waiting for initial ChromeOS resource diagnostics sample "
+                f"(returncode={r_rc}, stderr={self._get_res_stderr_text()!r})"
+            )
         self.check_no_fatal_error()
         log(
-            f"  [timeline] Passive D-Bus signal monitor subscribed on system bus "
-            f"(NameAcquired={self.monitor_unique_name})"
+            f"  [timeline] Passive D-Bus monitor (NameAcquired={self.monitor_unique_name}) "
+            f"& periodic ChromeOS resource sampler started "
+            f"(host={self.host_runner_info.vendor_id} {self.host_runner_info.model_name}, "
+            f"nproc={self.host_runner_info.nproc})."
         )
 
     def _read_stderr_loop(self) -> None:
@@ -1728,6 +3191,77 @@ class InitTimelineRecorder:
             if stripped:
                 with self._lock:
                     self._stderr_lines.append(stripped)
+
+    def _read_res_stderr_loop(self) -> None:
+        assert self._res_proc is not None and self._res_proc.stderr is not None
+        for line in self._res_proc.stderr:
+            stripped = line.rstrip("\r\n")
+            if stripped:
+                with self._lock:
+                    self._res_stderr_lines.append(stripped)
+
+    def _record_raw_resource_block(self, raw_block: str, mono_ts: float) -> None:
+        host_cpu, host_load1, host_mem_avail_mib = read_local_host_dynamic_sample()
+        with self._lock:
+            t_inst = self.t_install_mono
+        rel_sec = (mono_ts - t_inst) if t_inst is not None else 0.0
+        sample = parse_cros_resource_block(
+            raw_block,
+            mono_ts=mono_ts,
+            rel_sec=rel_sec,
+            host_cpu=host_cpu,
+            host_load1=host_load1,
+            host_mem_avail_mib=host_mem_avail_mib,
+        )
+        with self._lock:
+            self._resource_samples.append(sample)
+        self._res_first_sample_event.set()
+
+    def _read_res_events_loop(self) -> None:
+        assert self._res_proc is not None and self._res_proc.stdout is not None
+        in_block = False
+        buf_lines: list[str] = []
+        try:
+            for line in self._res_proc.stdout:
+                if self._stop_requested:
+                    return
+                stripped = line.strip()
+                if stripped == CROS_RESOURCE_SAMPLE_BEGIN:
+                    if in_block:
+                        raise ValueError("Nested ===CROS_RES_SAMPLE_BEGIN=== without END")
+                    in_block = True
+                    buf_lines = [stripped]
+                elif stripped == CROS_RESOURCE_SAMPLE_END:
+                    if not in_block:
+                        raise ValueError("===CROS_RES_SAMPLE_END=== without BEGIN")
+                    buf_lines.append(stripped)
+                    in_block = False
+                    self._record_raw_resource_block("\n".join(buf_lines), time.monotonic())
+                    buf_lines = []
+                elif in_block:
+                    buf_lines.append(stripped)
+                elif stripped:
+                    raise ValueError(
+                        f"Unexpected line outside ChromeOS resource sample block: {stripped!r}"
+                    )
+            if not self._stop_requested:
+                try:
+                    r_rc = self._res_proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    r_rc = self._res_proc.poll()
+                if self._res_stderr_thread is not None:
+                    self._res_stderr_thread.join(timeout=1.0)
+                raise RuntimeError(
+                    "ChromeOS resource sampler stdout reached EOF prematurely before stop_and_collect "
+                    f"(returncode={r_rc}, stderr={self._get_res_stderr_text()!r})"
+                )
+        except Exception as exc:
+            with self._lock:
+                if self._res_fatal_error is None:
+                    self._res_fatal_error = exc
+            log(f"  [timeline] FATAL error in ChromeOS resource sampler: {exc}")
+            self._res_first_sample_event.set()
+            self._container_started_event.set()
 
     def mark_install_clicked(self, username: str) -> None:
         self.check_no_fatal_error()
@@ -2303,7 +3837,8 @@ class InitTimelineRecorder:
                     self.readonly_summary_lines.append(f"Read-only D-Bus query error: {exc}")
 
     def _collect_uma_histograms(self, strict_dbus: bool = True) -> None:
-        b_conn = self.vm.connect_browser_cdp()
+        self.vm.set_step("step5:collect_uma_histograms")
+        b_conn = self.vm.connect_browser_cdp(label="Browser-UMA")
         try:
             for h_name in (
                 "Crostini.BaguetteReadyWait",
@@ -2312,7 +3847,11 @@ class InitTimelineRecorder:
                 "Crostini.RestarterResult.Installer",
             ):
                 if strict_dbus:
-                    h_res = b_conn.call("Browser.getHistogram", {"name": h_name})
+                    h_res = b_conn.call(
+                        "Browser.getHistogram",
+                        {"name": h_name},
+                        op_desc=f"UMA:getHistogram({h_name})",
+                    )
                     hist = h_res.get("histogram")
                     if not isinstance(hist, dict) or not hist:
                         raise RuntimeError(
@@ -2329,7 +3868,10 @@ class InitTimelineRecorder:
                 else:
                     try:
                         h_res = b_conn.call(
-                            "Browser.getHistogram", {"name": h_name}, allow_error=True
+                            "Browser.getHistogram",
+                            {"name": h_name},
+                            allow_error=True,
+                            op_desc=f"UMA:getHistogram({h_name})",
                         )
                         if "error" in h_res:
                             self.readonly_summary_lines.append(
@@ -2521,28 +4063,99 @@ class InitTimelineRecorder:
             strict=strict_dbus,
         )
 
+    def _collect_resource_diagnostics(self, strict_dbus: bool = True) -> None:
+        sampler_warnings: list[str] = []
+        with self._lock:
+            res_err = self._res_fatal_error
+        if res_err is not None:
+            if strict_dbus:
+                raise RuntimeError(
+                    f"Fatal ChromeOS resource diagnostics error in background sampler: {res_err}"
+                ) from res_err
+            sampler_warnings.append(f"background sampler error: {res_err}")
+
+        if self.host_runner_info is None:
+            if strict_dbus:
+                self.host_runner_info = read_local_host_runner_info()
+            else:
+                try:
+                    self.host_runner_info = read_local_host_runner_info()
+                except Exception as exc:
+                    sampler_warnings.append(f"host runner info read failed: {exc}")
+
+        if not self._final_res_snapshot_taken and self.vm is not None:
+            if strict_dbus:
+                fin_res = self.vm.ssh(CROS_RESOURCE_SNAPSHOT_CMD, check=True, timeout=20)
+                self._record_raw_resource_block(fin_res.stdout, time.monotonic())
+                self._final_res_snapshot_taken = True
+            else:
+                try:
+                    fin_res = self.vm.ssh(CROS_RESOURCE_SNAPSHOT_CMD, check=False, timeout=15)
+                    if fin_res.returncode == 0 and fin_res.stdout:
+                        self._record_raw_resource_block(fin_res.stdout, time.monotonic())
+                        self._final_res_snapshot_taken = True
+                    else:
+                        err_snip = (fin_res.stderr or "").strip().replace("\n", " | ")[:200]
+                        sampler_warnings.append(
+                            f"final ChromeOS resource snapshot exited with rc={fin_res.returncode} (stderr={err_snip!r})"
+                        )
+                except Exception as exc:
+                    sampler_warnings.append(f"final ChromeOS resource snapshot failed: {exc}")
+
+        with self._lock:
+            samples_copy = list(self._resource_samples)
+            t_inst = self.t_install_mono
+
+        self.resource_summary_lines = summarize_resource_diagnostics(
+            self.host_runner_info,
+            samples_copy,
+            install_mono=t_inst,
+            sampler_warnings=sampler_warnings,
+            strict=strict_dbus,
+        )
+
     def stop_and_collect(self, strict_dbus: bool = True) -> None:
-        """Stops the D-Bus monitor and collects read-only D-Bus state, UMA histograms, and logs."""
+        """Stops the D-Bus monitor + resource sampler and collects read-only D-Bus, resource, UMA, and log state."""
         if strict_dbus:
             self.check_no_fatal_error()
 
         self._stop_requested = True
-        if self._mon_proc is not None:
-            try:
-                self._mon_proc.terminate()
-                self._mon_proc.wait(timeout=3)
-            except Exception:
+        for proc in (self._mon_proc, self._res_proc):
+            if proc is not None:
                 try:
-                    self._mon_proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=3)
                 except Exception:
-                    pass
-            self._mon_proc = None
-        if self._reader_thread is not None:
-            self._reader_thread.join(timeout=2.0)
-            self._reader_thread = None
-        if self._stderr_thread is not None:
-            self._stderr_thread.join(timeout=2.0)
-            self._stderr_thread = None
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        self._mon_proc = None
+        self._res_proc = None
+        for th in (
+            self._reader_thread,
+            self._stderr_thread,
+            self._res_reader_thread,
+            self._res_stderr_thread,
+        ):
+            if th is not None:
+                th.join(timeout=2.0)
+        self._reader_thread = None
+        self._stderr_thread = None
+        self._res_reader_thread = None
+        self._res_stderr_thread = None
+
+        # Collect host + ChromeOS VM periodic resource diagnostics FIRST (over SSH + host /proc,
+        # completely independent of the Arch guest) so even if a later D-Bus/UMA/guest query fails,
+        # the timeline report always includes the resource summary.
+        self.resource_summary_lines.clear()
+        if strict_dbus:
+            self._collect_resource_diagnostics(strict_dbus=True)
+        else:
+            try:
+                self._collect_resource_diagnostics(strict_dbus=False)
+            except Exception as exc:
+                self.resource_summary_lines.append(f"Resource diagnostics error: {exc}")
 
         if strict_dbus:
             self.check_no_fatal_error()
@@ -2746,10 +4359,15 @@ class InitTimelineRecorder:
                 start_s = start_us / 1_000_000.0
                 end_s = end_us / 1_000_000.0
                 dur_str = (
-                    f"{end_s - start_s:.2f}s"
+                    f"{end_s - start_s:.3f}s"
                     if (start_us > 0 and end_us >= start_us)
                     else "in-flight/n/a"
                 )
+                act_dur_extra = ""
+                if inact_exit_us > 0 and act_enter_us >= inact_exit_us:
+                    act_dur_extra = (
+                        f", activate_dur={(act_enter_us - inact_exit_us) / 1_000_000.0:.3f}s"
+                    )
                 host_window = ""
                 if guest_boot_rel_sec is not None and start_us > 0:
                     h_start = max(0.0, guest_boot_rel_sec + start_s)
@@ -2770,14 +4388,14 @@ class InitTimelineRecorder:
                                     h_end,
                                     "guest",
                                     f"UnitDone({unit_id})",
-                                    f"(guest+{end_s:.2f}s) systemctl show exit dur={dur_str} result={result} status={exec_status}",
+                                    f"(guest+{end_s:.2f}s) systemctl show exit dur={dur_str}{act_dur_extra} result={result} status={exec_status}",
                                 )
                             )
                     else:
                         host_window = f" host=t+{h_start:.1f}s..(running)"
                 self.guest_summary_lines.append(
                     f"  {unit_id}: state={act_state}/{sub_state} result={result} "
-                    f"guest=+{start_s:.2f}s..+{end_s:.2f}s (dur={dur_str}, exit_status={exec_status})"
+                    f"guest=+{start_s:.3f}s..+{end_s:.3f}s (dur={dur_str}{act_dur_extra}, exit_status={exec_status})"
                     f"{host_window}"
                 )
 
@@ -2925,6 +4543,12 @@ class InitTimelineRecorder:
         lines = ["=== INITIALIZATION TIMELINE (relative to Install click) ==="]
         for e in sorted_entries:
             lines.append(f"  t+{e.rel_sec:6.1f}s  [{e.source:<9}] {e.name}: {e.detail}")
+        lines.append("  --- Runner & ChromeOS Resource Diagnostics (read-only) ---")
+        if self.resource_summary_lines:
+            for r_line in self.resource_summary_lines:
+                lines.append(f"  {r_line}")
+        else:
+            lines.append("  <not collected>")
         lines.append("  --- Read-Only D-Bus & UMA Snapshot ---")
         for s_line in self.readonly_summary_lines:
             lines.append(f"  {s_line}")
@@ -3040,6 +4664,13 @@ class ChromeOSVM:
         self._local_dt_port: int | None = None
         self._remote_dt_port: int | None = None
         self._browser_ws_path: str | None = None
+        self._current_step: str = "init"
+
+    def set_step(self, step: str) -> None:
+        self._current_step = step
+
+    def get_step(self) -> str:
+        return self._current_step
 
     def _ssh_base_cmd(self) -> list[str]:
         return [
@@ -3337,6 +4968,7 @@ dbus-send --system --type=method_call --print-reply \
         return remote_dl
 
     def _setup_devtools_tunnel(self) -> None:
+        self.set_step("prepare:setup_devtools_tunnel")
         dt_lines = self.ssh("cat /home/chronos/DevToolsActivePort").stdout.strip().splitlines()
         self._remote_dt_port = int(dt_lines[0].strip())
         self._browser_ws_path = dt_lines[1].strip()
@@ -3356,28 +4988,67 @@ dbus-send --system --type=method_call --print-reply \
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        deadline = time.monotonic() + 15.0
+        tunnel_timeout = 20.0
+        t0 = time.monotonic()
+        deadline = t0 + tunnel_timeout
         last_err: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                _ = self.list_cdp_targets()
+                _ = self.list_cdp_targets(timeout=5.0)
                 return
             except Exception as exc:
                 last_err = exc
                 time.sleep(0.3)
-        raise TimeoutError(
-            f"Timed out establishing SSH port forward to Chrome DevToolsActivePort (last error: {last_err})"
+        elapsed = time.monotonic() - t0
+        ctx = format_cdp_error_context(
+            operation="SSH -L DevTools tunnel readiness probe",
+            target_label="DevToolsTunnel",
+            target_url=f"http://127.0.0.1:{self._local_dt_port}/json/list",
+            target_id="browser",
+            step=self.get_step(),
+            elapsed_sec=elapsed,
+            timeout_sec=tunnel_timeout,
+        )
+        raise CDPTimeoutError(
+            f"Timed out establishing SSH port forward to Chrome DevToolsActivePort ({ctx}; last error: {last_err})"
         )
 
-    def connect_browser_cdp(self) -> CDPConnection:
+    def connect_browser_cdp(self, label: str = "Browser-Root") -> CDPConnection:
         assert self._local_dt_port and self._browser_ws_path
-        return CDPConnection(f"ws://127.0.0.1:{self._local_dt_port}{self._browser_ws_path}")
+        ws_url = f"ws://127.0.0.1:{self._local_dt_port}{self._browser_ws_path}"
+        return CDPConnection(
+            ws_url,
+            target_label=label,
+            target_url=ws_url,
+            target_id=self._browser_ws_path.rsplit("/", 1)[-1] or "browser",
+            step_getter=self.get_step,
+        )
 
-    def list_cdp_targets(self) -> list[dict]:
+    def list_cdp_targets(self, timeout: float = 20.0) -> list[dict]:
         assert self._local_dt_port and self._remote_dt_port
         url = f"http://127.0.0.1:{self._local_dt_port}/json/list"
-        raw = urllib.request.urlopen(url, timeout=15).read()
-        targets = json.loads(raw)
+        t0 = time.monotonic()
+        try:
+            raw = urllib.request.urlopen(url, timeout=timeout).read()
+            targets = json.loads(raw)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            ctx = format_cdp_error_context(
+                operation="HTTP GET /json/list",
+                target_label="DevToolsHTTP",
+                target_url=url,
+                target_id="<json-list>",
+                step=self.get_step(),
+                elapsed_sec=elapsed,
+                timeout_sec=timeout,
+            )
+            if _is_ws_timeout_exc(exc):
+                raise CDPTimeoutError(
+                    f"CDP target list HTTP request timed out ({ctx}): {type(exc).__name__}: {exc}"
+                ) from exc
+            raise CDPError(
+                f"CDP target list HTTP request failed ({ctx}): {type(exc).__name__}: {exc}"
+            ) from exc
         for tgt in targets:
             if "webSocketDebuggerUrl" in tgt:
                 tgt["webSocketDebuggerUrl"] = tgt["webSocketDebuggerUrl"].replace(
@@ -3387,28 +5058,46 @@ dbus-send --system --type=method_call --print-reply \
         return targets
 
     def open_crosh_tab(self, label: str) -> CroshTab:
-        browser_conn = self.connect_browser_cdp()
+        self.set_step(f"open_crosh_tab({label})")
+        browser_conn = self.connect_browser_cdp(label=f"Browser-CreateCrosh({label})")
         try:
             tid = browser_conn.call(
-                "Target.createTarget", {"url": "chrome-untrusted://crosh/"}
+                "Target.createTarget",
+                {"url": "chrome-untrusted://crosh/"},
+                op_desc=f"open_crosh_tab({label}):Target.createTarget",
             )["targetId"]
         finally:
             browser_conn.close()
 
-        for _ in range(40):
+        attach_timeout = 30.0
+        t0 = time.monotonic()
+        deadline = t0 + attach_timeout
+        while time.monotonic() < deadline:
             for tgt in self.list_cdp_targets():
                 if tgt.get("id") == tid and "webSocketDebuggerUrl" in tgt:
-                    conn = CDPConnection(tgt["webSocketDebuggerUrl"])
+                    conn = CDPConnection.from_target(
+                        tgt, label=label, step_getter=self.get_step
+                    )
                     tab = CroshTab(label, conn)
                     tab.wait_for(
                         lambda txt: txt.rstrip().endswith("crosh>"),
-                        timeout=30,
+                        timeout=45.0,
                         desc=f"{label} initial crosh> prompt",
                     )
                     log(f"Opened {label} (`chrome-untrusted://crosh/`, target={tid})")
                     return tab
             time.sleep(0.3)
-        raise RuntimeError(f"Failed to attach to crosh tab {label} ({tid})")
+        elapsed = time.monotonic() - t0
+        ctx = format_cdp_error_context(
+            operation=f"attach_target({label})",
+            target_label=label,
+            target_url="chrome-untrusted://crosh/",
+            target_id=str(tid),
+            step=self.get_step(),
+            elapsed_sec=elapsed,
+            timeout_sec=attach_timeout,
+        )
+        raise CDPTimeoutError(f"Failed to attach to crosh tab ({ctx})")
 
     def verify_guest_user_session(self, vm_name: str, expected_username: str) -> None:
         assert self.owner_hash
@@ -3473,15 +5162,20 @@ dbus-send --system --type=method_call --print-reply \
         Returns the initial `chrome-untrusted://terminal` vmshell CDP target dictionary opened by
         the installer upon completion.
         """
+        self.set_step("step2:open_os_settings")
         log("Opening `chrome://os-settings/` via CDP...")
-        browser_conn = self.connect_browser_cdp()
+        t_launch0 = time.monotonic()
+        browser_conn = self.connect_browser_cdp(label="Browser-LaunchOSSettings")
         try:
             # chrome://os-settings/ is a System Web App (SWA); Target.createTarget triggers
             # LaunchSystemWebAppAsync and returns CDP error -32000 ("Failed to open a new tab")
             # while opening the SWA window asynchronously. Only that exact SWA launch response
             # or a direct targetId is permitted.
             swa_res = browser_conn.call(
-                "Target.createTarget", {"url": "chrome://os-settings/"}, allow_error=True
+                "Target.createTarget",
+                {"url": "chrome://os-settings/"},
+                allow_error=True,
+                op_desc="launch chrome://os-settings/ SWA",
             )
             if "error" in swa_res:
                 err_obj = swa_res["error"]
@@ -3490,35 +5184,55 @@ dbus-send --system --type=method_call --print-reply \
                     and err_obj.get("code") == -32000
                     and err_obj.get("message") == "Failed to open a new tab"
                 ):
-                    raise RuntimeError(
-                        f"Unexpected CDP error launching chrome://os-settings/: {swa_res!r}"
+                    raise CDPError(
+                        f"Unexpected CDP error launching chrome://os-settings/ "
+                        f"({browser_conn._ctx('launch chrome://os-settings/ SWA', time.monotonic() - t_launch0, browser_conn.default_timeout)}): {swa_res!r}"
                     )
             elif "targetId" not in swa_res:
-                raise RuntimeError(
-                    f"Unexpected CDP response launching chrome://os-settings/: {swa_res!r}"
+                raise CDPError(
+                    f"Unexpected CDP response launching chrome://os-settings/ "
+                    f"({browser_conn._ctx('launch chrome://os-settings/ SWA', time.monotonic() - t_launch0, browser_conn.default_timeout)}): {swa_res!r}"
                 )
         finally:
             browser_conn.close()
 
+        settings_attach_timeout = 30.0
+        t_att0 = time.monotonic()
         settings_conn: CDPConnection | None = None
-        for _ in range(40):
+        while time.monotonic() - t_att0 < settings_attach_timeout:
             for tgt in self.list_cdp_targets():
                 if "chrome://os-settings" in tgt.get("url", "") and "webSocketDebuggerUrl" in tgt:
-                    settings_conn = CDPConnection(tgt["webSocketDebuggerUrl"])
+                    settings_conn = CDPConnection.from_target(
+                        tgt, label="OS-Settings", step_getter=self.get_step
+                    )
                     break
             if settings_conn is not None:
                 break
             time.sleep(0.5)
         if settings_conn is None:
-            raise RuntimeError("Could not find `chrome://os-settings/` target in CDP")
+            ctx = format_cdp_error_context(
+                operation="find_target(chrome://os-settings)",
+                target_label="OS-Settings",
+                target_url="chrome://os-settings/",
+                target_id="<pending>",
+                step=self.get_step(),
+                elapsed_sec=time.monotonic() - t_att0,
+                timeout_sec=settings_attach_timeout,
+            )
+            raise CDPTimeoutError(f"Could not find `chrome://os-settings/` target in CDP ({ctx})")
 
         try:
+            self.set_step("step2:navigate_os_settings_click_setup")
             log(
                 "Navigating OS Settings UI: clicking `About ChromeOS` -> "
                 "`Developers` -> `Linux development environment` -> `Set up`..."
             )
-            for _ in range(40):
-                nav_res = settings_conn.eval_js("""(() => {
+            nav_timeout = 30.0
+            t_nav0 = time.monotonic()
+            nav_res: Any = None
+            while time.monotonic() - t_nav0 < nav_timeout:
+                nav_res = settings_conn.eval_js(
+                    """(() => {
                     const ui = document.querySelector('os-settings-ui');
                     if (!ui || !ui.shadowRoot) return 'no-ui';
                     const menu = ui.shadowRoot.querySelector('os-settings-menu');
@@ -3542,50 +5256,90 @@ dbus-send --system --type=method_call --print-reply \
                     const btnText = btn.innerText.trim();
                     btn.click();
                     return 'CLICKED_SETUP:' + header + ' | ' + label + ' | ' + btnText;
-                })()""")
+                })()""",
+                    op_desc="OS-Settings:navigate_and_click_setup",
+                )
                 if isinstance(nav_res, str) and nav_res.startswith("CLICKED_SETUP:"):
                     log(f"  OS Settings UI action: {nav_res}")
                     break
                 time.sleep(0.5)
             else:
-                raise RuntimeError(f"Failed to click Set up button in OS Settings: {nav_res}")
+                ctx = settings_conn._ctx(
+                    "OS-Settings:click_setup_button", time.monotonic() - t_nav0, nav_timeout
+                )
+                raise CDPTimeoutError(
+                    f"Failed to click Set up button in OS Settings ({ctx}; last state={nav_res!r})"
+                )
         finally:
             settings_conn.close()
 
+        self.set_step("step2:attach_crostini_installer")
+        inst_attach_timeout = 30.0
+        t_inst_att0 = time.monotonic()
         installer_conn: CDPConnection | None = None
-        for _ in range(40):
+        while time.monotonic() - t_inst_att0 < inst_attach_timeout:
             for tgt in self.list_cdp_targets():
                 if (
                     "chrome://crostini-installer" in tgt.get("url", "")
                     and "webSocketDebuggerUrl" in tgt
                 ):
-                    installer_conn = CDPConnection(tgt["webSocketDebuggerUrl"])
+                    installer_conn = CDPConnection.from_target(
+                        tgt, label="Crostini-Installer", step_getter=self.get_step
+                    )
                     break
             if installer_conn is not None:
                 break
             time.sleep(0.5)
         if installer_conn is None:
-            raise RuntimeError("`chrome://crostini-installer` dialog did not open after clicking Set up")
+            ctx = format_cdp_error_context(
+                operation="find_target(chrome://crostini-installer)",
+                target_label="Crostini-Installer",
+                target_url="chrome://crostini-installer/",
+                target_id="<pending>",
+                step=self.get_step(),
+                elapsed_sec=time.monotonic() - t_inst_att0,
+                timeout_sec=inst_attach_timeout,
+            )
+            raise CDPTimeoutError(
+                f"`chrome://crostini-installer` dialog did not open after clicking Set up ({ctx})"
+            )
 
         try:
-            for _ in range(30):
-                step1 = installer_conn.eval_js("""(() => {
+            self.set_step("step2:installer_click_next")
+            next_timeout = 30.0
+            t_next0 = time.monotonic()
+            step1: Any = None
+            while time.monotonic() - t_next0 < next_timeout:
+                step1 = installer_conn.eval_js(
+                    """(() => {
                     const app = document.querySelector('crostini-installer-app');
                     if (!app || !app.shadowRoot) return 'no-app';
                     const nextBtn = app.shadowRoot.querySelector('#next');
                     if (!nextBtn || nextBtn.hidden) return 'no-next';
                     nextBtn.click();
                     return 'CLICKED_NEXT';
-                })()""")
+                })()""",
+                    op_desc="Crostini-Installer:click_next",
+                )
                 if step1 == "CLICKED_NEXT":
                     log("  Clicked `Next` in `chrome://crostini-installer`.")
                     break
                 time.sleep(0.5)
             else:
-                raise RuntimeError("Failed to click `#next` in `chrome://crostini-installer`")
+                ctx = installer_conn._ctx(
+                    "Crostini-Installer:click_next", time.monotonic() - t_next0, next_timeout
+                )
+                raise CDPTimeoutError(
+                    f"Failed to click `#next` in `chrome://crostini-installer` ({ctx}; last state={step1!r})"
+                )
 
-            for _ in range(30):
-                step2 = installer_conn.eval_js(f"""(() => {{
+            self.set_step("step2:installer_click_install")
+            inst_btn_timeout = 30.0
+            t_ibtn0 = time.monotonic()
+            step2: Any = None
+            while time.monotonic() - t_ibtn0 < inst_btn_timeout:
+                step2 = installer_conn.eval_js(
+                    f"""(() => {{
                     const app = document.querySelector('crostini-installer-app');
                     if (!app || !app.shadowRoot) return 'no-app';
                     const input = app.shadowRoot.querySelector('#username');
@@ -3597,21 +5351,30 @@ dbus-send --system --type=method_call --print-reply \
                     if (installBtn.disabled) return 'install-disabled';
                     installBtn.click();
                     return 'CLICKED_INSTALL:' + input.value;
-                }})()""")
+                }})()""",
+                    op_desc="Crostini-Installer:set_username_and_click_install",
+                )
                 if isinstance(step2, str) and step2.startswith("CLICKED_INSTALL:"):
                     timeline.mark_install_clicked(username)
                     log(f"  Clicked `Install` in `chrome://crostini-installer` ({step2}).")
                     break
                 time.sleep(0.5)
             else:
-                raise RuntimeError(
-                    f"Failed to set username and click `#install` in `chrome://crostini-installer`: {step2}"
+                ctx = installer_conn._ctx(
+                    "Crostini-Installer:set_username_and_click_install",
+                    time.monotonic() - t_ibtn0,
+                    inst_btn_timeout,
+                )
+                raise CDPTimeoutError(
+                    f"Failed to set username and click `#install` in `chrome://crostini-installer` ({ctx}; last state={step2!r})"
                 )
 
+            self.set_step("step2:wait_installer_complete")
             log("  Waiting for `chrome://crostini-installer` to finish provisioning `termina`...")
+            installer_finish_timeout = 420.0
             t0 = time.monotonic()
             last_status: dict[str, str] = {"err": "", "installing": ""}
-            while time.monotonic() - t0 < 420:
+            while time.monotonic() - t0 < installer_finish_timeout:
                 timeline.check_no_fatal_error()
                 targets = self.list_cdp_targets()
                 installer_open = any(
@@ -3628,7 +5391,10 @@ dbus-send --system --type=method_call --print-reply \
                         "InstallerClosed",
                         f"closed after {elapsed:.1f}s (last_progress={last_status.get('installing')!r})",
                     )
-                    term_deadline = time.monotonic() + 20.0
+                    self.set_step("step2:attach_initial_terminal_vmshell")
+                    term_attach_timeout = 45.0
+                    t_term0 = time.monotonic()
+                    term_deadline = t_term0 + term_attach_timeout
                     vmshell_tgt: dict | None = None
                     while time.monotonic() < term_deadline:
                         for x in self.list_cdp_targets():
@@ -3641,10 +5407,19 @@ dbus-send --system --type=method_call --print-reply \
                             break
                         time.sleep(0.5)
                     if vmshell_tgt is None:
-                        raise RuntimeError(
+                        ctx = format_cdp_error_context(
+                            operation="wait_for_target(Terminal-App-Initial vmshell)",
+                            target_label="Terminal-App-Initial",
+                            target_url="chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+                            target_id="<pending>",
+                            step=self.get_step(),
+                            elapsed_sec=time.monotonic() - t_term0,
+                            timeout_sec=term_attach_timeout,
+                        )
+                        raise CDPTimeoutError(
                             "`chrome://crostini-installer` closed after "
                             f"{elapsed:.1f}s (last progress: {last_status.get('installing')!r}), "
-                            "but the ChromeOS Terminal app (`chrome-untrusted://terminal` vmshell tab) did not open"
+                            f"but the ChromeOS Terminal app (`chrome-untrusted://terminal` vmshell tab) did not open ({ctx})"
                         )
                     log(
                         f"  `chrome://crostini-installer` completed and closed in {elapsed:.1f}s "
@@ -3653,14 +5428,18 @@ dbus-send --system --type=method_call --print-reply \
                     )
                     return vmshell_tgt
                 try:
-                    status = installer_conn.eval_js("""(() => {
+                    status = installer_conn.eval_js(
+                        """(() => {
                         const app = document.querySelector('crostini-installer-app');
                         if (!app || !app.shadowRoot) return null;
                         const err = app.shadowRoot.querySelector('#error-message:not([hidden]) div')?.innerText?.trim()
                             || app.shadowRoot.querySelector('#error-message div')?.innerText?.trim();
                         const installing = app.shadowRoot.querySelector('#installing-message div')?.innerText?.trim();
                         return { err: err || '', installing: installing || '' };
-                    })()""")
+                    })()""",
+                        timeout=30.0,
+                        op_desc="Crostini-Installer:poll_status",
+                    )
                     if isinstance(status, dict):
                         if status.get("installing"):
                             last_status["installing"] = status["installing"]
@@ -3689,28 +5468,57 @@ dbus-send --system --type=method_call --print-reply \
                     if still_open:
                         raise
                 time.sleep(1.5)
-            raise TimeoutError(
-                "Timed out waiting for `chrome://crostini-installer` to finish "
-                f"(last status: {last_status!r})"
+            ctx = installer_conn._ctx(
+                "Crostini-Installer:wait_for_finish",
+                time.monotonic() - t0,
+                installer_finish_timeout,
+            )
+            raise CDPTimeoutError(
+                f"Timed out waiting for `chrome://crostini-installer` to finish ({ctx}; last status={last_status!r})"
             )
         finally:
             installer_conn.close()
 
     def _open_fresh_terminal_from_home(self, old_target_ids: set[str]) -> CroshTab:
         """Clicks `penguin` in `chrome-untrusted://terminal/html/terminal.html#home` to launch a fresh Terminal tab."""
+        self.set_step("step3:relaunch_fresh_terminal_from_home")
+        home_find_timeout = 15.0
+        t_home0 = time.monotonic()
         home_tgt: dict | None = None
-        for tgt in self.list_cdp_targets():
-            if "chrome-untrusted://terminal/html/terminal.html#home" in tgt.get("url", ""):
-                home_tgt = tgt
+        while time.monotonic() - t_home0 < home_find_timeout:
+            for tgt in self.list_cdp_targets():
+                if (
+                    "chrome-untrusted://terminal/html/terminal.html#home" in tgt.get("url", "")
+                    and "webSocketDebuggerUrl" in tgt
+                ):
+                    home_tgt = tgt
+                    break
+            if home_tgt is not None:
                 break
+            time.sleep(0.4)
         if home_tgt is None:
-            raise RuntimeError(
-                "Could not find `chrome-untrusted://terminal/html/terminal.html#home` target to relaunch Terminal"
+            ctx = format_cdp_error_context(
+                operation="find_target(Terminal-Home #home)",
+                target_label="Terminal-Home",
+                target_url="chrome-untrusted://terminal/html/terminal.html#home",
+                target_id="<missing>",
+                step=self.get_step(),
+                elapsed_sec=time.monotonic() - t_home0,
+                timeout_sec=home_find_timeout,
             )
-        home_conn = CDPConnection(home_tgt["webSocketDebuggerUrl"])
+            raise CDPTimeoutError(
+                f"Could not find `chrome-untrusted://terminal/html/terminal.html#home` target to relaunch Terminal ({ctx})"
+            )
+        home_conn = CDPConnection.from_target(
+            home_tgt, label="Terminal-Home", step_getter=self.get_step
+        )
         try:
-            for _ in range(30):
-                click_res = home_conn.eval_js("""(() => {
+            click_timeout = 30.0
+            t_clk0 = time.monotonic()
+            click_res: Any = None
+            while time.monotonic() - t_clk0 < click_timeout:
+                click_res = home_conn.eval_js(
+                    """(() => {
                     const app = document.querySelector('terminal-home-app');
                     if (!app || !app.shadowRoot) return 'no-app';
                     const links = Array.from(app.shadowRoot.querySelectorAll('a[href*="command=vmshell"]'));
@@ -3718,17 +5526,28 @@ dbus-send --system --type=method_call --print-reply \
                     const href = links[0].getAttribute('href');
                     links[0].click();
                     return 'CLICKED:' + href;
-                })()""")
+                })()""",
+                    op_desc="Terminal-Home:click_penguin_vmshell",
+                )
                 if isinstance(click_res, str) and click_res.startswith("CLICKED:"):
                     log(f"  [Terminal-Home] Launched fresh Terminal tab via `{click_res}`")
                     break
                 time.sleep(0.5)
             else:
-                raise RuntimeError(f"Failed to click penguin container in Terminal Home: {click_res}")
+                ctx = home_conn._ctx(
+                    "Terminal-Home:click_penguin_vmshell",
+                    time.monotonic() - t_clk0,
+                    click_timeout,
+                )
+                raise CDPTimeoutError(
+                    f"Failed to click penguin container in Terminal Home ({ctx}; last state={click_res!r})"
+                )
         finally:
             home_conn.close()
 
-        deadline = time.monotonic() + 20.0
+        fresh_attach_timeout = 45.0
+        t_fatt0 = time.monotonic()
+        deadline = t_fatt0 + fresh_attach_timeout
         while time.monotonic() < deadline:
             for tgt in self.list_cdp_targets():
                 tid = tgt.get("id", "")
@@ -3738,9 +5557,25 @@ dbus-send --system --type=method_call --print-reply \
                     and "webSocketDebuggerUrl" in tgt
                 ):
                     log(f"  Attached to fresh Terminal vmshell tab (target={tid})")
-                    return CroshTab("Terminal-App-Fresh", CDPConnection(tgt["webSocketDebuggerUrl"]))
+                    return CroshTab(
+                        "Terminal-App-Fresh",
+                        CDPConnection.from_target(
+                            tgt, label="Terminal-App-Fresh", step_getter=self.get_step
+                        ),
+                    )
             time.sleep(0.4)
-        raise RuntimeError("Timed out waiting for fresh Terminal vmshell tab after clicking penguin in Terminal Home")
+        ctx = format_cdp_error_context(
+            operation="wait_for_target(Terminal-App-Fresh vmshell)",
+            target_label="Terminal-App-Fresh",
+            target_url="chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+            target_id="<pending>",
+            step=self.get_step(),
+            elapsed_sec=time.monotonic() - t_fatt0,
+            timeout_sec=fresh_attach_timeout,
+        )
+        raise CDPTimeoutError(
+            f"Timed out waiting for fresh Terminal vmshell tab after clicking penguin in Terminal Home ({ctx})"
+        )
 
     def verify_terminal_app_with_readiness_gate(
         self,
@@ -3750,9 +5585,15 @@ dbus-send --system --type=method_call --print-reply \
         throttler: HostQemuCpuThrottler | None = None,
     ) -> None:
         """Observes the installer-opened Terminal tab, gates on `ContainerStarted`, and verifies the Terminal shell."""
+        self.set_step("step3:observe_initial_terminal")
         initial_tid = initial_vmshell_tgt["id"]
         initial_tab = CroshTab(
-            "Terminal-App-Initial", CDPConnection(initial_vmshell_tgt["webSocketDebuggerUrl"])
+            "Terminal-App-Initial",
+            CDPConnection.from_target(
+                initial_vmshell_tgt,
+                label="Terminal-App-Initial",
+                step_getter=self.get_step,
+            ),
         )
         active_tab: CroshTab | None = None
         try:
@@ -3783,6 +5624,7 @@ dbus-send --system --type=method_call --print-reply \
 
             if initial_reached_prompt:
                 # Ensure ContainerStarted is also recorded on the timeline
+                self.set_step("step3:wait_container_started")
                 cs_rel = timeline.wait_for_container_started(timeout=60.0)
                 if throttler is not None:
                     throttler.stop()
@@ -3808,6 +5650,7 @@ dbus-send --system --type=method_call --print-reply \
                     f"(ContainerStarted already fired={cs_already_fired}).\n"
                     f"  Installer-opened Terminal buffer:\n{initial_final_buffer}"
                 )
+                self.set_step("step3:wait_container_started")
                 log("  Waiting on D-Bus readiness gate: `VmCicerone.ContainerStarted` (termina/penguin)...")
                 cs_rel = timeline.wait_for_container_started(timeout=300.0)
                 if throttler is not None:
@@ -3830,12 +5673,16 @@ dbus-send --system --type=method_call --print-reply \
                 )
                 active_tab = fresh_tab
                 try:
+                    self.set_step("step3:observe_fresh_terminal")
                     fresh_timeout = 180.0
-                    fresh_deadline = time.monotonic() + fresh_timeout
+                    t_fresh0 = time.monotonic()
+                    fresh_deadline = t_fresh0 + fresh_timeout
                     fresh_first_output_logged = False
+                    last_ftxt = ""
                     while time.monotonic() < fresh_deadline:
                         timeline.check_no_fatal_error()
                         ftxt = fresh_tab.get_text()
+                        last_ftxt = ftxt
                         if not fresh_first_output_logged and ftxt.strip():
                             fresh_first_output_logged = True
                             first_ln = ftxt.strip().splitlines()[0][:140]
@@ -3858,9 +5705,14 @@ dbus-send --system --type=method_call --print-reply \
                             )
                         time.sleep(0.5)
                     else:
-                        raise TimeoutError(
-                            f"Timed out ({fresh_timeout:.0f}s) waiting for fresh Terminal tab prompt "
-                            f"after ContainerStarted. Buffer:\n{fresh_tab.get_text()}"
+                        ctx = fresh_tab.conn._ctx(
+                            "Terminal-App-Fresh:wait_for_shell_prompt",
+                            time.monotonic() - t_fresh0,
+                            fresh_timeout,
+                        )
+                        raise CDPTimeoutError(
+                            f"Timed out waiting for fresh Terminal tab prompt after ContainerStarted "
+                            f"({ctx}). Buffer:\n{last_ftxt}"
                         )
                 except Exception:
                     fresh_tab.close()
@@ -3868,11 +5720,12 @@ dbus-send --system --type=method_call --print-reply \
 
             # Run interactive command in the active Terminal app tab
             assert active_tab is not None
+            self.set_step("step3:verify_terminal_interactive_shell")
             marker = f"TERM_USER_{int(time.monotonic() * 1000)}="
             active_tab.send_line(f'echo "{marker}$(id -nu)"')
             active_tab.wait_for(
                 lambda txt: f"\n{marker}{username}" in txt and txt.rstrip().endswith("$"),
-                timeout=30,
+                timeout=45.0,
                 desc=f"`id -nu` == {username} in {active_tab.label}",
             )
             ver_rel = timeline.record_ui(
@@ -3901,13 +5754,14 @@ dbus-send --system --type=method_call --print-reply \
 
     def _assert_guest_shell_in_crosh(self, tab: CroshTab, expected_username: str) -> None:
         """Runs `id -nu` inside the active guest shell in `tab` and exits back to `crosh>`."""
+        self.set_step("step4:verify_crosh_guest_shell")
         marker = f"USER_CHECK_{int(time.monotonic() * 1000)}="
         prev_crosh_prompts = tab.get_text().count("crosh>")
         tab.send_line(f'echo "{marker}$(id -nu)"')
         tab.wait_for(
             lambda txt: f"\n{marker}{expected_username}" in txt
             and txt.rstrip().endswith("$"),
-            timeout=30,
+            timeout=45.0,
             desc=f"`id -nu` == {expected_username} in {tab.label}",
         )
         log(f"  [{tab.label}] Confirmed guest shell user via crosh UI: `{expected_username}`")
@@ -3915,7 +5769,7 @@ dbus-send --system --type=method_call --print-reply \
         tab.wait_for(
             lambda txt: txt.count("crosh>") > prev_crosh_prompts
             and txt.rstrip().endswith("crosh>"),
-            timeout=30,
+            timeout=45.0,
             desc=f"exit guest shell back to crosh> in {tab.label}",
         )
 
@@ -3939,9 +5793,11 @@ dbus-send --system --type=method_call --print-reply \
         crosh = self.open_crosh_tab("Termina-Crosh")
         failed = False
         try:
+            self.set_step("step1:vmc_create")
             log("Step 1: Running `vmc create` command from README.md in crosh...")
             crosh.run_crosh_cmd(readme_cmds.termina_create, timeout=180)
 
+            self.set_step("step2:start_timeline_monitor")
             log("Step 2: Starting passive D-Bus init timeline monitor & driving ChromeOS Settings UI...")
             timeline.start()
             initial_vmshell_tgt = self.run_settings_crostini_installer_ui(
@@ -3956,6 +5812,7 @@ dbus-send --system --type=method_call --print-reply \
                 throttler=throttler,
             )
 
+            self.set_step("step4:crosh_vsh_reentry")
             log(f"Step 4: Verifying README crosh shell entry (`{readme_cmds.termina_reentry_vsh}`, single attempt)...")
             prev_guest_prompts = crosh.get_text().count(f"[{username}@")
             log(f"  [{crosh.label}] crosh> {readme_cmds.termina_reentry_vsh}")
@@ -3964,7 +5821,7 @@ dbus-send --system --type=method_call --print-reply \
                 crosh,
                 prev_guest_prompts,
                 username,
-                timeout=30,
+                timeout=45.0,
                 desc=f"`{readme_cmds.termina_reentry_vsh}` shell prompt for `{username}`",
             )
             self._assert_guest_shell_in_crosh(crosh, expected_username=username)
@@ -3973,6 +5830,7 @@ dbus-send --system --type=method_call --print-reply \
                 f"`{readme_cmds.termina_reentry_vsh}` -> `id -nu` == {username!r}",
             )
 
+            self.set_step("step5:stop_and_collect")
             log("Step 5: Collecting read-only D-Bus/UMA timeline & verifying in-guest systemd state...")
             timeline.stop_and_collect(strict_dbus=True)
             log("\n" + timeline.format_report(include_raw_logs=False))
