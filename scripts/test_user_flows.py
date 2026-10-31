@@ -428,7 +428,7 @@ def _parse_hex_byte_tokens(tokens: list[str], context: str, raw_line: str) -> li
 
 
 def parse_dbus_send_byte_array(output: str, context: str = "dbus-send") -> bytes:
-    """Strictly parses `dbus-send --print-reply` output containing a single `array of bytes [...]`."""
+    """Strictly parses `dbus-send --print-reply` output containing a single `array of bytes [...]` (or empty `array [\\n]`)."""
     non_empty = [ln for ln in output.splitlines() if ln.strip()]
     if len(non_empty) < 2:
         raise ValueError(f"{context}: truncated or empty dbus-send output:\n{output}")
@@ -438,9 +438,18 @@ def parse_dbus_send_byte_array(output: str, context: str = "dbus-send") -> bytes
         )
 
     first_body = non_empty[1]
+    # In dbus-print-message.c, a 0-length `ay` (byte array) has subiter arg_type == DBUS_TYPE_INVALID,
+    # so `dbus-send --print-reply` prints `   array [\n   ]` instead of `   array of bytes [`.
+    if first_body == "   array [":
+        if len(non_empty) != 3 or non_empty[2] != "   ]":
+            raise ValueError(
+                f"{context}: expected exact closing '   ]' after empty '   array [', got:\n{output}"
+            )
+        return b""
+
     if not first_body.startswith("   array of bytes ["):
         raise ValueError(
-            f"{context}: expected indented 'array of bytes [' on line 2, got {first_body!r}"
+            f"{context}: expected indented 'array of bytes [' (or empty '   array [') on line 2, got {first_body!r}"
         )
 
     hex_tokens: list[str] = []
@@ -503,7 +512,12 @@ class DbusMonitorSignalParser:
             return None
 
         if not line[0].isspace():
-            if self._state in ("WAIT_ARRAY_OPEN", "IN_ARRAY", "WAIT_DBUS_NAME_STRING"):
+            if self._state in (
+                "WAIT_ARRAY_OPEN",
+                "WAIT_EMPTY_ARRAY_CLOSE",
+                "IN_ARRAY",
+                "WAIT_DBUS_NAME_STRING",
+            ):
                 raise ValueError(
                     f"dbus-monitor signal {self._cur_iface}.{self._cur_member} ended "
                     f"before body completed (state={self._state}, next line: {line!r})"
@@ -551,9 +565,12 @@ class DbusMonitorSignalParser:
                 m_name.group(1).encode("utf-8"),
             )
         if self._state == "WAIT_ARRAY_OPEN":
+            if line == "   array [":
+                self._state = "WAIT_EMPTY_ARRAY_CLOSE"
+                return None
             if not line.startswith("   array of bytes ["):
                 raise ValueError(
-                    f"{ctx}: expected '   array of bytes [', got {line!r}"
+                    f"{ctx}: expected '   array of bytes [' (or empty '   array ['), got {line!r}"
                 )
             after_open = line.split("[", 1)[1]
             if "]" in after_open:
@@ -574,6 +591,14 @@ class DbusMonitorSignalParser:
             self._hex_tokens.extend(_parse_hex_byte_tokens(after_open.split(), ctx, line))
             self._state = "IN_ARRAY"
             return None
+
+        if self._state == "WAIT_EMPTY_ARRAY_CLOSE":
+            if line != "   ]":
+                raise ValueError(
+                    f"{ctx}: expected exact '   ]' closing empty '   array [', got {line!r}"
+                )
+            self._state = "AFTER_ARRAY"
+            return (self._cur_iface, self._cur_member, b"")
 
         if self._state == "IN_ARRAY":
             if "]" in line:
@@ -598,7 +623,12 @@ class DbusMonitorSignalParser:
         raise AssertionError(f"Unreachable parser state: {self._state!r}")
 
     def finish(self) -> None:
-        if self._state in ("WAIT_ARRAY_OPEN", "IN_ARRAY", "WAIT_DBUS_NAME_STRING"):
+        if self._state in (
+            "WAIT_ARRAY_OPEN",
+            "WAIT_EMPTY_ARRAY_CLOSE",
+            "IN_ARRAY",
+            "WAIT_DBUS_NAME_STRING",
+        ):
             raise ValueError(
                 f"dbus-monitor stream ended mid-signal {self._cur_iface}.{self._cur_member} "
                 f"(state={self._state})"
@@ -844,6 +874,34 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
     assert conc.VmInfo.VmType.Name(vm_info_resp.vm_info.vm_type) == "BAGUETTE"
     assert conc.VmStatus.Name(vm_info_resp.vm_info.status) == "VM_STATUS_RUNNING"
 
+    # 3b. Verify empty byte-array (`   array [\n   ]`) parsing for both dbus-send and dbus-monitor
+    empty_list_containers_reply = (
+        "method return time=1793443903.001918 sender=:1.179 -> destination=:1.213 serial=105 reply_serial=2\n"
+        "   array [\n"
+        "   ]\n"
+    )
+    raw_empty_lc = parse_dbus_send_byte_array(
+        empty_list_containers_reply, "test empty ListRunningContainers"
+    )
+    assert raw_empty_lc == b"", raw_empty_lc
+    empty_lc_resp = parse_and_validate_proto(
+        raw_empty_lc, cic.ListRunningContainersResponse, "test empty ListRunningContainers"
+    )
+    assert list(empty_lc_resp.containers) == []
+
+    empty_sig_parser = DbusMonitorSignalParser()
+    assert (
+        empty_sig_parser.feed_line(
+            "signal time=1793443903.001918 sender=:1.179 -> destination=(null destination) "
+            "serial=42 path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=PendingAppListUpdates"
+        )
+        is None
+    )
+    assert empty_sig_parser.feed_line("   array [") is None
+    ev_empty = empty_sig_parser.feed_line("   ]")
+    empty_sig_parser.finish()
+    assert ev_empty == ("org.chromium.VmCicerone", "PendingAppListUpdates", b"")
+
     # Build real signal stream (NameAcquired + VmStartingUpSignal + VmStartedSignal + ContainerStarted + PendingAppListUpdates)
     sig_starting = conc.VmStartingUpSignal(
         name="termina",
@@ -995,6 +1053,57 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
                 "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=BogusSignal"
             ),
         ),
+        (
+            "malformed dbus-send non-empty generic array [ 08 ]",
+            lambda: parse_dbus_send_byte_array(
+                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
+                "   array [ 08 ]\n",
+                "bad_generic_array_inline",
+            ),
+        ),
+        (
+            "malformed dbus-send non-empty generic array [\\n 08 \\n]",
+            lambda: parse_dbus_send_byte_array(
+                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
+                "   array [\n      08\n   ]\n",
+                "bad_generic_array_multiline",
+            ),
+        ),
+        (
+            "malformed dbus-send unclosed empty array [",
+            lambda: parse_dbus_send_byte_array(
+                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
+                "   array [\n",
+                "bad_unclosed_empty_array",
+            ),
+        ),
+        (
+            "malformed dbus-monitor non-empty generic array [\\n 08 \\n]",
+            lambda: [
+                p.feed_line(x)
+                for p in (DbusMonitorSignalParser(),)
+                for x in (
+                    "signal time=1.0 sender=:1.1 -> destination=(null destination) serial=1 "
+                    "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=PendingAppListUpdates",
+                    "   array [",
+                    "      08",
+                    "   ]",
+                )
+            ],
+        ),
+        (
+            "malformed dbus-monitor unclosed empty array [",
+            lambda: (
+                lambda p: (
+                    p.feed_line(
+                        "signal time=1.0 sender=:1.1 -> destination=(null destination) serial=1 "
+                        "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=PendingAppListUpdates"
+                    ),
+                    p.feed_line("   array ["),
+                    p.finish(),
+                )
+            )(DbusMonitorSignalParser()),
+        ),
     ]:
         try:
             bad_fn()
@@ -1144,6 +1253,35 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
     dummy_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
     dummy_rec.t_install_vm_epoch = 1000.0
     sample_guest_diag = (
+        "===GUEST_CLOCK_SYNC===\n"
+        "uptime_sec=30.00\n"
+        "epoch_sec=1030.500000000\n"
+        "===GUEST_STAT_MTIMES===\n"
+        "/etc/passwd|1016|1970-01-01 00:16:56.250000000 +0000|uid=0 gid=0 mode=644\n"
+        "/home/terminauser|1017|1970-01-01 00:16:57.500000000 +0000|uid=1000 gid=1000 mode=700\n"
+        "/var/lib/systemd/linger/terminauser|1018|1970-01-01 00:16:58.750000000 +0000|uid=0 gid=0 mode=644\n"
+        "===GUEST_LIST_JOBS===\n"
+        "No jobs running.\n"
+        "===GUEST_SYSTEMD_UNIT_SHOW===\n"
+        "Id=first-boot-cros.service\n"
+        "ActiveState=inactive\n"
+        "SubState=dead\n"
+        "Result=success\n"
+        "InactiveExitTimestampMonotonic=12400000\n"
+        "ActiveEnterTimestampMonotonic=28400000\n"
+        "ExecMainStartTimestampMonotonic=12450000\n"
+        "ExecMainExitTimestampMonotonic=28390000\n"
+        "ExecMainStatus=0\n"
+        "\n"
+        "Id=maitred.service\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "Result=success\n"
+        "InactiveExitTimestampMonotonic=12420000\n"
+        "ActiveEnterTimestampMonotonic=12500000\n"
+        "ExecMainStartTimestampMonotonic=12480000\n"
+        "ExecMainExitTimestampMonotonic=0\n"
+        "ExecMainStatus=0\n"
         "===GUEST_ANALYZE===\n"
         "Startup finished in 1.2s (kernel) + 1.5s (userspace) = 2.7s\n"
         "===GUEST_CRITICAL_CHAIN===\n"
@@ -1181,6 +1319,15 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
         + "\n"
         + json.dumps(
             {
+                "SYSLOG_IDENTIFIER": "useradd",
+                "MESSAGE": "new user: name=terminauser, UID=1000, GID=1000, home=/home/terminauser, shell=/bin/bash, from=none",
+                "__MONOTONIC_TIMESTAMP": "15500000",
+                "__REALTIME_TIMESTAMP": "1013000000",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
                 "SYSLOG_IDENTIFIER": "garcon",
                 "MESSAGE": "Server listening on vsock port",
                 "__MONOTONIC_TIMESTAMP": "19500000",
@@ -1189,12 +1336,27 @@ def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
         )
         + "\n"
     )
-    dummy_rec._parse_guest_diagnostics(sample_guest_diag, first_host_setup_user_rel=14.0)
+    dummy_rec._parse_guest_diagnostics(sample_guest_diag, first_host_setup_user_rel=14.0, strict=True)
     assert any("Startup finished" in ln for ln in dummy_rec.guest_summary_lines)
+    assert any("first-boot-cros.service:" in ln for ln in dummy_rec.guest_summary_lines)
     by_name = {e.name: e for e in dummy_rec.all_entries()}
     assert abs(by_name["MaitredStarted"].rel_sec - 13.0) < 1e-3, by_name["MaitredStarted"]
     assert abs(by_name["MaitredSetUpUser"].rel_sec - 14.0) < 1e-3, by_name["MaitredSetUpUser"]
+    assert abs(by_name["UseraddDone"].rel_sec - 16.0) < 1e-3, by_name["UseraddDone"]
     assert abs(by_name["GarconLog"].rel_sec - 20.0) < 1e-3, by_name["GarconLog"]
+    mtime_entries = [e for e in dummy_rec.all_entries() if e.name == "GuestFileMtime"]
+    assert len(mtime_entries) == 3, mtime_entries
+
+    # Also verify non-strict guest diagnostics parsing when user session hasn't started yet
+    partial_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
+    partial_rec.t_install_vm_epoch = 1000.0
+    partial_rec._parse_guest_diagnostics(
+        "===GUEST_CLOCK_SYNC===\nuptime_sec=20.0\nepoch_sec=1025.0\n"
+        "===GUEST_JOURNAL_MONO===\n[ 10.000000] VM systemd[1]: Starting First boot script...\n",
+        first_host_setup_user_rel=None,
+        strict=False,
+    )
+    assert any("Starting First boot script" in ln for ln in partial_rec.guest_summary_lines)
 
     # Verify negative cases (missing section or missing code blocks)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1463,11 +1625,13 @@ class InitTimelineRecorder:
         vm: ChromeOSVM,
         owner_hash: str,
         expected_username: str = "terminauser",
+        on_vm_starting_up: Callable[[], None] | None = None,
         on_vm_started: Callable[[], None] | None = None,
     ) -> None:
         self.vm = vm
         self.owner_hash = owner_hash
         self.expected_username = expected_username
+        self.on_vm_starting_up = on_vm_starting_up
         self.on_vm_started = on_vm_started
         self._protos = load_cros_protos()
         self.t_install_mono: float | None = None
@@ -1663,6 +1827,9 @@ class InitTimelineRecorder:
             detail = f"vm={vm_name!r} vm_type={vm_type_name}({sig.vm_type}) cid={sig.cid}"
             with self._lock:
                 self._entries.append(TimelineEntry(rel, "dbus", member, detail))
+            if vm_name == "termina" and self.on_vm_starting_up is not None:
+                self.on_vm_starting_up()
+                self.on_vm_starting_up = None
             return
 
         if (iface, member) == ("org.chromium.VmConcierge", "VmStartedSignal"):
@@ -2010,109 +2177,132 @@ class InitTimelineRecorder:
             self._host_log_entries = new_host_entries
         return first_host_setup_user_rel
 
-    def _collect_readonly_dbus_snapshot(self) -> None:
+    def _collect_readonly_dbus_snapshot(self, strict_dbus: bool = True) -> None:
         conc = self._protos.concierge_pb2
         cic = self._protos.cicerone_pb2
 
         # 1a. VmConcierge.GetVmInfo
-        ctx_vm = "VmConcierge.GetVmInfo"
-        req_vm = conc.GetVmInfoRequest(
-            name="termina", owner_id=self.owner_hash
-        ).SerializeToString()
-        res_vm = self.vm.ssh(
-            f"dbus-send --system --type=method_call --print-reply "
-            f"--dest=org.chromium.VmConcierge /org/chromium/VmConcierge "
-            f"org.chromium.VmConcierge.GetVmInfo {to_dbus_byte_arg(req_vm)}",
-            check=True,
-            timeout=15,
-        )
-        raw_vm = parse_dbus_send_byte_array(res_vm.stdout, ctx_vm)
-        vm_resp = parse_and_validate_proto(raw_vm, conc.GetVmInfoResponse, ctx_vm)
-        if not vm_resp.success:
-            raise RuntimeError(f"{ctx_vm} returned success=false (hex={raw_vm.hex()})")
-        vm_type_name = require_enum_name(
-            conc.VmInfo.VmType, vm_resp.vm_info.vm_type, "vm_info.vm_type", ctx_vm, raw_vm
-        )
-        vm_status_name = require_enum_name(
-            conc.VmStatus, vm_resp.vm_info.status, "vm_info.status", ctx_vm, raw_vm
-        )
-        if vm_resp.vm_info.pid <= 0 or vm_resp.vm_info.cid <= 0:
-            raise ValueError(
-                f"{ctx_vm}: invalid pid={vm_resp.vm_info.pid} cid={vm_resp.vm_info.cid}"
+        def _query_get_vm_info() -> None:
+            ctx_vm = "VmConcierge.GetVmInfo"
+            req_vm = conc.GetVmInfoRequest(
+                name="termina", owner_id=self.owner_hash
+            ).SerializeToString()
+            res_vm = self.vm.ssh(
+                f"dbus-send --system --type=method_call --print-reply "
+                f"--dest=org.chromium.VmConcierge /org/chromium/VmConcierge "
+                f"org.chromium.VmConcierge.GetVmInfo {to_dbus_byte_arg(req_vm)}",
+                check=True,
+                timeout=15,
             )
-        self.readonly_summary_lines.append(
-            f"VmConcierge.GetVmInfo(termina): success={vm_resp.success} "
-            f"status={vm_status_name}({vm_resp.vm_info.status}) "
-            f"vm_type={vm_type_name}({vm_resp.vm_info.vm_type}) "
-            f"cid={vm_resp.vm_info.cid} pid={vm_resp.vm_info.pid}"
-        )
+            raw_vm = parse_dbus_send_byte_array(res_vm.stdout, ctx_vm)
+            vm_resp = parse_and_validate_proto(raw_vm, conc.GetVmInfoResponse, ctx_vm)
+            if not vm_resp.success:
+                if strict_dbus:
+                    raise RuntimeError(f"{ctx_vm} returned success=false (hex={raw_vm.hex()})")
+                self.readonly_summary_lines.append(
+                    f"VmConcierge.GetVmInfo(termina): success={vm_resp.success}"
+                )
+                return
+            vm_type_name = require_enum_name(
+                conc.VmInfo.VmType, vm_resp.vm_info.vm_type, "vm_info.vm_type", ctx_vm, raw_vm
+            )
+            vm_status_name = require_enum_name(
+                conc.VmStatus, vm_resp.vm_info.status, "vm_info.status", ctx_vm, raw_vm
+            )
+            if vm_resp.vm_info.pid <= 0 or vm_resp.vm_info.cid <= 0:
+                raise ValueError(
+                    f"{ctx_vm}: invalid pid={vm_resp.vm_info.pid} cid={vm_resp.vm_info.cid}"
+                )
+            self.readonly_summary_lines.append(
+                f"VmConcierge.GetVmInfo(termina): success={vm_resp.success} "
+                f"status={vm_status_name}({vm_resp.vm_info.status}) "
+                f"vm_type={vm_type_name}({vm_resp.vm_info.vm_type}) "
+                f"cid={vm_resp.vm_info.cid} pid={vm_resp.vm_info.pid}"
+            )
 
         # 1b. VmConcierge.ListVms
-        ctx_lv = "VmConcierge.ListVms"
-        req_lv = conc.ListVmsRequest(owner_id=self.owner_hash).SerializeToString()
-        res_lv = self.vm.ssh(
-            f"dbus-send --system --type=method_call --print-reply "
-            f"--dest=org.chromium.VmConcierge /org/chromium/VmConcierge "
-            f"org.chromium.VmConcierge.ListVms {to_dbus_byte_arg(req_lv)}",
-            check=True,
-            timeout=15,
-        )
-        raw_lv = parse_dbus_send_byte_array(res_lv.stdout, ctx_lv)
-        lv_resp = parse_and_validate_proto(raw_lv, conc.ListVmsResponse, ctx_lv)
-        if not lv_resp.success:
-            raise RuntimeError(
-                f"{ctx_lv} returned success=false: {lv_resp.failure_reason!r} (hex={raw_lv.hex()})"
+        def _query_list_vms() -> None:
+            ctx_lv = "VmConcierge.ListVms"
+            req_lv = conc.ListVmsRequest(owner_id=self.owner_hash).SerializeToString()
+            res_lv = self.vm.ssh(
+                f"dbus-send --system --type=method_call --print-reply "
+                f"--dest=org.chromium.VmConcierge /org/chromium/VmConcierge "
+                f"org.chromium.VmConcierge.ListVms {to_dbus_byte_arg(req_lv)}",
+                check=True,
+                timeout=15,
             )
-        vm_names = [
-            require_non_empty_str(entry.name, "vms[].name", ctx_lv, raw_lv)
-            for entry in lv_resp.vms
-        ]
-        if "termina" not in vm_names:
-            raise RuntimeError(f"{ctx_lv}: expected 'termina' in running VMs, got {vm_names!r}")
-        self.readonly_summary_lines.append(
-            f"VmConcierge.ListVms: success={lv_resp.success} vms={vm_names}"
-        )
+            raw_lv = parse_dbus_send_byte_array(res_lv.stdout, ctx_lv)
+            lv_resp = parse_and_validate_proto(raw_lv, conc.ListVmsResponse, ctx_lv)
+            if not lv_resp.success and strict_dbus:
+                raise RuntimeError(
+                    f"{ctx_lv} returned success=false: {lv_resp.failure_reason!r} (hex={raw_lv.hex()})"
+                )
+            vm_names = [
+                require_non_empty_str(entry.name, "vms[].name", ctx_lv, raw_lv)
+                for entry in lv_resp.vms
+            ]
+            if strict_dbus and "termina" not in vm_names:
+                raise RuntimeError(f"{ctx_lv}: expected 'termina' in running VMs, got {vm_names!r}")
+            self.readonly_summary_lines.append(
+                f"VmConcierge.ListVms: success={lv_resp.success} vms={vm_names}"
+            )
 
         # 1c. VmCicerone.ListRunningContainers
-        ctx_lc = "VmCicerone.ListRunningContainers"
-        req_lc = cic.ListRunningContainersRequest(owner_id=self.owner_hash).SerializeToString()
-        res_lc = self.vm.ssh(
-            f"dbus-send --system --type=method_call --print-reply "
-            f"--dest=org.chromium.VmCicerone /org/chromium/VmCicerone "
-            f"org.chromium.VmCicerone.ListRunningContainers {to_dbus_byte_arg(req_lc)}",
-            check=True,
-            timeout=15,
-        )
-        raw_lc = parse_dbus_send_byte_array(res_lc.stdout, ctx_lc)
-        lc_resp = parse_and_validate_proto(raw_lc, cic.ListRunningContainersResponse, ctx_lc)
-        containers = [
-            f"{require_non_empty_str(c.vm_name, 'containers[].vm_name', ctx_lc, raw_lc)}/"
-            f"{require_non_empty_str(c.container_name, 'containers[].container_name', ctx_lc, raw_lc)}"
-            for c in lc_resp.containers
-        ]
-        if "termina/penguin" not in containers:
-            raise RuntimeError(
-                f"{ctx_lc}: expected 'termina/penguin' in running containers, got {containers!r}"
+        def _query_list_containers() -> None:
+            ctx_lc = "VmCicerone.ListRunningContainers"
+            req_lc = cic.ListRunningContainersRequest(owner_id=self.owner_hash).SerializeToString()
+            res_lc = self.vm.ssh(
+                f"dbus-send --system --type=method_call --print-reply "
+                f"--dest=org.chromium.VmCicerone /org/chromium/VmCicerone "
+                f"org.chromium.VmCicerone.ListRunningContainers {to_dbus_byte_arg(req_lc)}",
+                check=True,
+                timeout=15,
             )
-        self.readonly_summary_lines.append(
-            f"VmCicerone.ListRunningContainers: {containers}"
-        )
+            raw_lc = parse_dbus_send_byte_array(res_lc.stdout, ctx_lc)
+            lc_resp = parse_and_validate_proto(raw_lc, cic.ListRunningContainersResponse, ctx_lc)
+            containers = [
+                f"{require_non_empty_str(c.vm_name, 'containers[].vm_name', ctx_lc, raw_lc)}/"
+                f"{require_non_empty_str(c.container_name, 'containers[].container_name', ctx_lc, raw_lc)}"
+                for c in lc_resp.containers
+            ]
+            if strict_dbus and "termina/penguin" not in containers:
+                raise RuntimeError(
+                    f"{ctx_lc}: expected 'termina/penguin' in running containers, got {containers!r}"
+                )
+            self.readonly_summary_lines.append(
+                f"VmCicerone.ListRunningContainers: {containers}"
+            )
 
         # 1d. VmCicerone.GetGarconSessionInfo
-        garcon_info = self.query_garcon_session_info_readonly()
-        status_name = cic.GetGarconSessionInfoResponse.Status.Name(garcon_info.status)
-        if garcon_info.status != cic.GetGarconSessionInfoResponse.Status.SUCCEEDED:
-            raise RuntimeError(
-                f"VmCicerone.GetGarconSessionInfo(termina/penguin) status={status_name}"
+        def _query_garcon_info() -> None:
+            garcon_info = self.query_garcon_session_info_readonly()
+            status_name = cic.GetGarconSessionInfoResponse.Status.Name(garcon_info.status)
+            if strict_dbus and garcon_info.status != cic.GetGarconSessionInfoResponse.Status.SUCCEEDED:
+                raise RuntimeError(
+                    f"VmCicerone.GetGarconSessionInfo(termina/penguin) status={status_name}"
+                )
+            self.readonly_summary_lines.append(
+                f"VmCicerone.GetGarconSessionInfo(termina/penguin): "
+                f"status={status_name}({garcon_info.status}) "
+                f"user={garcon_info.container_username!r} "
+                f"homedir={garcon_info.container_homedir!r}"
             )
-        self.readonly_summary_lines.append(
-            f"VmCicerone.GetGarconSessionInfo(termina/penguin): "
-            f"status={status_name}({garcon_info.status}) "
-            f"user={garcon_info.container_username!r} "
-            f"homedir={garcon_info.container_homedir!r}"
-        )
 
-    def _collect_uma_histograms(self) -> None:
+        for query_fn in (
+            _query_get_vm_info,
+            _query_list_vms,
+            _query_list_containers,
+            _query_garcon_info,
+        ):
+            if strict_dbus:
+                query_fn()
+            else:
+                try:
+                    query_fn()
+                except Exception as exc:
+                    self.readonly_summary_lines.append(f"Read-only D-Bus query error: {exc}")
+
+    def _collect_uma_histograms(self, strict_dbus: bool = True) -> None:
         b_conn = self.vm.connect_browser_cdp()
         try:
             for h_name in (
@@ -2121,67 +2311,215 @@ class InitTimelineRecorder:
                 "Crostini.SetupResult",
                 "Crostini.RestarterResult.Installer",
             ):
-                h_res = b_conn.call("Browser.getHistogram", {"name": h_name})
-                hist = h_res.get("histogram")
-                if not isinstance(hist, dict) or not hist:
-                    raise RuntimeError(f"Browser.getHistogram({h_name!r}) returned empty result: {h_res!r}")
-                buckets = [
-                    f"[{b['low']}..{b['high']}):{b['count']}"
-                    for b in hist.get("buckets", [])
-                ]
-                self.readonly_summary_lines.append(
-                    f"UMA {h_name}: count={hist.get('count')} "
-                    f"sum={hist.get('sum')} buckets={buckets}"
-                )
+                if strict_dbus:
+                    h_res = b_conn.call("Browser.getHistogram", {"name": h_name})
+                    hist = h_res.get("histogram")
+                    if not isinstance(hist, dict) or not hist:
+                        raise RuntimeError(
+                            f"Browser.getHistogram({h_name!r}) returned empty result: {h_res!r}"
+                        )
+                    buckets = [
+                        f"[{b['low']}..{b['high']}):{b['count']}"
+                        for b in hist.get("buckets", [])
+                    ]
+                    self.readonly_summary_lines.append(
+                        f"UMA {h_name}: count={hist.get('count')} "
+                        f"sum={hist.get('sum')} buckets={buckets}"
+                    )
+                else:
+                    try:
+                        h_res = b_conn.call(
+                            "Browser.getHistogram", {"name": h_name}, allow_error=True
+                        )
+                        if "error" in h_res:
+                            self.readonly_summary_lines.append(
+                                f"UMA {h_name}: <not recorded ({h_res['error'].get('message', h_res['error'])})>"
+                            )
+                            continue
+                        hist = h_res.get("histogram")
+                        if not isinstance(hist, dict) or not hist:
+                            self.readonly_summary_lines.append(f"UMA {h_name}: <not recorded>")
+                            continue
+                        buckets = [
+                            f"[{b['low']}..{b['high']}):{b['count']}"
+                            for b in hist.get("buckets", [])
+                        ]
+                        self.readonly_summary_lines.append(
+                            f"UMA {h_name}: count={hist.get('count')} "
+                            f"sum={hist.get('sum')} buckets={buckets}"
+                        )
+                    except Exception as exc:
+                        self.readonly_summary_lines.append(f"UMA {h_name} query error: {exc}")
         finally:
             b_conn.close()
 
-    def _collect_guest_diagnostics(self, first_host_setup_user_rel: float | None) -> None:
-        # Note on systemd-analyze / systemctl exit codes inside the guest:
-        # In the 10% CPU throttled simulation, sommelier-x@0/1.service can enter 'failed'
-        # while cros-garcon.service (ordered After=sommelier-x@0/1, not Requires=) succeeds;
-        # `systemctl --user status` returns exit code 3 when any inspected unit is failed,
-        # and `systemd-analyze` returns exit code 1 if any unit is still activating. We
-        # Run the guest script under `set -euo pipefail` with no `|| true` fallbacks,
-        # requiring all `systemd-analyze`, `systemctl --user status`, `journalctl`, and
-        # `vsh` commands to succeed with exit code 0 (`timeout=180`), and strictly validate
-        # in `_parse_guest_diagnostics` that all 9 sections and the required maitred/garcon
-        # journal events are present and non-empty.
-        guest_diag_cmd = (
+    def _collect_guest_diagnostics(
+        self, first_host_setup_user_rel: float | None, strict_dbus: bool = True
+    ) -> None:
+        # Split guest diagnostics into 5 small, targeted read-only `vsh` commands, each with
+        # its own 25s-30s timeout, running the fastest system/unit/journal checks FIRST:
+        #   1. GUEST_UNIT_TIMING (timeout=25): /proc/uptime + UTC epoch sync, nanosecond `stat`
+        #      mtimes on /etc/passwd, /etc/group, /home/terminauser, /var/lib/systemd/linger/terminauser,
+        #      /dev/.container_token, /etc/ssh/ssh_host_*_key, `systemctl list-jobs`, and
+        #      `systemctl show` monotonic start/exit timestamps for first-boot-cros.service,
+        #      maitred.service, vshd.service, systemd-logind.service, ldconfig.service,
+        #      user-runtime-dir@1000.service, and user@1000.service.
+        #   2. GUEST_JOURNAL_MONO (timeout=30): `journalctl -b -o short-monotonic` filtered
+        #      directly by unit (-u ...) and SYSLOG_IDENTIFIER=... (no full-journal grep pipe).
+        #   3. GUEST_JOURNAL_JSON (timeout=30): `journalctl -b -o json` with the same native
+        #      unit and SYSLOG_IDENTIFIER filters.
+        #   4. GUEST_SYSTEM_ANALYZE (timeout=25): system-level `systemd-analyze blame`,
+        #      `systemd-analyze`, and `systemd-analyze critical-chain`.
+        #   5. GUEST_USER_ANALYZE (timeout=30): user-level `systemd-analyze --user` and
+        #      `systemctl --user status` via `setpriv --reuid=1000 --regid=1000 --init-groups`
+        #      (avoiding PAM/pam_systemd blocking when logind or user@1000 is slow or failed).
+        # When `strict_dbus=True` (passing path), every step runs under `set -euo pipefail`
+        # with `check=True` and `_parse_guest_diagnostics(..., strict=True)` requires all
+        # sections and required maitred/garcon journal events to be present and non-empty.
+        # When `strict_dbus=False` (failure path), each step is isolated in its own try/except
+        # so one slow or failing step never loses the others.
+        shell_flags = "set -euo pipefail; " if strict_dbus else "set -uo pipefail; "
+        vsh_prefix = (
             f"sudo -u chronos CROS_USER_ID_HASH={self.owner_hash} "
-            f"vsh --vm_name=termina --owner_id={self.owner_hash} --user=root -- sh -lc '"
-            "set -euo pipefail; "
-            'echo "===GUEST_ANALYZE==="; '
-            "systemd-analyze --no-pager 2>&1; "
-            'echo "===GUEST_CRITICAL_CHAIN==="; '
-            "systemd-analyze critical-chain --no-pager 2>&1; "
-            'echo "===GUEST_BLAME==="; '
-            "systemd-analyze blame --no-pager 2>&1; "
-            'echo "===GUEST_USER_ANALYZE==="; '
-            f"runuser -u {self.expected_username} -- env XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-            "systemd-analyze --user --no-pager 2>&1; "
-            'echo "===GUEST_USER_CRITICAL_CHAIN==="; '
-            f"runuser -u {self.expected_username} -- env XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-            "systemd-analyze --user critical-chain --no-pager 2>&1; "
-            'echo "===GUEST_USER_BLAME==="; '
-            f"runuser -u {self.expected_username} -- env XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-            "systemd-analyze --user blame --no-pager 2>&1; "
-            'echo "===GUEST_GARCON_STATUS==="; '
-            f"runuser -u {self.expected_username} -- env XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-            "systemctl --user status cros-garcon.service "
-            "sommelier@0.service sommelier-x@0.service sommelier@1.service sommelier-x@1.service --no-pager 2>&1; "
-            'echo "===GUEST_JOURNAL_MONO==="; '
-            'journalctl -b -o short-monotonic --no-pager | grep -iE "first-boot|maitred|user@1000|user-runtime-dir@1000|cros-garcon|garcon|sommelier|systemd-logind|useradd|usermod|vshd" | { grep -vE "audit\\[|kernel: audit:" || [ $? -eq 1 ]; }; '
-            'echo "===GUEST_JOURNAL_JSON==="; '
-            'journalctl -b -o json --no-pager | grep -iE "first-boot|maitred|user@1000|user-runtime-dir@1000|cros-garcon|garcon|sommelier|systemd-logind|useradd|usermod|vshd" | { grep -vE "audit\\[|kernel: audit:" || [ $? -eq 1 ]; }'
-            "'"
+            f"vsh --vm_name=termina --owner_id={self.owner_hash} --user=root -- sh -lc "
         )
-        g_res = self.vm.ssh(guest_diag_cmd, check=True, timeout=180)
-        self._parse_guest_diagnostics(g_res.stdout, first_host_setup_user_rel)
+        journal_filter_args = (
+            "-u first-boot-cros.service "
+            "-u maitred.service "
+            "-u vshd.service "
+            "-u systemd-logind.service "
+            "-u user-runtime-dir@1000.service "
+            "-u user@1000.service "
+            "-u ldconfig.service "
+            "SYSLOG_IDENTIFIER=first-boot-cros "
+            "SYSLOG_IDENTIFIER=maitred "
+            "SYSLOG_IDENTIFIER=useradd "
+            "SYSLOG_IDENTIFIER=usermod "
+            "SYSLOG_IDENTIFIER=garcon "
+            "SYSLOG_IDENTIFIER=sommelier "
+            "SYSLOG_IDENTIFIER=vshd"
+        )
+        user_env_prefix = (
+            "setpriv --reuid=1000 --regid=1000 --init-groups "
+            "env XDG_RUNTIME_DIR=/run/user/1000 "
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
+        )
+
+        steps: list[tuple[str, int, str]] = [
+            (
+                "unit_timing_and_stat",
+                25,
+                vsh_prefix
+                + "'"
+                + shell_flags
+                + 'echo "===GUEST_CLOCK_SYNC==="; '
+                + "read -r up _ < /proc/uptime; "
+                + 'echo "uptime_sec=$up"; '
+                + 'date -u +"epoch_sec=%s.%N"; '
+                + 'echo "===GUEST_STAT_MTIMES==="; '
+                + "for p in /etc/passwd /etc/group /etc/shadow /etc/gshadow /home /home/"
+                + self.expected_username
+                + " /var/lib/systemd/linger /var/lib/systemd/linger/"
+                + self.expected_username
+                + " /dev/.container_token /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ed25519_key; do "
+                + 'if [ -e "$p" ]; then TZ=UTC0 stat -c "%n|%Y|%y|uid=%u gid=%g mode=%a" "$p"; '
+                + 'else echo "$p|MISSING"; fi; done; '
+                + f"id {self.expected_username} 2>&1 || true; "
+                + 'echo "===GUEST_LIST_JOBS==="; '
+                + "systemctl list-jobs --no-pager 2>&1; "
+                + 'echo "===GUEST_SYSTEMD_UNIT_SHOW==="; '
+                + "systemctl show --no-pager "
+                + "-p Id -p ActiveState -p SubState -p Result "
+                + "-p InactiveExitTimestampMonotonic -p ActiveEnterTimestampMonotonic "
+                + "-p ActiveExitTimestampMonotonic -p InactiveEnterTimestampMonotonic "
+                + "-p ExecMainStartTimestampMonotonic -p ExecMainExitTimestampMonotonic "
+                + "-p ExecMainStatus "
+                + "first-boot-cros.service maitred.service vshd.service systemd-logind.service "
+                + "ldconfig.service user-runtime-dir@1000.service user@1000.service"
+                + "'",
+            ),
+            (
+                "journal_mono",
+                30,
+                vsh_prefix
+                + "'"
+                + shell_flags
+                + 'echo "===GUEST_JOURNAL_MONO==="; '
+                + f"journalctl -b -o short-monotonic --no-pager {journal_filter_args}"
+                + "'",
+            ),
+            (
+                "journal_json",
+                30,
+                vsh_prefix
+                + "'"
+                + shell_flags
+                + 'echo "===GUEST_JOURNAL_JSON==="; '
+                + f"journalctl -b -o json --no-pager {journal_filter_args}"
+                + "'",
+            ),
+            (
+                "system_analyze",
+                25,
+                vsh_prefix
+                + "'"
+                + shell_flags
+                + 'echo "===GUEST_BLAME==="; '
+                + "systemd-analyze blame --no-pager 2>&1; "
+                + 'echo "===GUEST_ANALYZE==="; '
+                + "systemd-analyze --no-pager 2>&1; "
+                + 'echo "===GUEST_CRITICAL_CHAIN==="; '
+                + "systemd-analyze critical-chain --no-pager 2>&1"
+                + "'",
+            ),
+            (
+                "user_analyze",
+                30,
+                vsh_prefix
+                + "'"
+                + shell_flags
+                + 'echo "===GUEST_USER_ANALYZE==="; '
+                + f"{user_env_prefix}systemd-analyze --user --no-pager 2>&1; "
+                + 'echo "===GUEST_USER_CRITICAL_CHAIN==="; '
+                + f"{user_env_prefix}systemd-analyze --user critical-chain --no-pager 2>&1; "
+                + 'echo "===GUEST_USER_BLAME==="; '
+                + f"{user_env_prefix}systemd-analyze --user blame --no-pager 2>&1; "
+                + 'echo "===GUEST_GARCON_STATUS==="; '
+                + f"{user_env_prefix}systemctl --user status cros-garcon.service "
+                + "sommelier@0.service sommelier-x@0.service sommelier@1.service sommelier-x@1.service --no-pager 2>&1"
+                + "'",
+            ),
+        ]
+
+        combined_chunks: list[str] = []
+        step_errors: list[str] = []
+        for step_name, step_timeout, step_cmd in steps:
+            if strict_dbus:
+                res = self.vm.ssh(step_cmd, check=True, timeout=step_timeout)
+                combined_chunks.append(res.stdout)
+            else:
+                try:
+                    res = self.vm.ssh(step_cmd, check=False, timeout=step_timeout)
+                    if res.stdout:
+                        combined_chunks.append(res.stdout)
+                    if res.returncode != 0:
+                        err_snip = (res.stderr or "").strip().replace("\n", " | ")[:200]
+                        step_errors.append(
+                            f"step {step_name!r} exited with rc={res.returncode} (stderr={err_snip!r})"
+                        )
+                except Exception as exc:
+                    step_errors.append(f"step {step_name!r} failed: {exc}")
+
+        if step_errors:
+            self.guest_summary_lines.append("[guest diagnostic step warnings]")
+            for se in step_errors:
+                self.guest_summary_lines.append(f"  {se}")
+
+        self._parse_guest_diagnostics(
+            "\n".join(combined_chunks),
+            first_host_setup_user_rel=first_host_setup_user_rel,
+            strict=strict_dbus,
+        )
 
     def stop_and_collect(self, strict_dbus: bool = True) -> None:
         """Stops the D-Bus monitor and collects read-only D-Bus state, UMA histograms, and logs."""
@@ -2225,19 +2563,19 @@ class InitTimelineRecorder:
 
         # 1. Read-only D-Bus queries: GetVmInfo, ListVms, ListRunningContainers, GetGarconSessionInfo
         if strict_dbus:
-            self._collect_readonly_dbus_snapshot()
+            self._collect_readonly_dbus_snapshot(strict_dbus=True)
         else:
             try:
-                self._collect_readonly_dbus_snapshot()
+                self._collect_readonly_dbus_snapshot(strict_dbus=False)
             except Exception as exc:
                 self.readonly_summary_lines.append(f"Read-only D-Bus snapshot error: {exc}")
 
         # 2. Chrome UMA histograms via CDP (read-only, raw counts/buckets without timeout inference)
         if strict_dbus:
-            self._collect_uma_histograms()
+            self._collect_uma_histograms(strict_dbus=True)
         else:
             try:
-                self._collect_uma_histograms()
+                self._collect_uma_histograms(strict_dbus=False)
             except Exception as exc:
                 self.readonly_summary_lines.append(f"UMA histogram query error: {exc}")
 
@@ -2254,15 +2592,18 @@ class InitTimelineRecorder:
         # 4. Post-hoc read-only guest boot & user-session diagnostics via root vsh
         self.guest_summary_lines.clear()
         if strict_dbus:
-            self._collect_guest_diagnostics(first_host_setup_user_rel)
+            self._collect_guest_diagnostics(first_host_setup_user_rel, strict_dbus=True)
         else:
             try:
-                self._collect_guest_diagnostics(first_host_setup_user_rel)
+                self._collect_guest_diagnostics(first_host_setup_user_rel, strict_dbus=False)
             except Exception as exc:
                 self.guest_summary_lines.append(f"Guest diagnostics error: {exc}")
 
     def _parse_guest_diagnostics(
-        self, raw_out: str, first_host_setup_user_rel: float | None = None
+        self,
+        raw_out: str,
+        first_host_setup_user_rel: float | None = None,
+        strict: bool = True,
     ) -> None:
         sections: dict[str, list[str]] = {}
         cur_sec: str | None = None
@@ -2273,6 +2614,173 @@ class InitTimelineRecorder:
             elif cur_sec is not None:
                 sections[cur_sec].append(line)
 
+        # Parse guest /proc/uptime + date -u +%s.%N clock sync if present
+        guest_uptime_sec: float | None = None
+        guest_epoch_sec: float | None = None
+        for cline in sections.get("GUEST_CLOCK_SYNC", []):
+            cline = cline.strip()
+            if cline.startswith("uptime_sec="):
+                try:
+                    guest_uptime_sec = float(cline.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif cline.startswith("epoch_sec="):
+                try:
+                    guest_epoch_sec = float(cline.split("=", 1)[1])
+                except ValueError:
+                    pass
+
+        parsed_json: list[dict] = []
+        first_guest_setup_mono: float | None = None
+        for jline in sections.get("GUEST_JOURNAL_JSON", []):
+            jline = jline.strip()
+            if not jline:
+                continue
+            try:
+                obj = json.loads(jline)
+            except json.JSONDecodeError:
+                if strict:
+                    raise
+                continue
+            parsed_json.append(obj)
+            msg = str(obj.get("MESSAGE", ""))
+            mono_us = int(obj.get("__MONOTONIC_TIMESTAMP", 0) or 0)
+            if (
+                first_guest_setup_mono is None
+                and "Received request to setup a new user" in msg
+                and mono_us > 0
+            ):
+                first_guest_setup_mono = mono_us / 1_000_000.0
+
+        if strict and (not parsed_json or first_guest_setup_mono is None):
+            raise RuntimeError(
+                "Guest journal JSON diagnostics missing 'Received request to setup a new user' entry"
+            )
+
+        guest_boot_rel_sec: float | None = None
+        guest_boot_epoch: float | None = None
+        if guest_uptime_sec is not None and guest_epoch_sec is not None:
+            guest_boot_epoch = guest_epoch_sec - guest_uptime_sec
+        if first_host_setup_user_rel is not None and first_guest_setup_mono is not None:
+            guest_boot_rel_sec = first_host_setup_user_rel - first_guest_setup_mono
+        elif guest_boot_epoch is not None and self.t_install_vm_epoch is not None:
+            guest_boot_rel_sec = guest_boot_epoch - self.t_install_vm_epoch
+
+        new_guest_entries: list[TimelineEntry] = []
+
+        # Summarize and project GUEST_STAT_MTIMES (nanosecond UTC mtimes of /etc/passwd, /home/terminauser, linger, etc.)
+        stat_lines = [ln.strip() for ln in sections.get("GUEST_STAT_MTIMES", []) if ln.strip()]
+        if stat_lines:
+            self.guest_summary_lines.append("[guest filesystem mtimes & user identity]")
+            for sln in stat_lines:
+                self.guest_summary_lines.append(f"  {sln}")
+                parts = sln.split("|")
+                if len(parts) == 4 and parts[1] != "MISSING":
+                    fpath, epoch_int_s, human_utc, meta_s = parts
+                    mtime_epoch: float | None = None
+                    m_utc = re.match(
+                        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d+))?\s+\+0000$",
+                        human_utc.strip(),
+                    )
+                    if m_utc:
+                        base_s = calendar.timegm(
+                            time.strptime(m_utc.group(1), "%Y-%m-%d %H:%M:%S")
+                        )
+                        frac_s = float(f"0.{m_utc.group(2)}") if m_utc.group(2) else 0.0
+                        mtime_epoch = float(base_s) + frac_s
+                    else:
+                        try:
+                            mtime_epoch = float(epoch_int_s)
+                        except ValueError:
+                            mtime_epoch = None
+                    if (
+                        mtime_epoch is not None
+                        and self.t_install_vm_epoch is not None
+                        and mtime_epoch >= self.t_install_vm_epoch - 2.0
+                    ):
+                        rel = max(0.0, mtime_epoch - self.t_install_vm_epoch)
+                        g_tag = ""
+                        if guest_boot_epoch is not None:
+                            g_tag = f"(guest+{max(0.0, mtime_epoch - guest_boot_epoch):.2f}s) "
+                        elif guest_boot_rel_sec is not None:
+                            g_tag = f"(guest+{max(0.0, rel - guest_boot_rel_sec):.2f}s) "
+                        new_guest_entries.append(
+                            TimelineEntry(
+                                rel,
+                                "guest",
+                                "GuestFileMtime",
+                                f"{g_tag}{fpath} mtime={human_utc.strip()} ({meta_s})",
+                            )
+                        )
+
+        # Summarize GUEST_LIST_JOBS if present
+        job_lines = [ln.strip() for ln in sections.get("GUEST_LIST_JOBS", []) if ln.strip()]
+        if job_lines:
+            self.guest_summary_lines.append("[systemctl list-jobs (system)]")
+            for jln in job_lines[:30]:
+                self.guest_summary_lines.append(f"  {jln}")
+
+        # Parse and summarize GUEST_SYSTEMD_UNIT_SHOW monotonic timestamps
+        unit_show_raw = "\n".join(sections.get("GUEST_SYSTEMD_UNIT_SHOW", [])).strip()
+        if unit_show_raw:
+            self.guest_summary_lines.append("[systemd unit monotonic timing (systemctl show)]")
+            for block in re.split(r"\n\s*\n", unit_show_raw):
+                props: dict[str, str] = {}
+                for bln in block.splitlines():
+                    if "=" in bln:
+                        k, v = bln.split("=", 1)
+                        props[k.strip()] = v.strip()
+                unit_id = props.get("Id", "")
+                if not unit_id:
+                    continue
+                act_state = props.get("ActiveState", "")
+                sub_state = props.get("SubState", "")
+                result = props.get("Result", "")
+                exec_status = props.get("ExecMainStatus", "")
+                inact_exit_us = int(props.get("InactiveExitTimestampMonotonic", "0") or "0")
+                act_enter_us = int(props.get("ActiveEnterTimestampMonotonic", "0") or "0")
+                exec_start_us = int(props.get("ExecMainStartTimestampMonotonic", "0") or "0")
+                exec_exit_us = int(props.get("ExecMainExitTimestampMonotonic", "0") or "0")
+                start_us = exec_start_us or inact_exit_us
+                end_us = exec_exit_us or act_enter_us
+                start_s = start_us / 1_000_000.0
+                end_s = end_us / 1_000_000.0
+                dur_str = (
+                    f"{end_s - start_s:.2f}s"
+                    if (start_us > 0 and end_us >= start_us)
+                    else "in-flight/n/a"
+                )
+                host_window = ""
+                if guest_boot_rel_sec is not None and start_us > 0:
+                    h_start = max(0.0, guest_boot_rel_sec + start_s)
+                    new_guest_entries.append(
+                        TimelineEntry(
+                            h_start,
+                            "guest",
+                            f"UnitStart({unit_id})",
+                            f"(guest+{start_s:.2f}s) systemctl show start ({act_state}/{sub_state})",
+                        )
+                    )
+                    if end_us >= start_us and end_us > 0:
+                        h_end = max(0.0, guest_boot_rel_sec + end_s)
+                        host_window = f" host=t+{h_start:.1f}s..t+{h_end:.1f}s"
+                        if exec_exit_us > 0:
+                            new_guest_entries.append(
+                                TimelineEntry(
+                                    h_end,
+                                    "guest",
+                                    f"UnitDone({unit_id})",
+                                    f"(guest+{end_s:.2f}s) systemctl show exit dur={dur_str} result={result} status={exec_status}",
+                                )
+                            )
+                    else:
+                        host_window = f" host=t+{h_start:.1f}s..(running)"
+                self.guest_summary_lines.append(
+                    f"  {unit_id}: state={act_state}/{sub_state} result={result} "
+                    f"guest=+{start_s:.2f}s..+{end_s:.2f}s (dur={dur_str}, exit_status={exec_status})"
+                    f"{host_window}"
+                )
+
         for label, key, max_lines in (
             ("systemd-analyze (system)", "GUEST_ANALYZE", 120),
             ("systemd-analyze critical-chain (system)", "GUEST_CRITICAL_CHAIN", 120),
@@ -2281,44 +2789,28 @@ class InitTimelineRecorder:
             ("systemd-analyze --user critical-chain (terminauser@)", "GUEST_USER_CRITICAL_CHAIN", 120),
             ("systemd-analyze --user blame top-12 (terminauser@)", "GUEST_USER_BLAME", 12),
             ("systemctl --user status cros-garcon & sommelier", "GUEST_GARCON_STATUS", 120),
-            ("journalctl -b -o short-monotonic (filtered)", "GUEST_JOURNAL_MONO", 120),
+            ("journalctl -b -o short-monotonic (filtered)", "GUEST_JOURNAL_MONO", 160),
         ):
             sec_lines = [ln for ln in sections.get(key, []) if ln.strip()]
             if not sec_lines:
-                raise RuntimeError(f"Guest diagnostics section {key!r} ({label}) is missing or empty")
+                if strict:
+                    raise RuntimeError(
+                        f"Guest diagnostics section {key!r} ({label}) is missing or empty"
+                    )
+                self.guest_summary_lines.append(f"[{label}]: <empty or unavailable>")
+                continue
             self.guest_summary_lines.append(f"[{label}]")
             for ln in sec_lines[:max_lines]:
                 self.guest_summary_lines.append(f"  {ln}")
 
-        parsed_json: list[dict] = []
-        first_guest_setup_mono: float | None = None
-        for jline in sections.get("GUEST_JOURNAL_JSON", []):
-            jline = jline.strip()
-            if not jline:
-                continue
-            obj = json.loads(jline)
-            parsed_json.append(obj)
-            msg = str(obj.get("MESSAGE", ""))
-            mono_us = int(obj.get("__MONOTONIC_TIMESTAMP", 0) or 0)
-            if first_guest_setup_mono is None and "Received request to setup a new user" in msg and mono_us > 0:
-                first_guest_setup_mono = mono_us / 1_000_000.0
-
-        if not parsed_json or first_guest_setup_mono is None:
-            raise RuntimeError(
-                "Guest journal JSON diagnostics missing 'Received request to setup a new user' entry"
-            )
-
-        guest_boot_rel_sec: float | None = None
-        if first_host_setup_user_rel is not None and first_guest_setup_mono is not None:
-            guest_boot_rel_sec = first_host_setup_user_rel - first_guest_setup_mono
-
         # Project key guest journal events onto the unified t+X.Xs timeline
-        new_guest_entries: list[TimelineEntry] = []
+        setup_user_guest_seq = 0
         for obj in parsed_json:
             msg = str(obj.get("MESSAGE", ""))
             comm = str(obj.get("_COMM", ""))
             syslog_id = str(obj.get("SYSLOG_IDENTIFIER", ""))
-            ident = f"{comm} {syslog_id}".lower()
+            unit = str(obj.get("_SYSTEMD_UNIT", "") or obj.get("UNIT", ""))
+            ident = f"{comm} {syslog_id} {unit}".lower()
             rt_us = int(obj.get("__REALTIME_TIMESTAMP", 0) or 0)
             mono_us = int(obj.get("__MONOTONIC_TIMESTAMP", 0) or 0)
             g_mono = mono_us / 1_000_000.0
@@ -2332,10 +2824,23 @@ class InitTimelineRecorder:
 
             if "Starting First boot script" in msg:
                 new_guest_entries.append(TimelineEntry(rel, "guest", "FirstBootStart", tag + msg))
-            elif "first-boot-cros" in ident and ("Resize device" in msg or "ssh-keygen:" in msg):
+            elif "first-boot-cros" in ident and (
+                "Resize device" in msg
+                or "FileSystem / has been resized" in msg
+                or "ssh-keygen:" in msg
+                or "Removed " in msg
+            ):
                 new_guest_entries.append(TimelineEntry(rel, "guest", "FirstBootStep", tag + msg))
             elif "Finished First boot script" in msg:
                 new_guest_entries.append(TimelineEntry(rel, "guest", "FirstBootDone", tag + msg))
+            elif "Starting Rebuild Dynamic Linker Cache" in msg:
+                new_guest_entries.append(TimelineEntry(rel, "guest", "LdconfigStart", tag + msg))
+            elif "Finished Rebuild Dynamic Linker Cache" in msg:
+                new_guest_entries.append(TimelineEntry(rel, "guest", "LdconfigDone", tag + msg))
+            elif "Starting User Login Management" in msg:
+                new_guest_entries.append(TimelineEntry(rel, "guest", "LogindStart", tag + msg))
+            elif "Started User Login Management" in msg:
+                new_guest_entries.append(TimelineEntry(rel, "guest", "LogindReady", tag + msg))
             elif "Started maitred" in msg:
                 new_guest_entries.append(TimelineEntry(rel, "guest", "MaitredStarted", tag + msg))
             elif "Wrote container token to /dev/.container_token" in msg:
@@ -2343,17 +2848,43 @@ class InitTimelineRecorder:
                     TimelineEntry(rel, "guest", "ContainerTokenWrote", tag + msg)
                 )
             elif "Received request to setup a new user" in msg:
+                setup_user_guest_seq += 1
                 new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "MaitredSetUpUser", tag + msg)
+                    TimelineEntry(
+                        rel,
+                        "guest",
+                        "MaitredSetUpUser",
+                        f"{tag}call #{setup_user_guest_seq}: {msg}",
+                    )
                 )
             elif "already exists" in msg and "maitred" in ident:
                 new_guest_entries.append(
                     TimelineEntry(rel, "guest", "MaitredUserExists", tag + msg)
                 )
+            elif "useradd" in ident and "new group:" in msg:
+                new_guest_entries.append(TimelineEntry(rel, "guest", "UseraddGroup", tag + msg))
             elif "useradd" in ident and "new user:" in msg:
                 new_guest_entries.append(TimelineEntry(rel, "guest", "UseraddDone", tag + msg))
+            elif "useradd" in ident and "add '" in msg and (
+                "group 'audio'" in msg or "shadow group 'video'" in msg
+            ):
+                new_guest_entries.append(
+                    TimelineEntry(rel, "guest", "UseraddGroupMembership", tag + msg)
+                )
             elif "usermod" in ident:
                 new_guest_entries.append(TimelineEntry(rel, "guest", "Usermod", tag + msg))
+            elif "maitred" in ident and (
+                "failed" in msg.lower() or "error" in msg.lower() or "linger" in msg.lower()
+            ):
+                new_guest_entries.append(TimelineEntry(rel, "guest", "MaitredLog", tag + msg))
+            elif "Starting User Runtime Directory /run/user/1000" in msg:
+                new_guest_entries.append(
+                    TimelineEntry(rel, "guest", "UserRuntimeDirStart", tag + msg)
+                )
+            elif "Finished User Runtime Directory /run/user/1000" in msg:
+                new_guest_entries.append(
+                    TimelineEntry(rel, "guest", "UserRuntimeDirDone", tag + msg)
+                )
             elif "Starting User Manager for UID 1000" in msg:
                 new_guest_entries.append(TimelineEntry(rel, "guest", "User1000Start", tag + msg))
             elif "Started User Manager for UID 1000" in msg:
@@ -2417,9 +2948,15 @@ class InitTimelineRecorder:
 class HostQemuCpuThrottler:
     """Optional host-side SIGSTOP/SIGCONT duty-cycle throttler on QEMU to simulate slow CI runners."""
 
-    def __init__(self, pid_file: Path, quota_pct: int | None) -> None:
+    def __init__(
+        self,
+        pid_file: Path,
+        quota_pct: int | None,
+        initial_delay_sec: float = 3.0,
+    ) -> None:
         self.pid_file = pid_file
         self.quota_pct = quota_pct
+        self.initial_delay_sec = initial_delay_sec
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -2428,19 +2965,26 @@ class HostQemuCpuThrottler:
             return
         if not (5 <= self.quota_pct < 100):
             raise ValueError(f"--qemu-cpu-quota-pct must be between 5 and 100, got {self.quota_pct}")
+        if self._thread is not None:
+            return
         pid = int(self.pid_file.read_text().strip())
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, args=(pid,), daemon=True)
         self._thread.start()
 
     def _run(self, pid: int) -> None:
-        # Allow SetUpVmUser gRPC (20s deadline) to complete and enter WaitUntilBaguetteReady(40s)
-        if self._stop_event.wait(timeout=3.0):
+        if self.initial_delay_sec > 0 and self._stop_event.wait(timeout=self.initial_delay_sec):
             return
-        log(f"  [throttle] Throttling host QEMU PID {pid} to {self.quota_pct}% CPU duty cycle...")
-        period = 0.100  # 100 ms period so Chrome's 4s timers still wake promptly
         assert self.quota_pct is not None
-        run_slice = period * (self.quota_pct / 100.0)
+        effective_quota_pct = (
+            max(5, self.quota_pct - 2) if self.initial_delay_sec == 0.0 else self.quota_pct
+        )
+        log(
+            f"  [throttle] Throttling host QEMU PID {pid} to {effective_quota_pct}% CPU duty cycle "
+            f"(requested={self.quota_pct}%, initial_delay={self.initial_delay_sec:.1f}s)..."
+        )
+        period = 0.100  # 100 ms period so Chrome's 4s timers still wake promptly
+        run_slice = period * (effective_quota_pct / 100.0)
         stop_slice = period - run_slice
         try:
             while not self._stop_event.is_set():
@@ -2476,6 +3020,7 @@ class ChromeOSVM:
         ram_gb: int | None = None,
         smp: int | None = None,
         cpu_quota_pct: int | None = None,
+        throttle_from_vm_start: bool = False,
     ) -> None:
         self.base_image = base_image
         self.ssh_key = ssh_key
@@ -2485,6 +3030,7 @@ class ChromeOSVM:
         self.ram_gb = ram_gb if ram_gb is not None else default_vm_ram_gb()
         self.smp = smp if smp is not None else min(8, os.cpu_count() or 4)
         self.cpu_quota_pct = cpu_quota_pct
+        self.throttle_from_vm_start = throttle_from_vm_start
         self.ssh_port = find_free_port()
         self.vm_image = self.work_dir / "cros_vm.bin"
         self.pid_file = self.work_dir / "kvm.pid"
@@ -2509,9 +3055,9 @@ class ChromeOSVM:
             "-o",
             "ConnectTimeout=5",
             "-o",
-            "ServerAliveInterval=5",
+            "ServerAliveInterval=20",
             "-o",
-            "ServerAliveCountMax=3",
+            "ServerAliveCountMax=6",
             "-p",
             str(self.ssh_port),
             "root@127.0.0.1",
@@ -3379,9 +3925,16 @@ dbus-send --system --type=method_call --print-reply \
         assert self.owner_hash
         h = self.owner_hash
         log("=== Starting Flow: `termina` VM + ChromeOS Settings UI Installer ===")
-        throttler = HostQemuCpuThrottler(self.pid_file, self.cpu_quota_pct)
+        throttler = HostQemuCpuThrottler(
+            self.pid_file,
+            self.cpu_quota_pct,
+            initial_delay_sec=0.0 if self.throttle_from_vm_start else 3.0,
+        )
         timeline = InitTimelineRecorder(
-            self, h, expected_username=username, on_vm_started=throttler.start
+            self,
+            h,
+            expected_username=username,
+            on_vm_started=throttler.start,
         )
         crosh = self.open_crosh_tab("Termina-Crosh")
         failed = False
@@ -3511,6 +4064,11 @@ def main() -> int:
         default=None,
         help="Optional host-side CPU duty-cycle quota (5..100%%) applied during installer to simulate slow CI runners",
     )
+    parser.add_argument(
+        "--qemu-throttle-from-vm-start",
+        action="store_true",
+        help="Start --qemu-cpu-quota-pct throttling immediately at VmStartingUpSignal (0s delay) so inner crosvm boot and SetUpVmUser #1 are also throttled",
+    )
     args = parser.parse_args()
 
     if args.self_test:
@@ -3543,6 +4101,7 @@ def main() -> int:
             ram_gb=args.qemu_ram_gb,
             smp=args.qemu_smp,
             cpu_quota_pct=args.qemu_cpu_quota_pct,
+            throttle_from_vm_start=args.qemu_throttle_from_vm_start,
         )
         try:
             vm.start()
