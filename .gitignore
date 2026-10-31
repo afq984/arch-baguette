@@ -15,3 +15,5 @@ packages/*/src/
 packages/*/pkg/
 packages/*/*.log
 packages/cros-guest-tools/cros-container-guest-tools/
+.venv/
+__pycache__/

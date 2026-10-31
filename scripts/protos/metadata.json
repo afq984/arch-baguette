@@ -1,0 +1,14 @@
+{
+  "board": "amd64-generic-public",
+  "cros_release": "R156-16827.0.0",
+  "files": {
+    "LICENSE": "d20e000b94db73939f262badd4994a6451c7f61ddd192e13c90f48399af2c9c6",
+    "arc/arc.proto": "71eaad340261722e047b11c6b99d75c3e6617a729858709344b1162ae7bf1e19",
+    "vm_applications/apps.proto": "4a3a3fedda98499fd046fccab39e782c4f5402f96f0735caec930646f774b27c",
+    "vm_cicerone/cicerone_service.proto": "a5d6bcb9637bb022ce9272815619f597fc649c2ae9695d76a6850b348e6daa41",
+    "vm_concierge/concierge_service.proto": "417dd7385f45623dc90ef00c1f781688e4fab7c26d0cf1e2703590f95d1a23ef"
+  },
+  "manifest_url": "https://storage.googleapis.com/chromiumos-image-archive/amd64-generic-public/R156-16827.0.0/manifest.xml",
+  "platform2_repo": "https://chromium.googlesource.com/chromiumos/platform2",
+  "platform2_revision": "4f4daab2caefdf9ce9214d0f8221cd91d6bd08cd"
+}
