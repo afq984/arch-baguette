@@ -88,8 +88,12 @@ arch-baguette-v2/
 │       └── verify-image.sh      # image-level asserts (guestfish/btrfs inspect)
 ├── scripts/
 │   ├── build-repo.sh            # makepkg all packages → out/repo (repo-add)
-│   └── deploy-test.sh           # push image into the nested ChromeOS rig
-├── .github/workflows/           # packages.yaml, image.yaml, uprev.yaml (phase D)
+│   ├── deploy-test.sh           # push image into the nested ChromeOS rig
+│   ├── test_user_flows.py       # nested-KVM ChromeOS UI + crosh E2E user-flow test
+│   └── protos/                  # SHA-256-pinned ChromiumOS D-Bus .proto schemas
+├── tests/
+│   └── test_user_flows_unit.py  # offline stdlib unittest suite for test_user_flows.py
+├── .github/workflows/           # packages.yaml, image.yaml, test-user-flows.yaml, uprev.yaml
 └── out/                         # build products (gitignored)
     ├── packages/                # *.pkg.tar.zst
     ├── repo/                    # baguette.db + packages (local pacman repo)
@@ -221,6 +225,18 @@ this repo. Requirements:
   a VM named `v2test` by default (NEVER touch `baguette` (stock) or the
   rig-owned `archtest`), captures os-release / is-system-running / df / id
   evidence.
+- `scripts/test_user_flows.py` + `scripts/protos/`: automated nested-KVM
+  ChromiumOS E2E test driving the documented `README.md` `termina` + ChromeOS
+  Settings Linux installer flow over CDP, gating Terminal readiness on
+  `VmCicerone.ContainerStarted` (validated against vendored SHA-256-pinned
+  `.proto` schemas matching `/etc/lsb-release`), verifying `vsh termina penguin`
+  re-entry, guest UID/GID `1000`, the 10 `SetUpUser` supplementary groups, and
+  active `cros-garcon.service`, and recording passive D-Bus/UMA/resource/guest
+  diagnostics.
+- `tests/test_user_flows_unit.py`: offline stdlib `unittest` suite (also invoked
+  via `scripts/test_user_flows.py --self-test`) covering `README.md` command
+  extraction, vendored `.proto` digests and strict wire decoding, D-Bus/CDP
+  parsers, slow-runner error-50 classification, and resource/guest diagnostics.
 
 ## CI (phase D — GitHub Actions)
 

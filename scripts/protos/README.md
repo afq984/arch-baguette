@@ -17,8 +17,9 @@ All files are governed by the ChromiumOS BSD-style license in [`LICENSE`](./LICE
 ChromeOS test image (`board` and `cros_release`), `manifest_url`,
 `platform2_revision`, and per-file SHA-256 digests:
 
-- `scripts/test_user_flows.py --self-test` (and every E2E run at startup)
-  verifies `metadata.json` and the SHA-256 digests of all vendored files.
+- `tests/test_user_flows_unit.py` / `scripts/test_user_flows.py --self-test`
+  (and every E2E run at startup) verifies `metadata.json` and the SHA-256
+  digests of all vendored files.
 - At runtime, `scripts/test_user_flows.py` downloads the ChromeOS test image for
   `board`/`cros_release` from `metadata.json`, inspects `/etc/lsb-release`
   inside the booted ChromeOS VM (`CHROMEOS_RELEASE_BUILDER_PATH`,

@@ -1,39 +1,10 @@
 #!/usr/bin/env python3
 """End-to-end verification of the arch-baguette ChromeOS UI user setup flow in a ChromeOS VM.
 
-All user-facing steps are driven through the real ChromeOS UI (Chrome DevTools
-Protocol over an SSH port forward to Chrome's DevToolsActivePort) using the
-exact commands parsed from `README.md` fenced code blocks, while a passive,
-side-effect-free initialization timeline recorder monitors D-Bus signals
-(`org.chromium.VmConcierge` and `org.chromium.VmCicerone`), read-only D-Bus
-queries, Chrome UMA histograms, and system logs:
-
-  - Flow (`termina` VM name + ChromeOS Settings Linux Installer UI):
-    1. Opens `chrome-untrusted://crosh/` and runs the `vmc create ... termina`
-      command parsed from `README.md`.
-    2. Starts a passive system D-Bus signal monitor (`dbus-monitor --system`)
-      before clicking **Install** to timestamp `VmStartingUpSignal`,
-      `VmStartedSignal`, and `ContainerStarted` (`termina`/`penguin`).
-    3. Opens `chrome://os-settings/`, navigates to **About ChromeOS** ->
-      **Developers** -> **Linux development environment**, and clicks **Set up**.
-    4. In `chrome://crostini-installer`, clicks **Next**, enters a custom
-      username (`terminauser`), clicks **Install**, and waits for the
-      installer dialog to finish and launch the ChromeOS Terminal app.
-    5. Observes the auto-opened `chrome-untrusted://terminal` window, gates
-      readiness on cicerone's `ContainerStarted` signal for `termina`/`penguin`,
-      allows recovery via a fresh Terminal tab from the Terminal Home app ONLY
-      for the single proven slow-runner case (initial Terminal buffer equals
-      `Launching vmshell failed: Error starting crostini for terminal: 50 (CONTAINER_SETUP_FAILED)`
-      caused by `SetUpVmUser` call #2 hitting its 20s `Deadline Exceeded` between
-      `InstallerClosed` and `ContainerStarted`), and verifies an interactive
-      shell (`id -nu` == `terminauser`) inside the ChromeOS Terminal app.
-    6. Runs the documented `vsh termina penguin` command in `crosh` once (no
-      retry) and asserts the guest login shell belongs to `terminauser`.
-    7. Verifies the Arch Linux guest environment (`/etc/os-release`), UID 1000
-      username (`terminauser`), primary group `terminauser` (GID 1000), exact
-      supplementary group set (`audio`, `cdrom`, `dialout`, `disk`, `floppy`,
-      `kvm`, `netdev`, `sudo`, `tss`, `video`), and active `cros-garcon.service`,
-      and prints the complete initialization timeline and read-only D-Bus/UMA state.
+Drives the documented `README.md` `termina` + ChromeOS Settings Linux installer flow over
+Chrome DevTools Protocol (CDP), gates Terminal readiness on `VmCicerone.ContainerStarted`,
+verifies `crosh` `vsh termina penguin` re-entry and guest UID/GID/group/`cros-garcon` contracts,
+and records a passive D-Bus, UMA, log, and host/ChromeOS resource timeline.
 """
 
 from __future__ import annotations
@@ -46,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -130,7 +102,6 @@ class CrosProtoModules:
     metadata: dict[str, Any]
     concierge_pb2: Any
     cicerone_pb2: Any
-    _temp_dir: tempfile.TemporaryDirectory[str]
 
 
 _CROS_PROTOS: CrosProtoModules | None = None
@@ -241,39 +212,38 @@ def load_cros_protos(proto_dir: Path = DEFAULT_PROTO_DIR) -> CrosProtoModules:
                 f"Expected google.protobuf major version 7.x matching uv.lock, got {pb_ver!r}"
             )
 
-        tmp_dir = tempfile.TemporaryDirectory(prefix="cros-protos-")
         proto_files = [
             str(proto_dir / "arc/arc.proto"),
             str(proto_dir / "vm_applications/apps.proto"),
             str(proto_dir / "vm_concierge/concierge_service.proto"),
             str(proto_dir / "vm_cicerone/cicerone_service.proto"),
         ]
-        rc = protoc.main(
-            [
-                "grpc_tools.protoc",
-                f"-I{proto_dir}",
-                f"--python_out={tmp_dir.name}",
-                *proto_files,
-            ]
-        )
-        if rc != 0:
-            raise RuntimeError(f"grpc_tools.protoc failed with exit code {rc}")
+        with tempfile.TemporaryDirectory(prefix="cros-protos-") as tmp_dir:
+            rc = protoc.main(
+                [
+                    "grpc_tools.protoc",
+                    f"-I{proto_dir}",
+                    f"--python_out={tmp_dir}",
+                    *proto_files,
+                ]
+            )
+            if rc != 0:
+                raise RuntimeError(f"grpc_tools.protoc failed with exit code {rc}")
 
-        sys.path.insert(0, tmp_dir.name)
-        try:
-            import importlib
+            sys.path.insert(0, tmp_dir)
+            try:
+                import importlib
 
-            importlib.invalidate_caches()
-            concierge_pb2 = importlib.import_module("vm_concierge.concierge_service_pb2")
-            cicerone_pb2 = importlib.import_module("vm_cicerone.cicerone_service_pb2")
-        finally:
-            sys.path.remove(tmp_dir.name)
+                importlib.invalidate_caches()
+                concierge_pb2 = importlib.import_module("vm_concierge.concierge_service_pb2")
+                cicerone_pb2 = importlib.import_module("vm_cicerone.cicerone_service_pb2")
+            finally:
+                sys.path.remove(tmp_dir)
 
         loaded = CrosProtoModules(
             metadata=meta,
             concierge_pb2=concierge_pb2,
             cicerone_pb2=cicerone_pb2,
-            _temp_dir=tmp_dir,
         )
         if proto_dir == DEFAULT_PROTO_DIR:
             _CROS_PROTOS = loaded
@@ -428,74 +398,96 @@ def _parse_hex_byte_tokens(tokens: list[str], context: str, raw_line: str) -> li
     return tokens
 
 
+class _DbusByteArrayParser:
+    """Shared state machine for `dbus-print-message.c` byte-array bodies (`array of bytes [...]` or empty `array [\\n]`)."""
+
+    def __init__(self, context: str) -> None:
+        self.context = context
+        self.state = "WAIT_OPEN"
+        self._hex_tokens: list[str] = []
+
+    def feed_line(self, line: str) -> bytes | None:
+        if self.state == "DONE":
+            raise ValueError(
+                f"{self.context}: unexpected extra line after closing ']': {line!r}"
+            )
+        if self.state == "WAIT_OPEN":
+            # In dbus-print-message.c, a 0-length `ay` has subiter arg_type == DBUS_TYPE_INVALID,
+            # printing `   array [\n   ]` instead of `   array of bytes [`.
+            if line == "   array [":
+                self.state = "WAIT_EMPTY_CLOSE"
+                return None
+            if not line.startswith("   array of bytes ["):
+                raise ValueError(
+                    f"{self.context}: expected '   array of bytes [' (or empty '   array ['), got {line!r}"
+                )
+            after_open = line.split("[", 1)[1]
+            if "]" in after_open:
+                before_close, after_close = after_open.split("]", 1)
+                if after_close.strip():
+                    raise ValueError(
+                        f"{self.context}: unexpected trailing text after ']': {line!r}"
+                    )
+                self._hex_tokens.extend(_parse_hex_byte_tokens(before_close.split(), self.context, line))
+                self.state = "DONE"
+                return bytes.fromhex("".join(self._hex_tokens))
+            self._hex_tokens.extend(_parse_hex_byte_tokens(after_open.split(), self.context, line))
+            self.state = "IN_ARRAY"
+            return None
+
+        if self.state == "WAIT_EMPTY_CLOSE":
+            if line != "   ]":
+                raise ValueError(
+                    f"{self.context}: expected exact '   ]' closing empty '   array [', got {line!r}"
+                )
+            self.state = "DONE"
+            return b""
+
+        if self.state == "IN_ARRAY":
+            if not line.startswith("   "):
+                raise ValueError(f"{self.context}: expected indented array line, got {line!r}")
+            if "]" in line:
+                before_close, after_close = line.split("]", 1)
+                if after_close.strip():
+                    raise ValueError(
+                        f"{self.context}: unexpected trailing text after ']': {line!r}"
+                    )
+                self._hex_tokens.extend(_parse_hex_byte_tokens(before_close.split(), self.context, line))
+                self.state = "DONE"
+                return bytes.fromhex("".join(self._hex_tokens))
+            toks = line.split()
+            if not toks:
+                raise ValueError(f"{self.context}: empty line inside array of bytes")
+            self._hex_tokens.extend(_parse_hex_byte_tokens(toks, self.context, line))
+            return None
+
+        raise AssertionError(f"Unreachable _DbusByteArrayParser state: {self.state!r}")
+
+    def ensure_done(self) -> None:
+        if self.state != "DONE":
+            raise ValueError(
+                f"{self.context}: unclosed byte array body (state={self.state})"
+            )
+
+
 def parse_dbus_send_byte_array(output: str, context: str = "dbus-send") -> bytes:
     """Strictly parses `dbus-send --print-reply` output containing a single `array of bytes [...]` (or empty `array [\\n]`)."""
-    non_empty = [ln for ln in output.splitlines() if ln.strip()]
+    non_empty = [ln.rstrip("\r\n") for ln in output.splitlines() if ln.strip()]
     if len(non_empty) < 2:
         raise ValueError(f"{context}: truncated or empty dbus-send output:\n{output}")
     if not _DBUS_METHOD_RETURN_RE.match(non_empty[0].strip()):
         raise ValueError(
             f"{context}: expected 'method return ...' header on line 1, got {non_empty[0]!r}"
         )
-
-    first_body = non_empty[1]
-    # In dbus-print-message.c, a 0-length `ay` (byte array) has subiter arg_type == DBUS_TYPE_INVALID,
-    # so `dbus-send --print-reply` prints `   array [\n   ]` instead of `   array of bytes [`.
-    if first_body == "   array [":
-        if len(non_empty) != 3 or non_empty[2] != "   ]":
-            raise ValueError(
-                f"{context}: expected exact closing '   ]' after empty '   array [', got:\n{output}"
-            )
-        return b""
-
-    if not first_body.startswith("   array of bytes ["):
-        raise ValueError(
-            f"{context}: expected indented 'array of bytes [' (or empty '   array [') on line 2, got {first_body!r}"
-        )
-
-    hex_tokens: list[str] = []
-    after_open = first_body.split("[", 1)[1]
-    if "]" in after_open:
-        if len(non_empty) != 2:
-            raise ValueError(
-                f"{context}: unexpected extra lines after closing ']' in:\n{output}"
-            )
-        before_close, after_close = after_open.split("]", 1)
-        if after_close.strip():
-            raise ValueError(
-                f"{context}: unexpected trailing text after ']' on line 2: {first_body!r}"
-            )
-        hex_tokens.extend(_parse_hex_byte_tokens(before_close.split(), context, first_body))
-        return bytes.fromhex("".join(hex_tokens))
-
-    hex_tokens.extend(_parse_hex_byte_tokens(after_open.split(), context, first_body))
-    closed = False
-    for idx, ln in enumerate(non_empty[2:], start=3):
-        if closed:
-            raise ValueError(
-                f"{context}: unexpected extra line {idx} after closing ']': {ln!r}"
-            )
-        if not ln.startswith("   "):
-            raise ValueError(
-                f"{context}: expected indented array line {idx}, got {ln!r}"
-            )
-        if "]" in ln:
-            before_close, after_close = ln.split("]", 1)
-            if after_close.strip():
-                raise ValueError(
-                    f"{context}: unexpected trailing text after ']' on line {idx}: {ln!r}"
-                )
-            hex_tokens.extend(_parse_hex_byte_tokens(before_close.split(), context, ln))
-            closed = True
-        else:
-            toks = ln.split()
-            if not toks:
-                raise ValueError(f"{context}: empty line inside array of bytes")
-            hex_tokens.extend(_parse_hex_byte_tokens(toks, context, ln))
-
-    if not closed:
-        raise ValueError(f"{context}: unclosed 'array of bytes [' in:\n{output}")
-    return bytes.fromhex("".join(hex_tokens))
+    parser = _DbusByteArrayParser(context)
+    result: bytes | None = None
+    for ln in non_empty[1:]:
+        out = parser.feed_line(ln)
+        if out is not None:
+            result = out
+    parser.ensure_done()
+    assert result is not None
+    return result
 
 
 class DbusMonitorSignalParser:
@@ -505,7 +497,14 @@ class DbusMonitorSignalParser:
         self._state: str = "IDLE"
         self._cur_iface: str = ""
         self._cur_member: str = ""
-        self._hex_tokens: list[str] = []
+        self._body_parser: _DbusByteArrayParser | None = None
+
+    def _ensure_not_mid_signal(self, reason: str) -> None:
+        if self._state in ("WAIT_DBUS_NAME_STRING", "IN_BODY"):
+            raise ValueError(
+                f"dbus-monitor signal {self._cur_iface}.{self._cur_member} ended "
+                f"before body completed ({reason}, state={self._state})"
+            )
 
     def feed_line(self, raw_line: str) -> tuple[str, str, bytes] | None:
         line = raw_line.rstrip("\r\n")
@@ -513,127 +512,50 @@ class DbusMonitorSignalParser:
             return None
 
         if not line[0].isspace():
-            if self._state in (
-                "WAIT_ARRAY_OPEN",
-                "WAIT_EMPTY_ARRAY_CLOSE",
-                "IN_ARRAY",
-                "WAIT_DBUS_NAME_STRING",
-            ):
-                raise ValueError(
-                    f"dbus-monitor signal {self._cur_iface}.{self._cur_member} ended "
-                    f"before body completed (state={self._state}, next line: {line!r})"
-                )
+            self._ensure_not_mid_signal(f"next line: {line!r}")
             if not line.startswith("signal "):
                 raise ValueError(f"Unexpected top-level dbus-monitor line: {line!r}")
             m = _DBUS_SIGNAL_HEADER_RE.match(line)
             if not m:
                 raise ValueError(f"Malformed dbus-monitor signal header: {line!r}")
             _path, iface, member = m.group(1), m.group(2), m.group(3)
+            self._cur_iface = iface
+            self._cur_member = member
             if iface == "org.freedesktop.DBus" and member in ("NameAcquired", "NameLost"):
                 self._state = "WAIT_DBUS_NAME_STRING"
-                self._cur_iface = iface
-                self._cur_member = member
-                self._hex_tokens = []
+                self._body_parser = None
                 return None
             if (iface, member) not in MONITORED_DBUS_SIGNALS:
                 raise ValueError(
                     f"Unexpected D-Bus signal {iface}.{member} on dbus-monitor stream: {line!r}"
                 )
-            self._state = "WAIT_ARRAY_OPEN"
-            self._cur_iface = iface
-            self._cur_member = member
-            self._hex_tokens = []
+            self._state = "IN_BODY"
+            self._body_parser = _DbusByteArrayParser(f"dbus-monitor({iface}.{member})")
             return None
 
-        # Indented body line
         ctx = f"dbus-monitor({self._cur_iface}.{self._cur_member})"
         if self._state == "IDLE":
             raise ValueError(f"Indented dbus-monitor line before any signal header: {line!r}")
-        if self._state == "AFTER_ARRAY":
+        if self._state == "AFTER_BODY":
             raise ValueError(
                 f"{ctx}: unexpected extra body line after signal body completed: {line!r}"
             )
         if self._state == "WAIT_DBUS_NAME_STRING":
             m_name = re.match(r'^   string "(:[^"]+)"$', line)
             if not m_name:
-                raise ValueError(
-                    f"{ctx}: expected '   string \":1.xxx\"' body line, got {line!r}"
-                )
-            self._state = "AFTER_ARRAY"
-            return (
-                self._cur_iface,
-                self._cur_member,
-                m_name.group(1).encode("utf-8"),
-            )
-        if self._state == "WAIT_ARRAY_OPEN":
-            if line == "   array [":
-                self._state = "WAIT_EMPTY_ARRAY_CLOSE"
-                return None
-            if not line.startswith("   array of bytes ["):
-                raise ValueError(
-                    f"{ctx}: expected '   array of bytes [' (or empty '   array ['), got {line!r}"
-                )
-            after_open = line.split("[", 1)[1]
-            if "]" in after_open:
-                before_close, after_close = after_open.split("]", 1)
-                if after_close.strip():
-                    raise ValueError(
-                        f"{ctx}: unexpected trailing text after ']': {line!r}"
-                    )
-                self._hex_tokens.extend(
-                    _parse_hex_byte_tokens(before_close.split(), ctx, line)
-                )
-                self._state = "AFTER_ARRAY"
-                return (
-                    self._cur_iface,
-                    self._cur_member,
-                    bytes.fromhex("".join(self._hex_tokens)),
-                )
-            self._hex_tokens.extend(_parse_hex_byte_tokens(after_open.split(), ctx, line))
-            self._state = "IN_ARRAY"
-            return None
+                raise ValueError(f"{ctx}: expected '   string \":1.xxx\"' body line, got {line!r}")
+            self._state = "AFTER_BODY"
+            return (self._cur_iface, self._cur_member, m_name.group(1).encode("utf-8"))
 
-        if self._state == "WAIT_EMPTY_ARRAY_CLOSE":
-            if line != "   ]":
-                raise ValueError(
-                    f"{ctx}: expected exact '   ]' closing empty '   array [', got {line!r}"
-                )
-            self._state = "AFTER_ARRAY"
-            return (self._cur_iface, self._cur_member, b"")
-
-        if self._state == "IN_ARRAY":
-            if "]" in line:
-                before_close, after_close = line.split("]", 1)
-                if after_close.strip():
-                    raise ValueError(
-                        f"{ctx}: unexpected trailing text after ']': {line!r}"
-                    )
-                self._hex_tokens.extend(
-                    _parse_hex_byte_tokens(before_close.split(), ctx, line)
-                )
-                self._state = "AFTER_ARRAY"
-                return (
-                    self._cur_iface,
-                    self._cur_member,
-                    bytes.fromhex("".join(self._hex_tokens)),
-                )
-            toks = line.split()
-            self._hex_tokens.extend(_parse_hex_byte_tokens(toks, ctx, line))
-            return None
-
-        raise AssertionError(f"Unreachable parser state: {self._state!r}")
+        assert self._state == "IN_BODY" and self._body_parser is not None
+        parsed_bytes = self._body_parser.feed_line(line)
+        if parsed_bytes is not None:
+            self._state = "AFTER_BODY"
+            return (self._cur_iface, self._cur_member, parsed_bytes)
+        return None
 
     def finish(self) -> None:
-        if self._state in (
-            "WAIT_ARRAY_OPEN",
-            "WAIT_EMPTY_ARRAY_CLOSE",
-            "IN_ARRAY",
-            "WAIT_DBUS_NAME_STRING",
-        ):
-            raise ValueError(
-                f"dbus-monitor stream ended mid-signal {self._cur_iface}.{self._cur_member} "
-                f"(state={self._state})"
-            )
+        self._ensure_not_mid_signal("EOF")
 
 
 def parse_rfc3339_utc(ts_str: str) -> float:
@@ -844,1160 +766,32 @@ def classify_initial_terminal_failure(
 
 
 def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
-    """Fast offline unit test verifying README extraction, vendored protos, and strict D-Bus parsers."""
-    log(f"Running offline self-test against {readme_path} and {DEFAULT_PROTO_DIR}...")
+    """Thin shim delegating `--self-test` to `tests/test_user_flows_unit.py` via stdlib `unittest`."""
+    import unittest
+
+    tests_dir = REPO_ROOT / "tests"
+    if not (tests_dir / "test_user_flows_unit.py").is_file():
+        raise FileNotFoundError(f"Offline unit test suite not found under {tests_dir}")
+    prev_env = os.environ.get("BAGUETTE_TEST_README")
+    os.environ["BAGUETTE_TEST_README"] = str(readme_path.resolve())
+    try:
+        suite = unittest.defaultTestLoader.discover(
+            start_dir=str(tests_dir), pattern="test_*.py"
+        )
+        result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)
+    finally:
+        if prev_env is None:
+            os.environ.pop("BAGUETTE_TEST_README", None)
+        else:
+            os.environ["BAGUETTE_TEST_README"] = prev_env
+    if result.testsRun == 0 or not result.wasSuccessful():
+        raise RuntimeError(
+            f"Offline unit test suite failed (ran={result.testsRun}, "
+            f"failures={len(result.failures)}, errors={len(result.errors)})"
+        )
     cmds = extract_readme_commands(readme_path)
-    assert cmds.termina_create.startswith("vmc create "), cmds.termina_create
-    assert cmds.termina_create.endswith(" termina"), cmds.termina_create
-    assert cmds.termina_reentry_vsh == "vsh termina penguin", cmds.termina_reentry_vsh
-
-    # 1. Verify vendored .proto SHA-256 digests against metadata.json and compile via protoc
-    protos = load_cros_protos(DEFAULT_PROTO_DIR)
-    meta = protos.metadata
-    conc = protos.concierge_pb2
-    cic = protos.cicerone_pb2
-
-    # Verify negative case: tampered vendored .proto file must fail verify_vendored_protos
-    with tempfile.TemporaryDirectory() as tmp_pdir:
-        shutil.copytree(DEFAULT_PROTO_DIR, Path(tmp_pdir) / "protos")
-        tampered = Path(tmp_pdir) / "protos/arc/arc.proto"
-        tampered.write_text(tampered.read_text(encoding="utf-8") + "\n// tampered\n", encoding="utf-8")
-        try:
-            verify_vendored_protos(Path(tmp_pdir) / "protos")
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("Expected RuntimeError when a vendored .proto file is modified")
-
-    # 2. Verify /etc/lsb-release matching against metadata.json (positive + negative)
-    pinned_board = str(meta["board"])
-    pinned_release = str(meta["cros_release"])
-    pinned_milestone, pinned_version = parse_cros_release_str(pinned_release)
-    wrong_milestone = str(int(pinned_milestone) - 1)
-    wrong_version = "0.0.0"
-    wrong_release = f"R{wrong_milestone}-{wrong_version}"
-    good_lsb = (
-        f"CHROMEOS_RELEASE_BUILDER_PATH={pinned_board}/{pinned_release}\n"
-        f"CHROMEOS_RELEASE_CHROME_MILESTONE={pinned_milestone}\n"
-        f"CHROMEOS_RELEASE_VERSION={pinned_version}\n"
-    )
-    verify_lsb_release_matches_metadata(good_lsb, meta)
-    for bad_lsb in (
-        f"CHROMEOS_RELEASE_BUILDER_PATH={pinned_board}/{wrong_release}\n"
-        f"CHROMEOS_RELEASE_CHROME_MILESTONE={wrong_milestone}\n"
-        f"CHROMEOS_RELEASE_VERSION={wrong_version}\n",
-        f"CHROMEOS_RELEASE_BUILDER_PATH={pinned_board}/{pinned_release}\n"
-        f"CHROMEOS_RELEASE_CHROME_MILESTONE={wrong_milestone}\n"
-        f"CHROMEOS_RELEASE_VERSION={pinned_version}\n",
-        f"CHROMEOS_RELEASE_BUILDER_PATH={pinned_board}-other/{pinned_release}\n"
-        f"CHROMEOS_RELEASE_CHROME_MILESTONE={pinned_milestone}\n"
-        f"CHROMEOS_RELEASE_VERSION={pinned_version}\n",
-    ):
-        try:
-            verify_lsb_release_matches_metadata(bad_lsb, meta)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError(f"Expected RuntimeError on mismatched lsb-release: {bad_lsb!r}")
-
-    # 3. Round-trip real captured D-Bus payloads through DbusMonitorSignalParser,
-    #    parse_dbus_send_byte_array, and InitTimelineRecorder signal validation
-    sample_owner = "483c91bbeb9f2f163f30c8dea260f4d8d1c87b4f"
-    real_get_vm_info_reply = (
-        "method return time=1793376373.228710 sender=:1.175 -> destination=:1.197 serial=91 reply_serial=2\n"
-        "   array of bytes [\n"
-        "      08 01 12 0f 0d 64 73 5c 1a 10 18 18 20 20 01 30 06 40 01\n"
-        "   ]\n"
-    )
-    raw_vm_info = parse_dbus_send_byte_array(real_get_vm_info_reply, "test GetVmInfo")
-    vm_info_resp = parse_and_validate_proto(raw_vm_info, conc.GetVmInfoResponse, "test GetVmInfo")
-    assert vm_info_resp.success is True
-    assert vm_info_resp.vm_info.pid == 24
-    assert vm_info_resp.vm_info.cid == 32
-    assert conc.VmInfo.VmType.Name(vm_info_resp.vm_info.vm_type) == "BAGUETTE"
-    assert conc.VmStatus.Name(vm_info_resp.vm_info.status) == "VM_STATUS_RUNNING"
-
-    # 3b. Verify empty byte-array (`   array [\n   ]`) parsing for both dbus-send and dbus-monitor
-    empty_list_containers_reply = (
-        "method return time=1793443903.001918 sender=:1.179 -> destination=:1.213 serial=105 reply_serial=2\n"
-        "   array [\n"
-        "   ]\n"
-    )
-    raw_empty_lc = parse_dbus_send_byte_array(
-        empty_list_containers_reply, "test empty ListRunningContainers"
-    )
-    assert raw_empty_lc == b"", raw_empty_lc
-    empty_lc_resp = parse_and_validate_proto(
-        raw_empty_lc, cic.ListRunningContainersResponse, "test empty ListRunningContainers"
-    )
-    assert list(empty_lc_resp.containers) == []
-
-    empty_sig_parser = DbusMonitorSignalParser()
-    assert (
-        empty_sig_parser.feed_line(
-            "signal time=1793443903.001918 sender=:1.179 -> destination=(null destination) "
-            "serial=42 path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=PendingAppListUpdates"
-        )
-        is None
-    )
-    assert empty_sig_parser.feed_line("   array [") is None
-    ev_empty = empty_sig_parser.feed_line("   ]")
-    empty_sig_parser.finish()
-    assert ev_empty == ("org.chromium.VmCicerone", "PendingAppListUpdates", b"")
-
-    # Build real signal stream (NameAcquired + VmStartingUpSignal + VmStartedSignal + ContainerStarted + PendingAppListUpdates)
-    sig_starting = conc.VmStartingUpSignal(
-        name="termina",
-        owner_id=sample_owner,
-        vm_type=conc.VmInfo.VmType.BAGUETTE,
-        cid=32,
-    ).SerializeToString()
-    sig_started = conc.VmStartedSignal(
-        name="termina",
-        owner_id=sample_owner,
-        vm_info=vm_info_resp.vm_info,
-        status=conc.VmStatus.VM_STATUS_RUNNING,
-    ).SerializeToString()
-    sig_container = cic.ContainerStartedSignal(
-        vm_name="termina",
-        container_name="penguin",
-        owner_id=sample_owner,
-        container_username="terminauser",
-        container_homedir="/home/terminauser",
-        sftp_vsock_port=4201566639,
-        container_token="9aa4fe0f-1346-4bdb-ac9c-62c9e9444f0e",
-    ).SerializeToString()
-    sig_applist = cic.PendingAppListUpdatesSignal(
-        vm_name="termina",
-        container_name="penguin",
-        count=0,
-    ).SerializeToString()
-
-    def _fmt_dbus_sig(iface: str, member: str, payload: bytes) -> str:
-        hex_str = " ".join(f"{b:02x}" for b in payload)
-        return (
-            f"signal time=1793376347.100000 sender=:1.175 -> destination=(null destination) "
-            f"serial=42 path=/org/chromium/{iface.split('.')[-1]}; interface={iface}; member={member}\n"
-            f"   array of bytes [\n"
-            f"      {hex_str}\n"
-            f"   ]\n"
-        )
-
-    monitor_stream = (
-        "signal time=1793376341.005000 sender=org.freedesktop.DBus -> destination=:1.198 "
-        "serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired\n"
-        '   string ":1.198"\n'
-        "signal time=1793376341.006000 sender=org.freedesktop.DBus -> destination=:1.198 "
-        "serial=4 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost\n"
-        '   string ":1.198"\n'
-        + _fmt_dbus_sig("org.chromium.VmConcierge", "VmStartingUpSignal", sig_starting)
-        + _fmt_dbus_sig("org.chromium.VmConcierge", "VmStartedSignal", sig_started)
-        + _fmt_dbus_sig("org.chromium.VmCicerone", "ContainerStarted", sig_container)
-        + _fmt_dbus_sig("org.chromium.VmCicerone", "PendingAppListUpdates", sig_applist)
-    )
-    mon_parser = DbusMonitorSignalParser()
-    rec = InitTimelineRecorder(None, sample_owner, expected_username="terminauser")  # type: ignore[arg-type]
-    rec.t_install_mono = time.monotonic()
-    parsed_events: list[tuple[str, str]] = []
-    for ln in monitor_stream.splitlines():
-        ev = mon_parser.feed_line(ln)
-        if ev is not None:
-            iface, member, raw_bytes = ev
-            rec._handle_dbus_signal(iface, member, raw_bytes)
-            parsed_events.append((iface, member))
-    mon_parser.finish()
-    assert len(parsed_events) == 6, parsed_events
-    assert rec.monitor_unique_name == ":1.198"
-    assert rec._monitor_subscribed_event.is_set() is True
-    assert rec.is_container_started() is True
-    rec.verify_required_dbus_signal_sequence()
-
-    # Negative signal sequence checks (missing or out-of-order signals must fail)
-    for bad_seq_entries in (
-        [
-            TimelineEntry(1.0, "dbus", "VmStartedSignal", "vm='termina'"),
-            TimelineEntry(2.0, "dbus", "ContainerStarted", "vm='termina' container='penguin'"),
-        ],
-        [
-            TimelineEntry(2.0, "dbus", "VmStartedSignal", "vm='termina'"),
-            TimelineEntry(1.0, "dbus", "VmStartingUpSignal", "vm='termina'"),
-            TimelineEntry(3.0, "dbus", "ContainerStarted", "vm='termina' container='penguin'"),
-        ],
-    ):
-        bad_seq_rec = InitTimelineRecorder(None, sample_owner, expected_username="terminauser")  # type: ignore[arg-type]
-        bad_seq_rec._entries = list(bad_seq_entries)
-        try:
-            bad_seq_rec.verify_required_dbus_signal_sequence()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError(f"Expected RuntimeError on invalid signal sequence: {bad_seq_entries!r}")
-
-    # 4. Verify negative cases for protobuf & D-Bus text parsers (must abort aggressively)
-    for bad_payload_desc, bad_fn in [
-        (
-            "truncated wire bytes",
-            lambda: parse_and_validate_proto(sig_container[:-1], cic.ContainerStartedSignal, "trunc"),
-        ),
-        (
-            "unknown wire field tag",
-            lambda: parse_and_validate_proto(
-                sig_container + b"\xf8\x0f\x01", cic.ContainerStartedSignal, "unk"
-            ),
-        ),
-        (
-            "wrong message type bytes (GetVmInfoResponse decoded as ContainerStartedSignal)",
-            lambda: parse_and_validate_proto(raw_vm_info, cic.ContainerStartedSignal, "wrong_type"),
-        ),
-        (
-            "missing required container_username in ContainerStarted",
-            lambda: rec._handle_dbus_signal(
-                "org.chromium.VmCicerone",
-                "ContainerStarted",
-                cic.ContainerStartedSignal(
-                    vm_name="termina", container_name="penguin", owner_id=sample_owner
-                ).SerializeToString(),
-            ),
-        ),
-        (
-            "unknown enum value in VmStartedSignal",
-            lambda: require_enum_name(conc.VmStatus, 999, "status", "enum_test", b"\x20\xe7\x07"),
-        ),
-        (
-            "malformed dbus-send output (missing method return)",
-            lambda: parse_dbus_send_byte_array("   array of bytes [\n      08 01\n   ]\n", "bad_send"),
-        ),
-        (
-            "malformed dbus-send output (non-hex byte token)",
-            lambda: parse_dbus_send_byte_array(
-                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
-                "   array of bytes [\n      08 zz\n   ]\n",
-                "bad_hex",
-            ),
-        ),
-        (
-            "malformed dbus-monitor signal (unclosed array of bytes)",
-            lambda: [
-                DbusMonitorSignalParser().feed_line(x)
-                for x in (
-                    "signal time=1.0 sender=:1.1 -> destination=(null destination) serial=1 "
-                    "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=ContainerStarted",
-                    "   array of bytes [",
-                    "      0a 07",
-                    "signal time=2.0 sender=:1.1 -> destination=(null destination) serial=2 "
-                    "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=ContainerStarted",
-                )
-            ],
-        ),
-        (
-            "unexpected D-Bus signal member on dbus-monitor",
-            lambda: DbusMonitorSignalParser().feed_line(
-                "signal time=1.0 sender=:1.1 -> destination=(null destination) serial=1 "
-                "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=BogusSignal"
-            ),
-        ),
-        (
-            "malformed dbus-send non-empty generic array [ 08 ]",
-            lambda: parse_dbus_send_byte_array(
-                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
-                "   array [ 08 ]\n",
-                "bad_generic_array_inline",
-            ),
-        ),
-        (
-            "malformed dbus-send non-empty generic array [\\n 08 \\n]",
-            lambda: parse_dbus_send_byte_array(
-                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
-                "   array [\n      08\n   ]\n",
-                "bad_generic_array_multiline",
-            ),
-        ),
-        (
-            "malformed dbus-send unclosed empty array [",
-            lambda: parse_dbus_send_byte_array(
-                "method return time=1.0 sender=:1.1 -> destination=:1.2 serial=1 reply_serial=1\n"
-                "   array [\n",
-                "bad_unclosed_empty_array",
-            ),
-        ),
-        (
-            "malformed dbus-monitor non-empty generic array [\\n 08 \\n]",
-            lambda: [
-                p.feed_line(x)
-                for p in (DbusMonitorSignalParser(),)
-                for x in (
-                    "signal time=1.0 sender=:1.1 -> destination=(null destination) serial=1 "
-                    "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=PendingAppListUpdates",
-                    "   array [",
-                    "      08",
-                    "   ]",
-                )
-            ],
-        ),
-        (
-            "malformed dbus-monitor unclosed empty array [",
-            lambda: (
-                lambda p: (
-                    p.feed_line(
-                        "signal time=1.0 sender=:1.1 -> destination=(null destination) serial=1 "
-                        "path=/org/chromium/VmCicerone; interface=org.chromium.VmCicerone; member=PendingAppListUpdates"
-                    ),
-                    p.feed_line("   array ["),
-                    p.finish(),
-                )
-            )(DbusMonitorSignalParser()),
-        ),
-    ]:
-        try:
-            bad_fn()
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"Expected ValueError on negative test: {bad_payload_desc}")
-
-    assert parse_rfc3339_utc("2026-10-30T16:01:34.115657Z") > 0
-
-    # 5. Unit-test classify_initial_terminal_failure with real CI run-2 evidence + negative variants
-    ci_run2_entries = [
-        TimelineEntry(0.0, "ui", "InstallClicked", "user='terminauser'"),
-        TimelineEntry(51.8, "concierge", "SetUpVmUser", "call #1: Received request: SetUpVmUser"),
-        TimelineEntry(57.2, "concierge", "SetUpVmUserDone", "call #1 completed in <=5.3s"),
-        TimelineEntry(
-            106.4,
-            "ui",
-            "InstallerClosed",
-            "closed after 106.1s (last_progress='Configuring the Linux container. This might take up to 30 minutes.')",
-        ),
-        TimelineEntry(126.5, "concierge", "SetUpVmUser", "call #2: Received request: SetUpVmUser"),
-        TimelineEntry(
-            146.5,
-            "concierge",
-            "SetUpVmUserFailed",
-            "call #2 failed after 20.0s: SetUpUser RPC failed: Deadline Exceeded",
-        ),
-        TimelineEntry(
-            146.5,
-            "chrome",
-            "SetUpBaguetteUserFailed",
-            "[chrome/browser/ash/crostini/crostini_manager.cc:3030] Failed to set up baguette user: Deadline Exceeded",
-        ),
-        TimelineEntry(
-            146.5,
-            "chrome",
-            "RestartCrostiniFailed",
-            '[chrome/browser/ash/crostini/crostini_manager.cc:1067] Failed to restart Crostini with error code: 50, container: (type:6:BAGUETTE vm:"termina" container:"penguin")',
-        ),
-        TimelineEntry(
-            149.3,
-            "cicerone",
-            "ContainerReadyLog",
-            "Startup of container penguin at IP  for VM termina completed.",
-        ),
-        TimelineEntry(
-            150.0,
-            "dbus",
-            "ContainerStarted",
-            "vm='termina' container='penguin' user='terminauser' homedir='/home/terminauser'",
-        ),
-    ]
-    classify_initial_terminal_failure(
-        KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-        ci_run2_entries,
-        container_started_rel_sec=150.0,
-    )
-    # Bug #1 regression check: 1.5s UI poll + host-vs-VM clock offset where InstallerClosed
-    # (host monotonic t+127.9s) is stamped slightly after SetUpVmUser call #2 (VM realtime t+126.5s)
-    # MUST still be accepted because each clock domain is internally ordered.
-    poll_skew_entries = [
-        TimelineEntry(127.9, e.source, e.name, e.detail) if e.name == "InstallerClosed" else e
-        for e in ci_run2_entries
-    ]
-    classify_initial_terminal_failure(
-        KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-        poll_skew_entries,
-        container_started_rel_sec=150.0,
-    )
-
-    for neg_desc, neg_buf, neg_entries, neg_cs_rel in [
-        (
-            "different terminal error code",
-            "Launching vmshell failed: Error starting crostini for terminal: 22 (CONTAINER_START_FAILED)",
-            ci_run2_entries,
-            150.0,
-        ),
-        (
-            "progress bar timeout without error 50",
-            "[=========\\ ] Configuring the Linux container",
-            ci_run2_entries,
-            150.0,
-        ),
-        (
-            "InstallerClosed at/after ContainerStarted (host monotonic domain)",
-            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-            ci_run2_entries,
-            106.0,
-        ),
-        (
-            "failure occurred at/after ContainerReadyLog (VM log domain)",
-            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-            [
-                TimelineEntry(145.0, e.source, e.name, e.detail)
-                if e.name == "ContainerReadyLog"
-                else e
-                for e in ci_run2_entries
-            ],
-            150.0,
-        ),
-        (
-            "SetUpVmUser call #2 preceded call #1 completion",
-            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-            [
-                TimelineEntry(55.0, e.source, e.name, e.detail)
-                if (e.name == "SetUpVmUser" and e.detail.startswith("call #2:"))
-                else e
-                for e in ci_run2_entries
-            ],
-            150.0,
-        ),
-        (
-            "missing ContainerReadyLog",
-            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-            [e for e in ci_run2_entries if e.name != "ContainerReadyLog"],
-            150.0,
-        ),
-        (
-            "missing log correlation (no RestartCrostiniFailed)",
-            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-            [e for e in ci_run2_entries if e.name != "RestartCrostiniFailed"],
-            150.0,
-        ),
-        (
-            "multiple candidate RestartCrostiniFailed entries",
-            KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
-            [
-                *ci_run2_entries,
-                TimelineEntry(
-                    147.0,
-                    "chrome",
-                    "RestartCrostiniFailed",
-                    'Failed to restart Crostini with error code: 50, container: (type:6:BAGUETTE vm:"termina" container:"penguin")',
-                ),
-            ],
-            150.0,
-        ),
-    ]:
-        try:
-            classify_initial_terminal_failure(neg_buf, neg_entries, neg_cs_rel)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError(f"Expected RuntimeError for negative classifier test: {neg_desc}")
-
-    # Bug #2 check: on_vm_starting_up callback fires once on VmStartingUpSignal for 'termina'
-    starting_up_hits: list[str] = []
-    cb_rec = InitTimelineRecorder(
-        None,  # type: ignore[arg-type]
-        "deadbeef",
-        on_vm_starting_up=lambda: starting_up_hits.append("hit"),
-    )
-    vm_starting_raw = conc.VmStartingUpSignal(
-        name="termina",
-        owner_id="deadbeef",
-        vm_type=conc.VmInfo.VmType.BAGUETTE,
-        cid=32,
-    ).SerializeToString()
-    cb_rec._handle_dbus_signal("org.chromium.VmConcierge", "VmStartingUpSignal", vm_starting_raw)
-    cb_rec._handle_dbus_signal("org.chromium.VmConcierge", "VmStartingUpSignal", vm_starting_raw)
-    assert starting_up_hits == ["hit"], starting_up_hits
-
-    # 6. Unit-test verify_guest_user_identity (positive + negative cases)
-    good_groups_str = "terminauser audio cdrom dialout disk floppy kvm netdev sudo tss video"
-    verify_guest_user_identity(
-        "1000", "terminauser", "1000", "terminauser", good_groups_str, "terminauser"
-    )
-    for bad_id_desc, bad_id_args in [
-        ("wrong UID", ("1001", "terminauser", "1000", "terminauser", good_groups_str, "terminauser")),
-        ("wrong GID", ("1000", "terminauser", "1001", "terminauser", good_groups_str, "terminauser")),
-        ("wrong primary group", ("1000", "terminauser", "1000", "users", good_groups_str, "terminauser")),
-        (
-            "missing supplementary group (kvm)",
-            (
-                "1000",
-                "terminauser",
-                "1000",
-                "terminauser",
-                "terminauser audio cdrom dialout disk floppy netdev sudo tss video",
-                "terminauser",
-            ),
-        ),
-        (
-            "extra supplementary group (plugdev)",
-            (
-                "1000",
-                "terminauser",
-                "1000",
-                "terminauser",
-                good_groups_str + " plugdev",
-                "terminauser",
-            ),
-        ),
-    ]:
-        try:
-            verify_guest_user_identity(*bad_id_args)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError(f"Expected RuntimeError for guest identity check: {bad_id_desc}")
-
-    # 7. Verify guest boot diagnostic parser and monotonic clock timeline anchoring
-    dummy_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
-    dummy_rec.t_install_vm_epoch = 1000.0
-    unit_blocks = "\n\n".join(
-        [
-            "Id=first-boot-cros.service\nActiveState=inactive\nSubState=dead\nResult=success\n"
-            "InactiveExitTimestampMonotonic=12400000\nActiveEnterTimestampMonotonic=28400000\n"
-            "ExecMainStartTimestampMonotonic=12450000\nExecMainExitTimestampMonotonic=28390000\nExecMainStatus=0",
-            "Id=maitred.service\nActiveState=active\nSubState=running\nResult=success\n"
-            "InactiveExitTimestampMonotonic=12420000\nActiveEnterTimestampMonotonic=12500000\n"
-            "ExecMainStartTimestampMonotonic=12480000\nExecMainExitTimestampMonotonic=0\nExecMainStatus=0",
-            *[
-                f"Id={u}\nActiveState=active\nSubState=running\nResult=success\n"
-                "InactiveExitTimestampMonotonic=12000000\nActiveEnterTimestampMonotonic=13000000\n"
-                "ExecMainStartTimestampMonotonic=12100000\nExecMainExitTimestampMonotonic=0\nExecMainStatus=0"
-                for u in (
-                    "vshd.service",
-                    "systemd-logind.service",
-                    "ldconfig.service",
-                    "user-runtime-dir@1000.service",
-                    "user@1000.service",
-                )
-            ],
-        ]
-    )
-    sample_guest_diag = (
-        "===GUEST_CLOCK_SYNC===\n"
-        "uptime_sec=30.00\n"
-        "epoch_sec=1030.500000000\n"
-        "===GUEST_STAT_MTIMES===\n"
-        "/etc/passwd|1016|1970-01-01 00:16:56.250000000 +0000|uid=0 gid=0 mode=644\n"
-        "/etc/group|1016|1970-01-01 00:16:56.300000000 +0000|uid=0 gid=0 mode=644\n"
-        "/home/terminauser|1017|1970-01-01 00:16:57.500000000 +0000|uid=1000 gid=1000 mode=700\n"
-        "/var/lib/systemd/linger/terminauser|1018|1970-01-01 00:16:58.750000000 +0000|uid=0 gid=0 mode=644\n"
-        "/dev/.container_token|1019|1970-01-01 00:16:59.000000000 +0000|uid=0 gid=0 mode=644\n"
-        "===GUEST_LIST_JOBS===\n"
-        "No jobs running.\n"
-        "===GUEST_SYSTEMD_UNIT_SHOW===\n"
-        + unit_blocks
-        + "\n===GUEST_ANALYZE===\n"
-        "Startup finished in 1.2s (kernel) + 1.5s (userspace) = 2.7s\n"
-        "===GUEST_CRITICAL_CHAIN===\n"
-        "multi-user.target @1.5s\n"
-        "===GUEST_BLAME===\n"
-        "1.0s first-boot-cros.service\n"
-        "===GUEST_USER_ANALYZE===\n"
-        "Startup finished in 0.5s (userspace)\n"
-        "===GUEST_USER_CRITICAL_CHAIN===\n"
-        "default.target @0.5s\n"
-        "===GUEST_USER_BLAME===\n"
-        "0.2s cros-garcon.service\n"
-        "===GUEST_GARCON_STATUS===\n"
-        "Active: active (running)\n"
-        "===GUEST_JOURNAL_MONO===\n"
-        "[   12.500000] VM systemd[1]: Started maitred.\n"
-        "===GUEST_JOURNAL_JSON===\n"
-        + json.dumps(
-            {
-                "_COMM": "systemd",
-                "MESSAGE": "Started maitred.",
-                "__MONOTONIC_TIMESTAMP": "12500000",
-                "__REALTIME_TIMESTAMP": "1010000000",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "SYSLOG_IDENTIFIER": "maitred",
-                "MESSAGE": "Received request to setup a new user.",
-                "__MONOTONIC_TIMESTAMP": "13500000",
-                "__REALTIME_TIMESTAMP": "1011000000",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "SYSLOG_IDENTIFIER": "useradd",
-                "MESSAGE": "new user: name=terminauser, UID=1000, GID=1000, home=/home/terminauser, shell=/bin/bash, from=none",
-                "__MONOTONIC_TIMESTAMP": "15500000",
-                "__REALTIME_TIMESTAMP": "1013000000",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "SYSLOG_IDENTIFIER": "garcon",
-                "MESSAGE": "Server listening on vsock port",
-                "__MONOTONIC_TIMESTAMP": "19500000",
-                "__REALTIME_TIMESTAMP": "1020000000",
-            }
-        )
-        + "\n"
-    )
-    dummy_rec._parse_guest_diagnostics(sample_guest_diag, first_host_setup_user_rel=14.0, strict=True)
-    assert any("Startup finished" in ln for ln in dummy_rec.guest_summary_lines)
-    assert any("first-boot-cros.service:" in ln for ln in dummy_rec.guest_summary_lines)
-    by_name = {e.name: e for e in dummy_rec.all_entries()}
-    assert abs(by_name["MaitredStarted"].rel_sec - 13.0) < 1e-3, by_name["MaitredStarted"]
-    assert abs(by_name["MaitredSetUpUser"].rel_sec - 14.0) < 1e-3, by_name["MaitredSetUpUser"]
-    assert abs(by_name["UseraddDone"].rel_sec - 16.0) < 1e-3, by_name["UseraddDone"]
-    assert abs(by_name["GarconLog"].rel_sec - 20.0) < 1e-3, by_name["GarconLog"]
-    mtime_entries = [e for e in dummy_rec.all_entries() if e.name == "GuestFileMtime"]
-    assert len(mtime_entries) == 5, mtime_entries
-
-    # Bug #3 check: strict=True rejects corrupt clock sync, MISSING required path, missing list-jobs, or missing unit
-    for bad_g_desc, bad_g_diag, bad_g_exc in [
-        (
-            "corrupt uptime_sec",
-            sample_guest_diag.replace("uptime_sec=30.00", "uptime_sec=not_a_float"),
-            ValueError,
-        ),
-        (
-            "MISSING /dev/.container_token",
-            sample_guest_diag.replace(
-                "/dev/.container_token|1019|1970-01-01 00:16:59.000000000 +0000|uid=0 gid=0 mode=644",
-                "/dev/.container_token|MISSING",
-            ),
-            RuntimeError,
-        ),
-        (
-            "empty GUEST_LIST_JOBS",
-            sample_guest_diag.replace("No jobs running.\n", ""),
-            RuntimeError,
-        ),
-        (
-            "missing user@1000.service in GUEST_SYSTEMD_UNIT_SHOW",
-            sample_guest_diag.replace("Id=user@1000.service", "Id=other.service"),
-            RuntimeError,
-        ),
-    ]:
-        bad_g_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
-        bad_g_rec.t_install_vm_epoch = 1000.0
-        try:
-            bad_g_rec._parse_guest_diagnostics(bad_g_diag, first_host_setup_user_rel=14.0, strict=True)
-        except bad_g_exc:
-            pass
-        else:
-            raise AssertionError(f"Expected {bad_g_exc.__name__} on {bad_g_desc}")
-
-    # Also verify non-strict guest diagnostics parsing when user session hasn't started yet
-    partial_rec = InitTimelineRecorder(None, "deadbeef")  # type: ignore[arg-type]
-    partial_rec.t_install_vm_epoch = 1000.0
-    partial_rec._parse_guest_diagnostics(
-        "===GUEST_CLOCK_SYNC===\nuptime_sec=20.0\nepoch_sec=1025.0\n"
-        "===GUEST_JOURNAL_MONO===\n[ 10.000000] VM systemd[1]: Starting First boot script...\n",
-        first_host_setup_user_rel=None,
-        strict=False,
-    )
-    assert any("Starting First boot script" in ln for ln in partial_rec.guest_summary_lines)
-
-    # Verify negative cases (missing section or missing code blocks)
-    with tempfile.TemporaryDirectory() as tmp:
-        bad_readme = Path(tmp) / "README.md"
-        bad_readme.write_text("# Empty\n", encoding="utf-8")
-        try:
-            extract_readme_commands(bad_readme)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Expected ValueError on README missing '### Setup:' section")
-
-        bad_readme.write_text(
-            "### Setup: Test\n```sh\nvmc create --vm-type BAGUETTE termina\n```\n",
-            encoding="utf-8",
-        )
-        try:
-            extract_readme_commands(bad_readme)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Expected ValueError when second code block is missing")
-
-    # 8. Verify CDPConnection & CroshTab error/timeout wrapping (never bare websocket TimeoutError)
-    class WebSocketTimeoutException(Exception):
-        """Matches websocket-client's WebSocketTimeoutException (subclasses Exception, not TimeoutError)."""
-
-    class WebSocketConnectionClosedException(Exception):
-        pass
-
-    class _FakeWS:
-        def __init__(self, responses: list[Any], connected: bool = True) -> None:
-            self._responses = list(responses)
-            self.connected = connected
-            self.sent: list[str] = []
-            self.last_timeout: float | None = None
-
-        def settimeout(self, t: float) -> None:
-            self.last_timeout = t
-
-        def send(self, payload: str) -> None:
-            self.sent.append(payload)
-
-        def recv(self) -> str:
-            if not self._responses:
-                self.connected = False
-                return ""
-            nxt = self._responses.pop(0)
-            if isinstance(nxt, BaseException):
-                raise nxt
-            return str(nxt)
-
-        def close(self) -> None:
-            self.connected = False
-
-    fake_tgt = {
-        "id": "9F2A1B",
-        "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
-        "webSocketDebuggerUrl": "ws://127.0.0.1:41234/devtools/page/9F2A1B",
-    }
-
-    # 8a. Connect timeout wraps WebSocketTimeoutException -> CDPTimeoutError with full context
-    try:
-        CDPConnection.from_target(
-            fake_tgt,
-            label="Terminal-App-Initial",
-            timeout=12.0,
-            step_getter=lambda: "step3:observe_initial_terminal",
-            connect_fn=lambda *_a, **_kw: (_ for _ in ()).throw(
-                WebSocketTimeoutException("Connection timed out")
-            ),
-        )
-    except CDPTimeoutError as exc:
-        msg = str(exc)
-        for req_tok in (
-            "WebSocket.connect",
-            "Terminal-App-Initial",
-            "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
-            "9F2A1B",
-            "step3:observe_initial_terminal",
-            "waited=",
-        ):
-            assert req_tok in msg, (req_tok, msg)
-    else:
-        raise AssertionError("Expected CDPTimeoutError on WebSocket connect timeout")
-
-    # 8b. CroshTab.get_text recv WebSocketTimeoutException -> CDPTimeoutError (exact ci-pr5-run1 crash mode)
-    hung_conn = CDPConnection.from_target(
-        fake_tgt,
-        label="Terminal-App-Initial",
-        timeout=30.0,
-        step_getter=lambda: "step3:observe_initial_terminal",
-        connect_fn=lambda *_a, **_kw: _FakeWS([WebSocketTimeoutException("")]),
-    )
-    hung_tab = CroshTab("Terminal-App-Initial", hung_conn)
-    try:
-        hung_tab.get_text()
-    except CDPTimeoutError as exc:
-        msg = str(exc)
-        for req_tok in (
-            "Terminal-App-Initial.get_text",
-            "Runtime.evaluate#1",
-            "target='Terminal-App-Initial'",
-            "url='chrome-untrusted://terminal/html/terminal.html?command=vmshell'",
-            "target_id='9F2A1B'",
-            "step='step3:observe_initial_terminal'",
-            "waited=",
-        ):
-            assert req_tok in msg, (req_tok, msg)
-    else:
-        raise AssertionError("Expected CDPTimeoutError on CroshTab.get_text recv timeout")
-
-    # 8c. Socket disconnect / protocol error / JS exception -> CDPError with full context
-    for cdp_err_desc, ws_frames, call_kind in [
-        (
-            "unexpected WebSocket close",
-            [WebSocketConnectionClosedException("socket is already closed")],
-            "call",
-        ),
-        (
-            "CDP protocol error",
-            [json.dumps({"id": 1, "error": {"code": -32000, "message": "Target closed"}})],
-            "call",
-        ),
-        (
-            "JavaScript exceptionDetails",
-            [
-                json.dumps(
-                    {
-                        "id": 1,
-                        "result": {
-                            "exceptionDetails": {"text": "Uncaught TypeError: null"},
-                        },
-                    }
-                )
-            ],
-            "eval_js",
-        ),
-    ]:
-        err_conn = CDPConnection.from_target(
-            fake_tgt,
-            label="Crostini-Installer",
-            timeout=15.0,
-            step_getter=lambda: "step2:wait_installer_complete",
-            connect_fn=lambda *_a, _f=ws_frames, **_kw: _FakeWS(_f),
-        )
-        try:
-            if call_kind == "call":
-                err_conn.call("DOM.getDocument", op_desc="Installer:getDocument")
-            else:
-                err_conn.eval_js("window.boom()", op_desc="Installer:poll_status")
-        except CDPError as exc:
-            msg = str(exc)
-            for req_tok in (
-                "target='Crostini-Installer'",
-                "target_id='9F2A1B'",
-                "step='step2:wait_installer_complete'",
-                "waited=",
-            ):
-                assert req_tok in msg, (cdp_err_desc, req_tok, msg)
-        else:
-            raise AssertionError(f"Expected CDPError on {cdp_err_desc}")
-
-    # 8d. CroshTab.wait_for predicate timeout -> CDPTimeoutError with target, step, waited, and buffer
-    wait_frames = [
-        json.dumps({"id": i, "result": {"result": {"value": "[===  ] Starting VM..."}}})
-        for i in range(1, 20)
-    ]
-    wait_conn = CDPConnection.from_target(
-        fake_tgt,
-        label="Termina-Crosh",
-        timeout=10.0,
-        step_getter=lambda: "step4:crosh_vsh_reentry",
-        connect_fn=lambda *_a, **_kw: _FakeWS(wait_frames),
-    )
-    wait_tab = CroshTab("Termina-Crosh", wait_conn)
-    try:
-        wait_tab.wait_for(lambda txt: "crosh>" in txt, timeout=0.15, desc="crosh> prompt")
-    except CDPTimeoutError as exc:
-        msg = str(exc)
-        for req_tok in (
-            "Termina-Crosh.wait_for(crosh> prompt)",
-            "target='Termina-Crosh'",
-            "target_id='9F2A1B'",
-            "step='step4:crosh_vsh_reentry'",
-            "waited=",
-            "[===  ] Starting VM...",
-        ):
-            assert req_tok in msg, (req_tok, msg)
-    else:
-        raise AssertionError("Expected CDPTimeoutError on CroshTab.wait_for timeout")
-
-    # 9. Verify Host + ChromeOS VM periodic resource diagnostics parsers & strict/non-strict contract
-    host_info_amd = parse_host_runner_info(
-        "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\n",
-        "MemTotal:       16384000 kB\nMemAvailable:   12288000 kB\n",
-        4,
-    )
-    assert host_info_amd.vendor_id == "AuthenticAMD"
-    assert "EPYC 7763" in host_info_amd.model_name
-    assert host_info_amd.nproc == 4
-    assert abs(host_info_amd.mem_total_mib - 16000.0) < 1e-3
-
-    c0 = parse_proc_stat_cpu_line("cpu  100 10 50 800 20 5 5 10 30 0\n", "test0", clk_tck=100)
-    c1 = parse_proc_stat_cpu_line("cpu  250 10 100 830 50 5 5 50 80 0\n", "test1", clk_tck=100)
-    cdelta = compute_cpu_delta_pct(c0, c1)
-    # Total ticks: c0 = 1000, c1 = 1300 -> dt = 300; busy delta = (370 - 170) = 200 (66.67%),
-    # iowait delta = 30 (10.0%), steal delta = 40 (13.33%, 0.40s), idle delta = 30 (10.0%).
-    assert abs(cdelta.busy_pct - (200.0 / 3.0)) < 1e-2, cdelta
-    assert abs(cdelta.iowait_pct - 10.0) < 1e-2, cdelta
-    assert abs(cdelta.steal_pct - (40.0 / 3.0)) < 1e-2, cdelta
-    assert abs(cdelta.steal_sec - 0.40) < 1e-3, cdelta
-
-    sample_block_0 = "\n".join(
-        [
-            CROS_RESOURCE_SAMPLE_BEGIN,
-            "epoch_sec=2000.000",
-            "nproc=2",
-            "clk_tck=100",
-            "uptime_sec=50.00",
-            "loadavg=0.40 0.20 0.10 1/240 1200",
-            "stat_cpu=cpu  500 0 200 9200 50 10 10 30 0 0",
-            "psi_cpu=some avg10=1.50 avg60=0.50 avg300=0.10 total=100000",
-            "psi_memory=some avg10=0.00 avg60=0.00 avg300=0.00 total=10000",
-            "psi_memory=full avg10=0.00 avg60=0.00 avg300=0.00 total=5000",
-            "psi_io=some avg10=0.20 avg60=0.10 avg300=0.00 total=200000",
-            "psi_io=full avg10=0.10 avg60=0.05 avg300=0.00 total=150000",
-            "zram_mm_stat=10485760 4194304 5242880 0 5242880 100 0",
-            "meminfo_MemTotal=4096000",
-            "meminfo_MemAvailable=2800000",
-            "meminfo_Cached=900000",
-            "meminfo_SwapTotal=6144000",
-            "meminfo_SwapFree=6133760",
-            "meminfo_Dirty=512",
-            "meminfo_Writeback=0",
-            "meminfo_Shmem=65536",
-            "vmstat_pgpgin=10000",
-            "vmstat_pgpgout=5000",
-            "vmstat_pswpin=0",
-            "vmstat_pswpout=10",
-            "vmstat_pgmajfault=25",
-            "vmstat_oom_kill=0",
-            CROS_RESOURCE_SAMPLE_END,
-        ]
-    )
-    sample_block_1 = "\n".join(
-        [
-            CROS_RESOURCE_SAMPLE_BEGIN,
-            "epoch_sec=2010.000",
-            "nproc=2",
-            "clk_tck=100",
-            "uptime_sec=60.00",
-            "loadavg=3.20 1.50 0.60 4/280 1450",
-            "stat_cpu=cpu  1900 0 500 9350 150 10 10 80 1100 0",
-            "psi_cpu=some avg10=48.00 avg60=15.00 avg300=4.00 total=3600000",
-            "psi_cpu=full avg10=0.00 avg60=0.00 avg300=0.00 total=0",
-            "psi_memory=some avg10=6.50 avg60=2.00 avg300=0.50 total=610000",
-            "psi_memory=full avg10=2.10 avg60=0.80 avg300=0.20 total=205000",
-            "psi_io=some avg10=18.40 avg60=5.00 avg300=1.00 total=1700000",
-            "psi_io=full avg10=12.00 avg60=3.50 avg300=0.70 total=1150000",
-            "zram_mm_stat=104857600 31457280 35651584 0 36700160 400 12",
-            "meminfo_MemTotal=4096000",
-            "meminfo_MemAvailable=420000",
-            "meminfo_Cached=550000",
-            "meminfo_SwapTotal=6144000",
-            "meminfo_SwapFree=5900000",
-            "meminfo_Dirty=16384",
-            "meminfo_Writeback=4096",
-            "meminfo_Shmem=98304",
-            "vmstat_pgpgin=25000",
-            "vmstat_pgpgout=48000",
-            "vmstat_pswpin=120",
-            "vmstat_pswpout=960",
-            "vmstat_pgmajfault=140",
-            "vmstat_oom_kill=0",
-            "crosvm_proc=2401:crosvm:1150:819200:204800:R",
-            "crosvm_proc=2412:v_block:250:131072:16384:S",
-            CROS_RESOURCE_SAMPLE_END,
-        ]
-    )
-    rs0 = parse_cros_resource_block(
-        sample_block_0,
-        mono_ts=99.0,
-        rel_sec=-1.0,
-        host_cpu=c0,
-        host_load1=1.2,
-        host_mem_avail_mib=12000.0,
-    )
-    rs1 = parse_cros_resource_block(
-        sample_block_1,
-        mono_ts=109.0,
-        rel_sec=9.0,
-        host_cpu=c1,
-        host_load1=2.4,
-        host_mem_avail_mib=11500.0,
-    )
-    res_lines = summarize_resource_diagnostics(
-        host_info_amd, [rs0, rs1], install_mono=100.0, strict=True
-    )
-    joined_res = "\n".join(res_lines)
-    assert "vendor=AuthenticAMD" in joined_res, joined_res
-    assert "steal=13.33%" in joined_res, joined_res
-    assert "cpu_some=3.50s (35.0%, pk10=48.0)" in joined_res, joined_res
-    assert "io_some=1.50s (15.0%, pk10=18.4)" in joined_res, joined_res
-    assert "peak_procs=2 cpu_avg=140.0% cpu_peak=140.0%" in joined_res, joined_res
-    assert "CPU-contention" in joined_res and "IO-stall" in joined_res, joined_res
-    assert "[periodic samples (2/2 shown" in joined_res, joined_res
-
-    # Strict mode MUST fail on <2 samples or sampler warnings; non-strict mode MUST NOT raise
-    for bad_strict_desc, bad_strict_kwargs in [
-        ("only 1 sample", {"host_info": host_info_amd, "samples": [rs0], "install_mono": 100.0}),
-        (
-            "sampler warning present",
-            {
-                "host_info": host_info_amd,
-                "samples": [rs0, rs1],
-                "install_mono": 100.0,
-                "sampler_warnings": ["ssh exited rc=255"],
-            },
-        ),
-        (
-            "missing host_info",
-            {"host_info": None, "samples": [rs0, rs1], "install_mono": 100.0},
-        ),
-    ]:
-        try:
-            summarize_resource_diagnostics(**bad_strict_kwargs, strict=True)  # type: ignore[arg-type]
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError(
-                f"Expected RuntimeError in strict resource summary check: {bad_strict_desc}"
-            )
-        non_strict_out = summarize_resource_diagnostics(**bad_strict_kwargs, strict=False)  # type: ignore[arg-type]
-        assert len(non_strict_out) >= 1
-
-    # Negative parser checks for host/ChromeOS resource parsers
-    for neg_res_desc, neg_res_fn in [
-        (
-            "missing CPU vendor_id",
-            lambda: parse_host_runner_info("model name : X\n", "MemTotal: 100 kB\nMemAvailable: 50 kB\n", 2),
-        ),
-        (
-            "short /proc/stat line",
-            lambda: parse_proc_stat_cpu_line("cpu 1 2 3\n", "bad_stat"),
-        ),
-        (
-            "missing psi_io in ChromeOS sample",
-            lambda: parse_cros_resource_block(
-                "\n".join(x for x in sample_block_0.splitlines() if not x.startswith("psi_io=")),
-                mono_ts=1.0,
-                rel_sec=0.0,
-                host_cpu=c0,
-                host_load1=1.0,
-                host_mem_avail_mib=1000.0,
-            ),
-        ),
-        (
-            "missing meminfo_MemAvailable in ChromeOS sample",
-            lambda: parse_cros_resource_block(
-                "\n".join(
-                    x for x in sample_block_0.splitlines() if not x.startswith("meminfo_MemAvailable=")
-                ),
-                mono_ts=1.0,
-                rel_sec=0.0,
-                host_cpu=c0,
-                host_load1=1.0,
-                host_mem_avail_mib=1000.0,
-            ),
-        ),
-        (
-            "malformed crosvm_proc entry",
-            lambda: parse_cros_resource_block(
-                sample_block_0.replace(
-                    CROS_RESOURCE_SAMPLE_END,
-                    "crosvm_proc=bad:entry\n" + CROS_RESOURCE_SAMPLE_END,
-                ),
-                mono_ts=1.0,
-                rel_sec=0.0,
-                host_cpu=c0,
-                host_load1=1.0,
-                host_mem_avail_mib=1000.0,
-            ),
-        ),
-        (
-            "unexpected key in ChromeOS sample",
-            lambda: parse_cros_resource_block(
-                sample_block_0.replace(
-                    CROS_RESOURCE_SAMPLE_END,
-                    "mystery_field=123\n" + CROS_RESOURCE_SAMPLE_END,
-                ),
-                mono_ts=1.0,
-                rel_sec=0.0,
-                host_cpu=c0,
-                host_load1=1.0,
-                host_mem_avail_mib=1000.0,
-            ),
-        ),
-        (
-            "missing meminfo_Shmem in ChromeOS sample",
-            lambda: parse_cros_resource_block(
-                "\n".join(x for x in sample_block_0.splitlines() if not x.startswith("meminfo_Shmem=")),
-                mono_ts=1.0,
-                rel_sec=0.0,
-                host_cpu=c0,
-                host_load1=1.0,
-                host_mem_avail_mib=1000.0,
-            ),
-        ),
-        (
-            "missing vmstat_oom_kill in ChromeOS sample",
-            lambda: parse_cros_resource_block(
-                "\n".join(
-                    x for x in sample_block_0.splitlines() if not x.startswith("vmstat_oom_kill=")
-                ),
-                mono_ts=1.0,
-                rel_sec=0.0,
-                host_cpu=c0,
-                host_load1=1.0,
-                host_mem_avail_mib=1000.0,
-            ),
-        ),
-    ]:
-        try:
-            neg_res_fn()
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(f"Expected ValueError on negative resource parser test: {neg_res_desc}")
-
-    # Bug #4 check: _select_sample_indices caps strictly at <=32 rows while preserving {0, peak, N-1},
-    # and skipped-sample pswpout spikes appear in the next displayed row's delta.
-    for test_n in (33, 45, 60, 89):
-        many_samples = [
-            dataclasses.replace(
-                rs0,
-                mono_ts=100.0 + i,
-                rel_sec=float(i),
-                uptime_sec=50.0 + i,
-                load1=99.0 if i == 17 else 0.4,
-                pswpout=10 + (500 if i >= 16 else 0),
-            )
-            for i in range(test_n)
-        ]
-        sel = _select_sample_indices(many_samples, max_rows=32)
-        assert len(sel) <= 32, (test_n, len(sel))
-        assert sel[0] == 0 and sel[-1] == test_n - 1 and 17 in sel, (test_n, sel)
-        if test_n == 89:
-            # Verify sample 16 is skipped while sample 17 IS shown, and sample 17's row reports +500
-            assert 16 not in sel and 17 in sel, sel
-            ds_out = "\n".join(
-                summarize_resource_diagnostics(
-                    host_info_amd, many_samples, install_mono=100.0, strict=True
-                )
-            )
-            assert "pswp=+0/+500" in ds_out, ds_out
-
-    # Bug #6 check: _pid_matches_qemu matches qemu-system-*, kvm, custom --qemu-bin, and rejects kthreads/other procs
-    with tempfile.TemporaryDirectory() as fake_proc_str:
-        fp = Path(fake_proc_str)
-        for pid_num, comm_txt, cmdline_bytes in [
-            (101, "qemu-system-x86", b"/usr/bin/qemu-system-x86_64\x00-enable-kvm\x00"),
-            (102, "kvm", b"/usr/bin/kvm\x00-m\x004G\x00"),
-            (103, "my-custom-vmm", b"/opt/vmm/my-custom-vmm\x00-daemonize\x00"),
-            (104, "kvm-pit/101", b""),  # kernel thread: empty cmdline
-            (105, "python3", b"python3\x00-m\x00http.server\x00"),
-        ]:
-            d = fp / str(pid_num)
-            d.mkdir()
-            (d / "comm").write_text(comm_txt + "\n", encoding="utf-8")
-            (d / "cmdline").write_bytes(cmdline_bytes)
-        assert _pid_matches_qemu(101, "qemu-system-x86_64", proc_root=fp)
-        assert _pid_matches_qemu(102, "/usr/bin/kvm", proc_root=fp)
-        assert _pid_matches_qemu(103, "/opt/vmm/my-custom-vmm", proc_root=fp)
-        assert not _pid_matches_qemu(104, "/usr/bin/kvm", proc_root=fp)
-        assert not _pid_matches_qemu(105, "qemu-system-x86_64", proc_root=fp)
-
-    # Bug #7 check: negative pre-Install timestamps format cleanly as `t-   X.Xs` and in-flight SetUpVmUser is recorded
-    assert _fmt_rel_t(-2.4) == "t-   2.4s", _fmt_rel_t(-2.4)
-
-    class _FakeLogVM:
-        def ssh(self, cmd: str, **_kw: Any) -> Any:
-            if "/var/log/messages" in cmd:
-                out = (
-                    "2026-10-30T16:00:08.500000Z localhost vm_concierge[100]: Found existing disk at /x\n"
-                    "2026-10-30T16:00:15.000000Z localhost vm_concierge[100]: Received request: SetUpVmUser\n"
-                )
-            else:
-                out = ""
-            return subprocess.CompletedProcess(["ssh"], 0, stdout=out, stderr="")
-
-    inflight_rec = InitTimelineRecorder(_FakeLogVM(), "deadbeef")  # type: ignore[arg-type]
-    inflight_rec.t_install_vm_epoch = parse_rfc3339_utc("2026-10-30T16:00:10.000000Z")
-    inflight_rec.scrape_host_logs()
-    rep_txt = inflight_rec.format_report()
-    assert "t-   1.5s  [concierge] FoundExistingDisk:" in rep_txt, rep_txt
-    assert "t+   5.0s  [concierge] SetUpVmUserInFlight: call #1 still in flight" in rep_txt, rep_txt
-
     log(
-        "Self-test passed! Extracted README commands:\n"
+        f"Self-test passed ({result.testsRun} unit tests)! Extracted README commands:\n"
         f"  Setup create:       {cmds.termina_create}\n"
         f"  Setup vsh re-entry: {cmds.termina_reentry_vsh}"
     )
@@ -2018,23 +812,20 @@ def find_sbin_tool(name: str) -> str:
 
 def detect_host_qemu_cpu_arg() -> str:
     """Selects QEMU -cpu model matching chromite/lib/vm.py for Intel vs AMD KVM hosts."""
-    cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8")
-    if "AuthenticAMD" in cpuinfo:
+    vendor = read_local_host_runner_info().vendor_id
+    if vendor == "AuthenticAMD":
         return "Opteron_G4,-invpcid,-tsc-deadline,check,svm=on"
-    if "GenuineIntel" in cpuinfo:
+    if vendor == "GenuineIntel":
         return "Haswell-noTSX,-invpcid,-tsc-deadline,check,vmx=on"
-    raise RuntimeError("Unsupported host CPU vendor in /proc/cpuinfo (expected GenuineIntel or AuthenticAMD)")
+    raise RuntimeError(
+        f"Unsupported host CPU vendor {vendor!r} in /proc/cpuinfo (expected GenuineIntel or AuthenticAMD)"
+    )
 
 
 def default_vm_ram_gb() -> int:
     """Clamps default VM RAM between 4 GiB and 8 GiB based on host MemAvailable."""
-    meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
-    for line in meminfo.splitlines():
-        if line.startswith("MemAvailable:"):
-            avail_kib = int(line.split()[1])
-            avail_gib = avail_kib // (1024 * 1024)
-            return min(8, max(4, avail_gib - 2))
-    raise RuntimeError("MemAvailable entry not found in /proc/meminfo")
+    avail_gib = int(read_local_host_runner_info().mem_avail_mib // 1024)
+    return min(8, max(4, avail_gib - 2))
 
 
 def assert_host_kvm_available() -> None:
@@ -2146,7 +937,6 @@ class CDPConnection:
         step_getter: Callable[[], str] | None = None,
         connect_fn: Callable[..., Any] | None = None,
     ) -> None:
-        self.ws_url = ws_url
         self.default_timeout = timeout
         self.target_label = target_label
         self.target_url = target_url or ws_url
@@ -2158,7 +948,6 @@ class CDPConnection:
             self.target_id = "<unknown>"
         self._step_getter = step_getter
         self._next_id = 0
-        self.events: list[dict] = []
 
         t0 = time.monotonic()
         try:
@@ -2292,7 +1081,6 @@ class CDPConnection:
                         f"CDP protocol error ({self._ctx(op, elapsed, eff_timeout)}): {msg['error']}"
                     )
                 return msg.get("result", msg)
-            self.events.append(msg)
 
     def eval_js(
         self,
@@ -2320,6 +1108,29 @@ class CDPConnection:
                 f"CDP JavaScript exception ({self._ctx(op, elapsed, eff_timeout)}): {res['exceptionDetails']}"
             )
         return res.get("result", {}).get("value")
+
+    def poll_js(
+        self,
+        expression: str,
+        done_pred: Callable[[Any], bool],
+        *,
+        op_desc: str,
+        timeout: float = 30.0,
+        interval: float = 0.5,
+    ) -> Any:
+        """Evaluates `expression` until `done_pred(val)` holds or raises `CDPTimeoutError`."""
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        last_val: Any = None
+        while time.monotonic() < deadline:
+            last_val = self.eval_js(expression, op_desc=op_desc)
+            if done_pred(last_val):
+                return last_val
+            time.sleep(interval)
+        ctx = self._ctx(op_desc, time.monotonic() - t0, timeout)
+        raise CDPTimeoutError(
+            f"Timed out in {op_desc} ({ctx}; last state={last_val!r})"
+        )
 
     def close(self) -> None:
         try:
@@ -2423,7 +1234,7 @@ class CroshTab:
             f"Timed out waiting for {desc} ({ctx}). Last terminal buffer:\n{last}"
         )
 
-    def run_crosh_cmd(self, cmd: str, timeout: float = 180.0, check_no_error: bool = True) -> str:
+    def run_crosh_cmd(self, cmd: str, timeout: float = 180.0) -> str:
         """Types `cmd` at a `crosh>` prompt and waits for the next `crosh>` prompt."""
         before = self.get_text()
         prev_prompts = before.count("crosh>")
@@ -2436,7 +1247,7 @@ class CroshTab:
         )
         parts = after.split("crosh>")
         delta = parts[-2] if len(parts) >= 2 else after
-        if check_no_error and ("ERROR - ERROR: command failed" in delta or "Error:" in delta):
+        if "ERROR - ERROR: command failed" in delta or "Error:" in delta:
             raise RuntimeError(
                 f"Command `{cmd}` failed in {self.label}:\n{delta.strip()}"
             )
@@ -2490,15 +1301,12 @@ class CpuDeltaPct:
     busy_pct: float
     iowait_pct: float
     steal_pct: float
-    idle_pct: float
     steal_sec: float
 
 
 @dataclasses.dataclass(frozen=True)
 class PsiMetricLine:
     avg10: float
-    avg60: float
-    avg300: float
     total_us: int
 
 
@@ -2509,150 +1317,69 @@ class PsiResource:
 
 
 @dataclasses.dataclass(frozen=True)
-class ZramMmStat:
-    orig_data_bytes: int
-    compr_data_bytes: int
-    mem_used_total_bytes: int
-    mem_used_max_bytes: int
-
-
-@dataclasses.dataclass(frozen=True)
-class CrosvmProcStat:
-    pid: int
-    comm: str
-    cpu_ticks: int
-    vm_rss_kib: int
-    rss_anon_kib: int
-    state: str
-
-
-@dataclasses.dataclass(frozen=True)
 class CrosResourceSample:
     mono_ts: float
     rel_sec: float
-    epoch_sec: float
     uptime_sec: float
     nproc: int
     clk_tck: int
     load1: float
-    load5: float
-    load15: float
-    running_threads: str
     cros_cpu: CpuStatCounters
     psi_cpu: PsiResource
     psi_memory: PsiResource
     psi_io: PsiResource
     mem_total_kib: int
     mem_avail_kib: int
-    cached_kib: int
     swap_total_kib: int
     swap_free_kib: int
     dirty_kib: int
     writeback_kib: int
-    shmem_kib: int
-    pgpgin: int
-    pgpgout: int
-    pswpin: int
-    pswpout: int
-    pgmajfault: int
-    oom_kill: int
-    zram: ZramMmStat | None
-    crosvm_procs: tuple[CrosvmProcStat, ...]
     host_cpu: CpuStatCounters
     host_load1: float
     host_mem_avail_mib: float
 
 
-CROS_RESOURCE_SAMPLE_BEGIN = "===CROS_RES_SAMPLE_BEGIN==="
-CROS_RESOURCE_SAMPLE_END = "===CROS_RES_SAMPLE_END==="
-
-# Read-only ChromeOS VM resource snapshot script executed via `python3 -u` over SSH
+# Read-only ChromeOS VM JSONL resource snapshot script executed via `python3 -u` over SSH
 # (zero child process forks per sample and immune to mawk sandbox restrictions).
 _CROS_RESOURCE_PY_SCRIPT = r"""
-import os, sys, time
+import json, os, sys, time
 
 NPROC = os.cpu_count() or 1
 CLK_TCK = int(os.sysconf("SC_CLK_TCK"))
-MEM_KEYS = {
-    "MemTotal", "MemAvailable", "Buffers", "Cached",
-    "SwapTotal", "SwapFree", "Dirty", "Writeback", "AnonPages", "Shmem",
-}
-VMSTAT_KEYS = {"pgpgin", "pgpgout", "pswpin", "pswpout", "pgmajfault", "oom_kill"}
+MEM_KEYS = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty", "Writeback"}
 
 def emit_once() -> None:
-    out = [
-        "===CROS_RES_SAMPLE_BEGIN===",
-        f"epoch_sec={time.time():.9f}",
-        f"nproc={NPROC}",
-        f"clk_tck={CLK_TCK}",
-    ]
     with open("/proc/uptime", "r", encoding="utf-8") as f:
-        out.append("uptime_sec=" + f.read().split()[0])
+        uptime_sec = float(f.read().split()[0])
     with open("/proc/loadavg", "r", encoding="utf-8") as f:
-        out.append("loadavg=" + " ".join(f.read().split()[:5]))
+        load1 = float(f.read().split()[0])
     with open("/proc/stat", "r", encoding="utf-8") as f:
-        out.append("stat_cpu=" + f.readline().strip())
+        stat_cpu = f.readline().strip()
+    psi = {}
     for p in ("cpu", "memory", "io"):
         pp = f"/proc/pressure/{p}"
         if os.path.exists(pp):
             with open(pp, "r", encoding="utf-8") as f:
-                for pl in f.read().splitlines():
-                    if pl.strip():
-                        out.append(f"psi_{p}={pl.strip()}")
+                psi[p] = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
         else:
-            out.append(f"psi_{p}=MISSING")
-    zp = "/sys/block/zram0/mm_stat"
-    if os.path.exists(zp):
-        with open(zp, "r", encoding="utf-8") as f:
-            out.append("zram_mm_stat=" + " ".join(f.read().split()))
-    else:
-        out.append("zram_mm_stat=NONE")
+            psi[p] = []
+    mem = {}
     with open("/proc/meminfo", "r", encoding="utf-8") as f:
         for ml in f:
             parts = ml.split()
             if len(parts) >= 2:
                 k = parts[0].rstrip(":")
                 if k in MEM_KEYS:
-                    out.append(f"meminfo_{k}={parts[1]}")
-    with open("/proc/vmstat", "r", encoding="utf-8") as f:
-        for vl in f:
-            parts = vl.split()
-            if len(parts) >= 2 and parts[0] in VMSTAT_KEYS:
-                out.append(f"vmstat_{parts[0]}={parts[1]}")
-    for ent in os.listdir("/proc"):
-        if not ent.isdigit():
-            continue
-        try:
-            with open(f"/proc/{ent}/stat", "r", encoding="utf-8", errors="replace") as f:
-                st = f.read().strip()
-            lp = st.find("(")
-            rp = st.rfind(") ")
-            if lp < 0 or rp < 0:
-                continue
-            comm = st[lp + 1 : rp]
-            with open(f"/proc/{ent}/cmdline", "rb") as f:
-                raw_cl = f.read(512)
-            argv0 = raw_cl.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-            if not (comm.startswith("crosvm") or argv0 == "crosvm" or argv0.endswith("/crosvm")):
-                continue
-            rest = st[rp + 2 :].split()
-            state = rest[0]
-            ticks = int(rest[11]) + int(rest[12])
-            rss = 0
-            anon = 0
-            with open(f"/proc/{ent}/status", "r", encoding="utf-8", errors="replace") as f:
-                for sl in f:
-                    if sl.startswith("VmRSS:"):
-                        rss = int(sl.split()[1])
-                    elif sl.startswith("RssAnon:"):
-                        anon = int(sl.split()[1])
-            safe_comm = comm.replace(":", "_").replace(" ", "_").replace("\t", "_")
-            out.append(f"crosvm_proc={ent}:{safe_comm}:{ticks}:{rss}:{anon}:{state}")
-        except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError, OSError):
-            continue
-    out.append("===CROS_RES_SAMPLE_END===")
-    sys.stdout.write("\n".join(out) + "\n")
-    sys.stdout.flush()
+                    mem[k] = int(parts[1])
+    print(json.dumps({
+        "nproc": NPROC,
+        "clk_tck": CLK_TCK,
+        "uptime_sec": uptime_sec,
+        "load1": load1,
+        "stat_cpu": stat_cpu,
+        "psi": psi,
+        "mem_kib": mem,
+    }), flush=True)
 
 if len(sys.argv) > 1 and sys.argv[1] == "--loop":
     interval = float(sys.argv[2])
@@ -2684,8 +1411,7 @@ def parse_host_runner_info(cpuinfo_text: str, meminfo_text: str, nproc: int) -> 
         if ":" not in line:
             continue
         k, v = line.split(":", 1)
-        key = k.strip()
-        val = v.strip()
+        key, val = k.strip(), v.strip()
         if key == "vendor_id" and not vendor_id:
             vendor_id = val
         elif key == "model name" and not model_name:
@@ -2755,22 +1481,20 @@ def parse_proc_stat_cpu_line(
 
 
 def compute_cpu_delta_pct(start: CpuStatCounters, end: CpuStatCounters) -> CpuDeltaPct:
-    """Computes CPU busy/iowait/steal/idle % and stolen CPU-seconds between two `/proc/stat` snapshots."""
+    """Computes CPU busy/iowait/steal % and stolen CPU-seconds between two `/proc/stat` snapshots."""
     dt = end.total_ticks - start.total_ticks
     if dt < 0:
         raise ValueError(f"CPU total ticks went backwards: start={start.total_ticks} end={end.total_ticks}")
     if dt == 0:
-        return CpuDeltaPct(0.0, 0.0, 0.0, 0.0, 0.0)
+        return CpuDeltaPct(0.0, 0.0, 0.0, 0.0)
     d_busy = max(0, end.busy_ticks - start.busy_ticks)
     d_iow = max(0, end.iowait - start.iowait)
     d_stl = max(0, end.steal - start.steal)
-    d_idl = max(0, end.idle - start.idle)
     tck = float(end.clk_tck if end.clk_tck > 0 else 100)
     return CpuDeltaPct(
         busy_pct=100.0 * d_busy / dt,
         iowait_pct=100.0 * d_iow / dt,
         steal_pct=100.0 * d_stl / dt,
-        idle_pct=100.0 * d_idl / dt,
         steal_sec=d_stl / tck,
     )
 
@@ -2798,7 +1522,7 @@ def _parse_psi_line(raw_line: str, context: str) -> tuple[str, PsiMetricLine]:
         raise ValueError(f"{context}: invalid numeric value in PSI line {raw_line!r}") from exc
     if total_us < 0 or avg10 < 0.0 or avg60 < 0.0 or avg300 < 0.0:
         raise ValueError(f"{context}: negative value in PSI line {raw_line!r}")
-    return kind, PsiMetricLine(avg10=avg10, avg60=avg60, avg300=avg300, total_us=total_us)
+    return kind, PsiMetricLine(avg10=avg10, total_us=total_us)
 
 
 def _parse_psi_resource(lines: list[str], name: str, require_full: bool) -> PsiResource:
@@ -2807,6 +1531,8 @@ def _parse_psi_resource(lines: list[str], name: str, require_full: bool) -> PsiR
         raise ValueError(f"{ctx}: missing PSI metrics")
     by_kind: dict[str, PsiMetricLine] = {}
     for ln in lines:
+        if not isinstance(ln, str):
+            raise ValueError(f"{ctx}: expected string PSI line, got {ln!r}")
         kind, metric = _parse_psi_line(ln, ctx)
         if kind in by_kind:
             raise ValueError(f"{ctx}: duplicate {kind!r} line in {lines!r}")
@@ -2834,18 +1560,34 @@ def read_local_host_dynamic_sample() -> tuple[CpuStatCounters, float, float]:
         raise ValueError(f"Malformed host /proc/loadavg: {load_toks!r}")
     host_load1 = float(load_toks[0])
     mem_txt = Path("/proc/meminfo").read_text(encoding="utf-8")
-    avail_kib: int | None = None
     for line in mem_txt.splitlines():
         if line.startswith("MemAvailable:"):
-            avail_kib = int(line.split()[1])
-            break
-    if avail_kib is None:
-        raise ValueError("Missing MemAvailable in host /proc/meminfo")
-    return host_cpu, host_load1, avail_kib / 1024.0
+            return host_cpu, host_load1, int(line.split()[1]) / 1024.0
+    raise ValueError("Missing MemAvailable in host /proc/meminfo")
 
 
-def parse_cros_resource_block(
-    raw_block: str,
+_REQUIRED_CROS_RES_KEYS = frozenset(
+    {"nproc", "clk_tck", "uptime_sec", "load1", "stat_cpu", "psi", "mem_kib"}
+)
+_REQUIRED_CROS_MEM_KEYS = frozenset(
+    {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty", "Writeback"}
+)
+
+
+def _require_strict_int(val: Any, name: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"Expected int for {name}, got {val!r}")
+    return val
+
+
+def _require_strict_num(val: Any, name: str) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"Expected float/int for {name}, got {val!r}")
+    return float(val)
+
+
+def parse_cros_resource_json(
+    raw_json_line: str,
     *,
     mono_ts: float,
     rel_sec: float,
@@ -2853,197 +1595,69 @@ def parse_cros_resource_block(
     host_load1: float,
     host_mem_avail_mib: float,
 ) -> CrosResourceSample:
-    """Strictly parses a delimited ChromeOS resource sample block."""
-    scalars: dict[str, str] = {}
-    psi_lines: dict[str, list[str]] = {"cpu": [], "memory": [], "io": []}
-    meminfo: dict[str, int] = {}
-    vmstat: dict[str, int] = {}
-    crosvm_procs: list[CrosvmProcStat] = []
-
-    for raw_ln in raw_block.splitlines():
-        ln = raw_ln.strip()
-        if not ln or ln in (CROS_RESOURCE_SAMPLE_BEGIN, CROS_RESOURCE_SAMPLE_END):
-            continue
-        if "=" not in ln:
-            raise ValueError(f"Malformed ChromeOS resource sample line (no '='): {ln!r}")
-        key, val = ln.split("=", 1)
-        if key in ("psi_cpu", "psi_memory", "psi_io"):
-            psi_lines[key.split("_", 1)[1]].append(val)
-        elif key.startswith("meminfo_"):
-            mkey = key[len("meminfo_") :]
-            try:
-                meminfo[mkey] = int(val.strip())
-            except ValueError as exc:
-                raise ValueError(f"Invalid integer for {key}: {val!r}") from exc
-        elif key.startswith("vmstat_"):
-            vkey = key[len("vmstat_") :]
-            try:
-                vmstat[vkey] = int(val.strip())
-            except ValueError as exc:
-                raise ValueError(f"Invalid integer for {key}: {val!r}") from exc
-        elif key == "crosvm_proc":
-            p_parts = val.split(":")
-            if len(p_parts) != 6:
-                raise ValueError(f"Malformed crosvm_proc entry: {val!r}")
-            try:
-                pid = int(p_parts[0])
-                comm = p_parts[1]
-                cpu_ticks = int(p_parts[2])
-                vm_rss_kib = int(p_parts[3])
-                rss_anon_kib = int(p_parts[4])
-                state = p_parts[5]
-            except ValueError as exc:
-                raise ValueError(f"Non-integer field in crosvm_proc entry: {val!r}") from exc
-            if pid <= 0 or cpu_ticks < 0 or vm_rss_kib < 0 or rss_anon_kib < 0 or not state:
-                raise ValueError(f"Invalid field value in crosvm_proc entry: {val!r}")
-            crosvm_procs.append(
-                CrosvmProcStat(
-                    pid=pid,
-                    comm=comm,
-                    cpu_ticks=cpu_ticks,
-                    vm_rss_kib=vm_rss_kib,
-                    rss_anon_kib=rss_anon_kib,
-                    state=state,
-                )
-            )
-        elif key in (
-            "epoch_sec",
-            "nproc",
-            "clk_tck",
-            "uptime_sec",
-            "loadavg",
-            "stat_cpu",
-            "zram_mm_stat",
-        ):
-            scalars[key] = val.strip()
-        else:
-            raise ValueError(f"Unexpected key {key!r} in ChromeOS resource sample: {ln!r}")
-
-    for req_scalar in (
-        "epoch_sec",
-        "nproc",
-        "clk_tck",
-        "uptime_sec",
-        "loadavg",
-        "stat_cpu",
-        "zram_mm_stat",
-    ):
-        if req_scalar not in scalars:
-            raise ValueError(f"Missing required field {req_scalar!r} in ChromeOS resource sample")
-
+    """Strictly parses and validates a single JSONL ChromeOS resource sample line."""
     try:
-        epoch_sec = float(scalars["epoch_sec"])
-        nproc = int(scalars["nproc"])
-        clk_tck = int(scalars["clk_tck"])
-        uptime_sec = float(scalars["uptime_sec"])
-    except ValueError as exc:
-        raise ValueError(f"Invalid scalar number in ChromeOS resource sample: {scalars!r}") from exc
-    if epoch_sec <= 0 or nproc <= 0 or clk_tck <= 0 or uptime_sec <= 0:
+        obj = json.loads(raw_json_line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Malformed JSON in ChromeOS resource sample: {raw_json_line!r}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected JSON object for ChromeOS resource sample, got {type(obj).__name__}")
+    actual_keys = frozenset(obj.keys())
+    if actual_keys != _REQUIRED_CROS_RES_KEYS:
+        missing = sorted(_REQUIRED_CROS_RES_KEYS - actual_keys)
+        extra = sorted(actual_keys - _REQUIRED_CROS_RES_KEYS)
         raise ValueError(
-            f"Non-positive epoch/nproc/clk_tck/uptime in ChromeOS resource sample: {scalars!r}"
+            f"ChromeOS resource sample keys mismatch (missing={missing}, extra={extra}): {raw_json_line!r}"
         )
 
-    load_parts = scalars["loadavg"].split()
-    if len(load_parts) < 4 or "/" not in load_parts[3]:
-        raise ValueError(f"Malformed ChromeOS loadavg {scalars['loadavg']!r}")
-    try:
-        load1 = float(load_parts[0])
-        load5 = float(load_parts[1])
-        load15 = float(load_parts[2])
-    except ValueError as exc:
-        raise ValueError(f"Invalid float in ChromeOS loadavg {scalars['loadavg']!r}") from exc
+    nproc = _require_strict_int(obj["nproc"], "nproc")
+    clk_tck = _require_strict_int(obj["clk_tck"], "clk_tck")
+    uptime_sec = _require_strict_num(obj["uptime_sec"], "uptime_sec")
+    load1 = _require_strict_num(obj["load1"], "load1")
+    if nproc <= 0 or clk_tck <= 0 or uptime_sec <= 0.0 or load1 < 0.0:
+        raise ValueError(f"Out-of-range ChromeOS scalar resource fields: {obj!r}")
+    if not isinstance(obj["stat_cpu"], str):
+        raise ValueError(f"Expected string stat_cpu, got {obj['stat_cpu']!r}")
+    cros_cpu = parse_proc_stat_cpu_line(obj["stat_cpu"], "ChromeOS /proc/stat", clk_tck=clk_tck)
 
-    cros_cpu = parse_proc_stat_cpu_line(scalars["stat_cpu"], "ChromeOS /proc/stat", clk_tck=clk_tck)
-    psi_cpu = _parse_psi_resource(psi_lines["cpu"], "cpu", require_full=False)
-    psi_memory = _parse_psi_resource(psi_lines["memory"], "memory", require_full=True)
-    psi_io = _parse_psi_resource(psi_lines["io"], "io", require_full=True)
+    psi_map = obj["psi"]
+    if not isinstance(psi_map, dict) or frozenset(psi_map.keys()) != frozenset({"cpu", "memory", "io"}):
+        raise ValueError(f"Invalid ChromeOS psi object: {psi_map!r}")
+    for pk, pv in psi_map.items():
+        if not isinstance(pv, list):
+            raise ValueError(f"Expected list for psi[{pk!r}], got {pv!r}")
+    psi_cpu = _parse_psi_resource(psi_map["cpu"], "cpu", require_full=False)
+    psi_memory = _parse_psi_resource(psi_map["memory"], "memory", require_full=True)
+    psi_io = _parse_psi_resource(psi_map["io"], "io", require_full=True)
 
-    for req_mem in (
-        "MemTotal",
-        "MemAvailable",
-        "Cached",
-        "SwapTotal",
-        "SwapFree",
-        "Dirty",
-        "Writeback",
-        "Shmem",
-    ):
-        if req_mem not in meminfo:
-            raise ValueError(f"Missing meminfo_{req_mem} in ChromeOS resource sample")
-
-    for req_vm in ("pgpgin", "pgpgout", "pswpin", "pswpout", "pgmajfault", "oom_kill"):
-        if req_vm not in vmstat:
-            raise ValueError(f"Missing vmstat_{req_vm} in ChromeOS resource sample")
-
-    zram_raw = scalars["zram_mm_stat"]
-    zram: ZramMmStat | None = None
-    if zram_raw != "NONE":
-        z_parts = zram_raw.split()
-        if len(z_parts) < 7:
-            raise ValueError(f"Malformed ChromeOS zram mm_stat (expected >=7 ints): {zram_raw!r}")
-        try:
-            z_ints = [int(x) for x in z_parts[:7]]
-        except ValueError as exc:
-            raise ValueError(f"Non-integer in ChromeOS zram mm_stat: {zram_raw!r}") from exc
-        if any(v < 0 for v in z_ints):
-            raise ValueError(f"Negative value in ChromeOS zram mm_stat: {zram_raw!r}")
-        zram = ZramMmStat(
-            orig_data_bytes=z_ints[0],
-            compr_data_bytes=z_ints[1],
-            mem_used_total_bytes=z_ints[2],
-            mem_used_max_bytes=z_ints[4],
-        )
+    mem_map = obj["mem_kib"]
+    if not isinstance(mem_map, dict) or frozenset(mem_map.keys()) != _REQUIRED_CROS_MEM_KEYS:
+        raise ValueError(f"Missing or unexpected keys in ChromeOS mem_kib: {mem_map!r}")
+    mem_ints = {mk: _require_strict_int(mv, f"mem_kib.{mk}") for mk, mv in mem_map.items()}
+    if mem_ints["MemTotal"] <= 0 or any(v < 0 for v in mem_ints.values()):
+        raise ValueError(f"Invalid ChromeOS mem_kib values: {mem_ints!r}")
 
     return CrosResourceSample(
         mono_ts=mono_ts,
         rel_sec=rel_sec,
-        epoch_sec=epoch_sec,
         uptime_sec=uptime_sec,
         nproc=nproc,
         clk_tck=clk_tck,
         load1=load1,
-        load5=load5,
-        load15=load15,
-        running_threads=load_parts[3],
         cros_cpu=cros_cpu,
         psi_cpu=psi_cpu,
         psi_memory=psi_memory,
         psi_io=psi_io,
-        mem_total_kib=meminfo["MemTotal"],
-        mem_avail_kib=meminfo["MemAvailable"],
-        cached_kib=meminfo["Cached"],
-        swap_total_kib=meminfo["SwapTotal"],
-        swap_free_kib=meminfo["SwapFree"],
-        dirty_kib=meminfo["Dirty"],
-        writeback_kib=meminfo["Writeback"],
-        shmem_kib=meminfo["Shmem"],
-        pgpgin=vmstat["pgpgin"],
-        pgpgout=vmstat["pgpgout"],
-        pswpin=vmstat["pswpin"],
-        pswpout=vmstat["pswpout"],
-        pgmajfault=vmstat["pgmajfault"],
-        oom_kill=vmstat["oom_kill"],
-        zram=zram,
-        crosvm_procs=tuple(crosvm_procs),
+        mem_total_kib=mem_ints["MemTotal"],
+        mem_avail_kib=mem_ints["MemAvailable"],
+        swap_total_kib=mem_ints["SwapTotal"],
+        swap_free_kib=mem_ints["SwapFree"],
+        dirty_kib=mem_ints["Dirty"],
+        writeback_kib=mem_ints["Writeback"],
         host_cpu=host_cpu,
         host_load1=host_load1,
         host_mem_avail_mib=host_mem_avail_mib,
     )
-
-
-def _crosvm_interval_cpu_pct(prev: CrosResourceSample, curr: CrosResourceSample) -> float:
-    dt_up = curr.uptime_sec - prev.uptime_sec
-    if dt_up <= 0.0:
-        return 0.0
-    prev_map = {p.pid: p.cpu_ticks for p in prev.crosvm_procs}
-    total_delta_ticks = 0
-    max_new_pid_ticks = dt_up * curr.clk_tck * max(1, curr.nproc) * 2.0
-    for p in curr.crosvm_procs:
-        if p.pid in prev_map and p.cpu_ticks >= prev_map[p.pid]:
-            total_delta_ticks += p.cpu_ticks - prev_map[p.pid]
-        elif p.cpu_ticks <= max_new_pid_ticks:
-            total_delta_ticks += p.cpu_ticks
-    return 100.0 * total_delta_ticks / (dt_up * float(curr.clk_tck))
 
 
 def summarize_resource_diagnostics(
@@ -3053,8 +1667,9 @@ def summarize_resource_diagnostics(
     install_mono: float | None = None,
     sampler_warnings: list[str] | None = None,
     strict: bool = True,
+    include_samples: bool = False,
 ) -> list[str]:
-    """Formats a compact host + ChromeOS VM resource pressure summary and periodic sample table."""
+    """Formats a host + ChromeOS VM resource pressure summary (plus periodic sample rows on failure)."""
     warnings = list(sampler_warnings or [])
     if strict:
         if warnings:
@@ -3062,11 +1677,10 @@ def summarize_resource_diagnostics(
         if host_info is None:
             raise RuntimeError("Missing host runner CPU/memory info in strict mode")
 
-    reanchored: list[CrosResourceSample] = []
-    for s in samples:
-        rel = (s.mono_ts - install_mono) if install_mono is not None else s.rel_sec
-        reanchored.append(dataclasses.replace(s, rel_sec=rel))
-
+    reanchored = [
+        dataclasses.replace(s, rel_sec=(s.mono_ts - install_mono) if install_mono is not None else s.rel_sec)
+        for s in samples
+    ]
     if strict:
         if len(reanchored) < 2:
             raise RuntimeError(
@@ -3085,8 +1699,7 @@ def summarize_resource_diagnostics(
     out: list[str] = []
     if warnings:
         out.append("[resource diagnostics warnings]")
-        for w in warnings:
-            out.append(f"  {w}")
+        out.extend(f"  {w}" for w in warnings)
 
     if host_info is not None and len(reanchored) < 2:
         out.append(
@@ -3102,26 +1715,23 @@ def summarize_resource_diagnostics(
         out.append("Host/ChromeOS resource diagnostics: <no samples collected>")
         return out
 
-    # Baseline is the latest sample at/just before InstallClicked (or sample[0] if all are post-Install).
     pre_or_at_install = [s for s in reanchored if s.rel_sec <= 0.5]
     s_base = pre_or_at_install[-1] if pre_or_at_install else reanchored[0]
     s_end = reanchored[-1]
     if s_end is s_base and len(reanchored) >= 2:
-        s_base = reanchored[0]
-        s_end = reanchored[-1]
+        s_base, s_end = reanchored[0], reanchored[-1]
 
     window_samples = [s for s in reanchored if s.mono_ts >= s_base.mono_ts]
     span_sec = max(0.0, s_end.uptime_sec - s_base.uptime_sec)
-
     host_delta = (
         compute_cpu_delta_pct(s_base.host_cpu, s_end.host_cpu)
         if span_sec > 0
-        else CpuDeltaPct(0.0, 0.0, 0.0, 0.0, 0.0)
+        else CpuDeltaPct(0.0, 0.0, 0.0, 0.0)
     )
     cros_delta = (
         compute_cpu_delta_pct(s_base.cros_cpu, s_end.cros_cpu)
         if span_sec > 0
-        else CpuDeltaPct(0.0, 0.0, 0.0, 0.0, 0.0)
+        else CpuDeltaPct(0.0, 0.0, 0.0, 0.0)
     )
 
     if host_info is not None:
@@ -3150,14 +1760,12 @@ def summarize_resource_diagnostics(
     def _psi_delta(
         getter: Callable[[CrosResourceSample], PsiMetricLine | None],
     ) -> tuple[float, float, float]:
-        b_m = getter(s_base)
-        e_m = getter(s_end)
+        b_m, e_m = getter(s_base), getter(s_end)
         if b_m is None or e_m is None or span_sec <= 0.0:
             return 0.0, 0.0, 0.0
         d_sec = max(0, e_m.total_us - b_m.total_us) / 1_000_000.0
-        pct = 100.0 * d_sec / span_sec
         pk10 = max((getter(s).avg10 for s in window_samples if getter(s) is not None), default=0.0)
-        return d_sec, pct, pk10
+        return d_sec, 100.0 * d_sec / span_sec, pk10
 
     cpu_s_sec, cpu_s_pct, cpu_pk10 = _psi_delta(lambda s: s.psi_cpu.some)
     mem_s_sec, mem_s_pct, mem_s_pk10 = _psi_delta(lambda s: s.psi_memory.some)
@@ -3175,49 +1783,14 @@ def summarize_resource_diagnostics(
     min_avail_mib = min(s.mem_avail_kib for s in window_samples) / 1024.0
     min_avail_pct = 100.0 * min_avail_mib / max(1.0, mem_total_mib)
     swap_total_mib = s_end.swap_total_kib / 1024.0
+    base_swap_used_mib = (s_base.swap_total_kib - s_base.swap_free_kib) / 1024.0
     swap_used_peak_mib = max((s.swap_total_kib - s.swap_free_kib) for s in window_samples) / 1024.0
+    swap_growth_mib = max(0.0, swap_used_peak_mib - base_swap_used_mib)
     dirty_peak_mib = max((s.dirty_kib + s.writeback_kib) for s in window_samples) / 1024.0
-    zram_samples = [s.zram for s in window_samples if s.zram is not None]
-    if zram_samples:
-        z_orig_pk = max(z.orig_data_bytes for z in zram_samples) / (1024.0 * 1024.0)
-        z_compr_pk = max(z.compr_data_bytes for z in zram_samples) / (1024.0 * 1024.0)
-        z_used_pk = max(z.mem_used_max_bytes for z in zram_samples) / (1024.0 * 1024.0)
-        zram_str = f"orig_pk={z_orig_pk:.1f}MiB compr_pk={z_compr_pk:.1f}MiB used_max={z_used_pk:.1f}MiB"
-    else:
-        zram_str = "none"
-
-    d_pgpgin = max(0, s_end.pgpgin - s_base.pgpgin)
-    d_pgpgout = max(0, s_end.pgpgout - s_base.pgpgout)
-    d_pswpin = max(0, s_end.pswpin - s_base.pswpin)
-    d_pswpout = max(0, s_end.pswpout - s_base.pswpout)
-    d_pgmaj = max(0, s_end.pgmajfault - s_base.pgmajfault)
-    d_oom = max(0, s_end.oom_kill - s_base.oom_kill)
     out.append(
-        f"ChromeOS mem/vmstat: avail_min={min_avail_mib:.0f}MiB ({min_avail_pct:.1f}%) "
+        f"ChromeOS mem: avail_min={min_avail_mib:.0f}MiB ({min_avail_pct:.1f}%) "
         f"swap_used_pk={swap_used_peak_mib:.0f}/{swap_total_mib:.0f}MiB "
-        f"zram=({zram_str}) dirty+wb_pk={dirty_peak_mib:.1f}MiB "
-        f"pgpg_in/out=+{d_pgpgin}/+{d_pgpgout}KiB "
-        f"pswp_in/out=+{d_pswpin}/+{d_pswpout} pgmajfault=+{d_pgmaj} oom_kill=+{d_oom}"
-    )
-
-    crosvm_step_pcts: list[float] = []
-    for i in range(1, len(window_samples)):
-        if window_samples[i].crosvm_procs or window_samples[i - 1].crosvm_procs:
-            crosvm_step_pcts.append(_crosvm_interval_cpu_pct(window_samples[i - 1], window_samples[i]))
-    peak_procs = max((len(s.crosvm_procs) for s in window_samples), default=0)
-    peak_proc_rss_mib = (
-        max((p.vm_rss_kib for s in window_samples for p in s.crosvm_procs), default=0) / 1024.0
-    )
-    peak_sum_anon_mib = (
-        max((sum(p.rss_anon_kib for p in s.crosvm_procs) for s in window_samples), default=0)
-        / 1024.0
-    )
-    crosvm_avg_pct = sum(crosvm_step_pcts) / len(crosvm_step_pcts) if crosvm_step_pcts else 0.0
-    crosvm_pk_pct = max(crosvm_step_pcts, default=0.0)
-    out.append(
-        f"ChromeOS crosvm: peak_procs={peak_procs} "
-        f"cpu_avg={crosvm_avg_pct:.1f}% cpu_peak={crosvm_pk_pct:.1f}% (100%=1vCPU) "
-        f"peak_proc_rss={peak_proc_rss_mib:.0f}MiB peak_sum_anon={peak_sum_anon_mib:.0f}MiB"
+        f"(+{swap_growth_mib:.0f}MiB) dirty+wb_pk={dirty_peak_mib:.1f}MiB"
     )
 
     bottleneck_tags: list[str] = []
@@ -3233,50 +1806,43 @@ def summarize_resource_diagnostics(
         bottleneck_tags.append(
             f"IO-stall (psi_io_some={io_s_pct:.1f}%, io_full={io_f_pct:.1f}%, iowait={cros_delta.iowait_pct:.1f}%)"
         )
-    if mem_s_pct >= 5.0 or d_pswpout > 0 or d_oom > 0 or min_avail_pct < 12.0:
+    if mem_s_pct >= 5.0 or swap_growth_mib >= 16.0 or min_avail_pct < 12.0:
         bottleneck_tags.append(
-            f"memory/reclaim (psi_mem_some={mem_s_pct:.1f}%, mem_full={mem_f_pct:.1f}%, pswpout=+{d_pswpout}, avail_min={min_avail_mib:.0f}MiB)"
+            f"memory/reclaim (psi_mem_some={mem_s_pct:.1f}%, mem_full={mem_f_pct:.1f}%, swap_growth=+{swap_growth_mib:.0f}MiB, avail_min={min_avail_mib:.0f}MiB)"
         )
     profile_str = "; ".join(bottleneck_tags) if bottleneck_tags else "no major CPU/memory/IO stall observed"
     out.append(f"Observed resource profile: {profile_str}")
 
-    # Compact per-sample table (strictly <=32 rows while keeping first, peak pressure, and last,
-    # with deltas computed across each displayed interval rather than unshown intermediate samples).
-    chosen_indices = _select_sample_indices(window_samples, max_rows=32)
-
-    out.append(f"[periodic samples ({len(chosen_indices)}/{len(window_samples)} shown, relative to Install click)]")
-    for pos, idx in enumerate(chosen_indices):
-        cur = window_samples[idx]
-        if pos == 0:
-            c_cpu_str = "baseline"
-            h_stl_str = "base"
-            pswp_str = "+0/+0"
-            cvm_cpu_str = "base"
-        else:
-            prv = window_samples[chosen_indices[pos - 1]]
-            cd = compute_cpu_delta_pct(prv.cros_cpu, cur.cros_cpu)
-            hd = compute_cpu_delta_pct(prv.host_cpu, cur.host_cpu)
-            c_cpu_str = f"{cd.busy_pct:4.1f}%(iow={cd.iowait_pct:.1f}%,stl={cd.steal_pct:.1f}%)"
-            h_stl_str = f"{hd.steal_pct:.1f}%"
-            pswp_str = f"+{max(0, cur.pswpin - prv.pswpin)}/+{max(0, cur.pswpout - prv.pswpout)}"
-            cvm_cpu_str = f"{_crosvm_interval_cpu_pct(prv, cur):.1f}%"
-        avail_m = cur.mem_avail_kib / 1024.0
-        swp_m = (cur.swap_total_kib - cur.swap_free_kib) / 1024.0
-        z_m = (cur.zram.mem_used_total_bytes / (1024.0 * 1024.0)) if cur.zram is not None else 0.0
-        rss_pk_m = max((p.vm_rss_kib for p in cur.crosvm_procs), default=0) / 1024.0
-        anon_sum_m = sum(p.rss_anon_kib for p in cur.crosvm_procs) / 1024.0
+    if include_samples:
+        chosen_indices = _select_sample_indices(window_samples, max_rows=24)
         out.append(
-            f"  t{cur.rel_sec:+6.1f}s: load1={cur.load1:4.2f} cros_cpu={c_cpu_str} "
-            f"psi10(c/m/i)={cur.psi_cpu.some.avg10:.1f}/{cur.psi_memory.some.avg10:.1f}/{cur.psi_io.some.avg10:.1f} "
-            f"avail={avail_m:.0f}MiB swap={swp_m:.0f}MiB(zram={z_m:.1f}MiB) pswp={pswp_str} "
-            f"crosvm={len(cur.crosvm_procs)}p/{cvm_cpu_str}/rss={rss_pk_m:.0f}MiB(anon={anon_sum_m:.0f}MiB) "
-            f"host_stl={h_stl_str}"
+            f"[periodic samples ({len(chosen_indices)}/{len(window_samples)} shown, relative to Install click)]"
         )
+        for pos, idx in enumerate(chosen_indices):
+            cur = window_samples[idx]
+            if pos == 0:
+                c_cpu_str, h_stl_str, dswp_str = "baseline", "base", "+0MiB"
+            else:
+                prv = window_samples[chosen_indices[pos - 1]]
+                cd = compute_cpu_delta_pct(prv.cros_cpu, cur.cros_cpu)
+                hd = compute_cpu_delta_pct(prv.host_cpu, cur.host_cpu)
+                c_cpu_str = f"{cd.busy_pct:4.1f}%(iow={cd.iowait_pct:.1f}%,stl={cd.steal_pct:.1f}%)"
+                h_stl_str = f"{hd.steal_pct:.1f}%"
+                prv_swp = prv.swap_total_kib - prv.swap_free_kib
+                cur_swp = cur.swap_total_kib - cur.swap_free_kib
+                dswp_str = f"{(cur_swp - prv_swp) / 1024.0:+.0f}MiB"
+            avail_m = cur.mem_avail_kib / 1024.0
+            swp_m = (cur.swap_total_kib - cur.swap_free_kib) / 1024.0
+            out.append(
+                f"  {_fmt_rel_t(cur.rel_sec)}: load1={cur.load1:4.2f} cros_cpu={c_cpu_str} "
+                f"psi10(c/m/i)={cur.psi_cpu.some.avg10:.1f}/{cur.psi_memory.some.avg10:.1f}/{cur.psi_io.some.avg10:.1f} "
+                f"avail={avail_m:.0f}MiB swap={swp_m:.0f}MiB({dswp_str}) host_stl={h_stl_str}"
+            )
     return out
 
 
 def _select_sample_indices(
-    window_samples: list[CrosResourceSample], max_rows: int = 32
+    window_samples: list[CrosResourceSample], max_rows: int = 24
 ) -> list[int]:
     n = len(window_samples)
     if max_rows < 2:
@@ -3297,8 +1863,7 @@ def _select_sample_indices(
         return [0, n - 1]
     even_budget = max_rows - (1 if peak_idx not in (0, n - 1) else 0)
     for slot in range(even_budget):
-        idx = round(slot * (n - 1) / (even_budget - 1))
-        chosen.add(idx)
+        chosen.add(round(slot * (n - 1) / (even_budget - 1)))
     ordered = sorted(chosen)
     while len(ordered) > max_rows:
         for cand in ordered[1:-1]:
@@ -3306,6 +1871,135 @@ def _select_sample_indices(
                 ordered.remove(cand)
                 break
     return ordered
+
+
+def _terminate_proc(proc: subprocess.Popen[Any] | None) -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_diag(
+    strict: bool, err_sink: list[str], label: str, fn: Callable[[], None]
+) -> None:
+    if strict:
+        fn()
+        return
+    try:
+        fn()
+    except Exception as exc:
+        err_sink.append(f"{label}: {exc}")
+
+
+class _BackgroundSshStream:
+    """Line-buffered background SSH process with stderr capture and premature-EOF detection."""
+
+    def __init__(
+        self,
+        name: str,
+        cmd: list[str],
+        *,
+        on_line: Callable[[str], None],
+        on_eof: Callable[[], None] | None = None,
+        on_fatal: Callable[[Exception], None],
+    ) -> None:
+        self.name = name
+        self.cmd = cmd
+        self._on_line = on_line
+        self._on_eof = on_eof
+        self._on_fatal = on_fatal
+        self._lock = threading.Lock()
+        self._stderr_lines: list[str] = []
+        self._stop_requested = False
+        self.fatal_error: Exception | None = None
+        self.proc: subprocess.Popen[str] | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._reader_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            self.cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
+        self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader_thread.start()
+
+    def stderr_text(self) -> str:
+        with self._lock:
+            return "\n".join(self._stderr_lines).strip()
+
+    def poll_rc(self) -> int | None:
+        return self.proc.poll() if self.proc is not None else None
+
+    def _read_stderr(self) -> None:
+        assert self.proc is not None and self.proc.stderr is not None
+        for line in self.proc.stderr:
+            stripped = line.rstrip("\r\n")
+            if stripped:
+                with self._lock:
+                    self._stderr_lines.append(stripped)
+
+    def _read_stdout(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        try:
+            for line in self.proc.stdout:
+                if self._stop_requested:
+                    return
+                self._on_line(line)
+            if not self._stop_requested:
+                if self._on_eof is not None:
+                    self._on_eof()
+                try:
+                    rc = self.proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    rc = self.proc.poll()
+                if self._stderr_thread is not None:
+                    self._stderr_thread.join(timeout=1.0)
+                raise RuntimeError(
+                    f"{self.name} stdout reached EOF prematurely before stop_and_collect "
+                    f"(returncode={rc}, stderr={self.stderr_text()!r})"
+                )
+        except Exception as exc:
+            with self._lock:
+                if self.fatal_error is None:
+                    self.fatal_error = exc
+            log(f"  [timeline] FATAL error in {self.name}: {exc}")
+            self._on_fatal(exc)
+
+    def check_healthy(self, stop_requested: bool) -> None:
+        with self._lock:
+            err = self.fatal_error
+        if err is not None:
+            raise RuntimeError(f"Fatal error in background {self.name}: {err}") from err
+        if self.proc is not None and not stop_requested:
+            rc = self.proc.poll()
+            if rc is not None:
+                raise RuntimeError(
+                    f"{self.name} process exited prematurely before stop_and_collect "
+                    f"(returncode={rc}, stderr={self.stderr_text()!r})"
+                )
+
+    def stop(self) -> None:
+        self._stop_requested = True
+        _terminate_proc(self.proc)
+        self.proc = None
+        for th in (self._reader_thread, self._stderr_thread):
+            if th is not None:
+                th.join(timeout=2.0)
+        self._reader_thread = None
+        self._stderr_thread = None
 
 
 class InitTimelineRecorder:
@@ -3337,19 +2031,10 @@ class InitTimelineRecorder:
         self.monitor_unique_name: str = ""
         self._container_started_event = threading.Event()
         self.container_started_rel_sec: float | None = None
-        self.container_started_detail: str = ""
-        self._fatal_error: Exception | None = None
-        self._mon_proc: subprocess.Popen[str] | None = None
-        self._reader_thread: threading.Thread | None = None
-        self._stderr_thread: threading.Thread | None = None
-        self._stderr_lines: list[str] = []
-        self.host_runner_info: HostRunnerInfo | None = None
-        self._res_proc: subprocess.Popen[str] | None = None
-        self._res_reader_thread: threading.Thread | None = None
-        self._res_stderr_thread: threading.Thread | None = None
-        self._res_stderr_lines: list[str] = []
         self._res_first_sample_event = threading.Event()
-        self._res_fatal_error: Exception | None = None
+        self._mon_stream: _BackgroundSshStream | None = None
+        self._res_stream: _BackgroundSshStream | None = None
+        self.host_runner_info: HostRunnerInfo | None = None
         self._resource_samples: list[CrosResourceSample] = []
         self._final_res_snapshot_taken = False
         self._stop_requested = False
@@ -3357,7 +2042,9 @@ class InitTimelineRecorder:
         self._first_host_setup_user_rel: float | None = None
         self.readonly_summary_lines: list[str] = []
         self.resource_summary_lines: list[str] = []
+        self.resource_sample_lines: list[str] = []
         self.guest_summary_lines: list[str] = []
+        self.guest_verbose_lines: list[str] = []
         self.messages_excerpt: str = ""
         self.chrome_excerpt: str = ""
 
@@ -3366,42 +2053,10 @@ class InitTimelineRecorder:
             combined = self._entries + self._host_log_entries + self._guest_log_entries
         return sorted(combined, key=lambda e: e.rel_sec)
 
-    def _get_stderr_text(self) -> str:
-        with self._lock:
-            return "\n".join(self._stderr_lines).strip()
-
-    def _get_res_stderr_text(self) -> str:
-        with self._lock:
-            return "\n".join(self._res_stderr_lines).strip()
-
     def check_no_fatal_error(self) -> None:
-        with self._lock:
-            err = self._fatal_error
-            res_err = self._res_fatal_error
-        if err is not None:
-            raise RuntimeError(
-                f"Fatal D-Bus/protobuf validation error in background monitor: {err}"
-            ) from err
-        if res_err is not None:
-            raise RuntimeError(
-                f"Fatal ChromeOS resource diagnostics error in background sampler: {res_err}"
-            ) from res_err
-        if self._mon_proc is not None and not self._stop_requested:
-            rc = self._mon_proc.poll()
-            if rc is not None:
-                stderr_txt = self._get_stderr_text()
-                raise RuntimeError(
-                    f"dbus-monitor process exited prematurely before stop_and_collect "
-                    f"(returncode={rc}, stderr={stderr_txt!r})"
-                )
-        if self._res_proc is not None and not self._stop_requested:
-            r_rc = self._res_proc.poll()
-            if r_rc is not None:
-                r_stderr = self._get_res_stderr_text()
-                raise RuntimeError(
-                    f"ChromeOS resource sampler process exited prematurely before stop_and_collect "
-                    f"(returncode={r_rc}, stderr={r_stderr!r})"
-                )
+        for stream in (self._mon_stream, self._res_stream):
+            if stream is not None:
+                stream.check_healthy(self._stop_requested)
 
     def start(self) -> None:
         """Starts background `dbus-monitor --system` and periodic resource sampler on the VM before `Install`."""
@@ -3416,44 +2071,47 @@ class InitTimelineRecorder:
             f'"type=\'signal\',interface=\'{iface}\',member=\'{member}\'"'
             for iface, member in sorted(MONITORED_DBUS_SIGNALS)
         )
-        remote_cmd = f"exec dbus-monitor --system {match_rules}"
-        self._mon_proc = subprocess.Popen(
-            [*self.vm._ssh_base_cmd(), remote_cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        self._stderr_thread = threading.Thread(target=self._read_stderr_loop, daemon=True)
-        self._stderr_thread.start()
-        self._reader_thread = threading.Thread(target=self._read_events_loop, daemon=True)
-        self._reader_thread.start()
+        dbus_parser = DbusMonitorSignalParser()
 
-        self._res_proc = subprocess.Popen(
-            [*self.vm._ssh_base_cmd(), CROS_RESOURCE_SAMPLER_LOOP_CMD],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+        def _on_dbus_line(line: str) -> None:
+            ev = dbus_parser.feed_line(line)
+            if ev is not None:
+                self._handle_dbus_signal(*ev)
+
+        def _wake_waiters(_exc: Exception) -> None:
+            self._monitor_subscribed_event.set()
+            self._res_first_sample_event.set()
+            self._container_started_event.set()
+
+        self._mon_stream = _BackgroundSshStream(
+            "dbus-monitor",
+            [*self.vm._ssh_base_cmd(), f"exec dbus-monitor --system {match_rules}"],
+            on_line=_on_dbus_line,
+            on_eof=dbus_parser.finish,
+            on_fatal=_wake_waiters,
         )
-        self._res_stderr_thread = threading.Thread(target=self._read_res_stderr_loop, daemon=True)
-        self._res_stderr_thread.start()
-        self._res_reader_thread = threading.Thread(target=self._read_res_events_loop, daemon=True)
-        self._res_reader_thread.start()
+        self._res_stream = _BackgroundSshStream(
+            "ChromeOS resource sampler",
+            [*self.vm._ssh_base_cmd(), CROS_RESOURCE_SAMPLER_LOOP_CMD],
+            on_line=self._on_resource_line,
+            on_fatal=_wake_waiters,
+        )
+        self._mon_stream.start()
+        self._res_stream.start()
 
         if not self._monitor_subscribed_event.wait(timeout=15.0):
             self.check_no_fatal_error()
-            rc = self._mon_proc.poll()
             raise RuntimeError(
                 "Timed out waiting for dbus-monitor org.freedesktop.DBus.NameAcquired "
-                f"subscription signal (returncode={rc}, stderr={self._get_stderr_text()!r})"
+                f"subscription signal (returncode={self._mon_stream.poll_rc()}, "
+                f"stderr={self._mon_stream.stderr_text()!r})"
             )
         if not self._res_first_sample_event.wait(timeout=15.0):
             self.check_no_fatal_error()
-            r_rc = self._res_proc.poll()
             raise RuntimeError(
                 "Timed out waiting for initial ChromeOS resource diagnostics sample "
-                f"(returncode={r_rc}, stderr={self._get_res_stderr_text()!r})"
+                f"(returncode={self._res_stream.poll_rc()}, "
+                f"stderr={self._res_stream.stderr_text()!r})"
             )
         self.check_no_fatal_error()
         log(
@@ -3463,29 +2121,13 @@ class InitTimelineRecorder:
             f"nproc={self.host_runner_info.nproc})."
         )
 
-    def _read_stderr_loop(self) -> None:
-        assert self._mon_proc is not None and self._mon_proc.stderr is not None
-        for line in self._mon_proc.stderr:
-            stripped = line.rstrip("\r\n")
-            if stripped:
-                with self._lock:
-                    self._stderr_lines.append(stripped)
-
-    def _read_res_stderr_loop(self) -> None:
-        assert self._res_proc is not None and self._res_proc.stderr is not None
-        for line in self._res_proc.stderr:
-            stripped = line.rstrip("\r\n")
-            if stripped:
-                with self._lock:
-                    self._res_stderr_lines.append(stripped)
-
-    def _record_raw_resource_block(self, raw_block: str, mono_ts: float) -> None:
+    def _record_resource_json_line(self, raw_json_line: str, mono_ts: float) -> None:
         host_cpu, host_load1, host_mem_avail_mib = read_local_host_dynamic_sample()
         with self._lock:
             t_inst = self.t_install_mono
         rel_sec = (mono_ts - t_inst) if t_inst is not None else 0.0
-        sample = parse_cros_resource_block(
-            raw_block,
+        sample = parse_cros_resource_json(
+            raw_json_line,
             mono_ts=mono_ts,
             rel_sec=rel_sec,
             host_cpu=host_cpu,
@@ -3496,51 +2138,10 @@ class InitTimelineRecorder:
             self._resource_samples.append(sample)
         self._res_first_sample_event.set()
 
-    def _read_res_events_loop(self) -> None:
-        assert self._res_proc is not None and self._res_proc.stdout is not None
-        in_block = False
-        buf_lines: list[str] = []
-        try:
-            for line in self._res_proc.stdout:
-                if self._stop_requested:
-                    return
-                stripped = line.strip()
-                if stripped == CROS_RESOURCE_SAMPLE_BEGIN:
-                    if in_block:
-                        raise ValueError("Nested ===CROS_RES_SAMPLE_BEGIN=== without END")
-                    in_block = True
-                    buf_lines = [stripped]
-                elif stripped == CROS_RESOURCE_SAMPLE_END:
-                    if not in_block:
-                        raise ValueError("===CROS_RES_SAMPLE_END=== without BEGIN")
-                    buf_lines.append(stripped)
-                    in_block = False
-                    self._record_raw_resource_block("\n".join(buf_lines), time.monotonic())
-                    buf_lines = []
-                elif in_block:
-                    buf_lines.append(stripped)
-                elif stripped:
-                    raise ValueError(
-                        f"Unexpected line outside ChromeOS resource sample block: {stripped!r}"
-                    )
-            if not self._stop_requested:
-                try:
-                    r_rc = self._res_proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    r_rc = self._res_proc.poll()
-                if self._res_stderr_thread is not None:
-                    self._res_stderr_thread.join(timeout=1.0)
-                raise RuntimeError(
-                    "ChromeOS resource sampler stdout reached EOF prematurely before stop_and_collect "
-                    f"(returncode={r_rc}, stderr={self._get_res_stderr_text()!r})"
-                )
-        except Exception as exc:
-            with self._lock:
-                if self._res_fatal_error is None:
-                    self._res_fatal_error = exc
-            log(f"  [timeline] FATAL error in ChromeOS resource sampler: {exc}")
-            self._res_first_sample_event.set()
-            self._container_started_event.set()
+    def _on_resource_line(self, line: str) -> None:
+        stripped = line.strip()
+        if stripped:
+            self._record_resource_json_line(stripped, time.monotonic())
 
     def mark_install_clicked(self, username: str) -> None:
         self.check_no_fatal_error()
@@ -3560,9 +2161,7 @@ class InitTimelineRecorder:
 
     def _rel_mono(self, mono_ts: float | None = None) -> float:
         now = mono_ts if mono_ts is not None else time.monotonic()
-        if self.t_install_mono is None:
-            return 0.0
-        return now - self.t_install_mono
+        return 0.0 if self.t_install_mono is None else (now - self.t_install_mono)
 
     def record_ui(self, name: str, detail: str) -> float:
         self.check_no_fatal_error()
@@ -3570,37 +2169,6 @@ class InitTimelineRecorder:
         with self._lock:
             self._entries.append(TimelineEntry(rel, "ui", name, detail))
         return rel
-
-    def _read_events_loop(self) -> None:
-        assert self._mon_proc is not None and self._mon_proc.stdout is not None
-        parser = DbusMonitorSignalParser()
-        try:
-            for line in self._mon_proc.stdout:
-                if self._stop_requested:
-                    return
-                ev = parser.feed_line(line)
-                if ev is not None:
-                    iface, member, raw_bytes = ev
-                    self._handle_dbus_signal(iface, member, raw_bytes)
-            if not self._stop_requested:
-                parser.finish()
-                try:
-                    rc = self._mon_proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    rc = self._mon_proc.poll()
-                if self._stderr_thread is not None:
-                    self._stderr_thread.join(timeout=1.0)
-                raise RuntimeError(
-                    "dbus-monitor stdout reached EOF prematurely before stop_and_collect "
-                    f"(returncode={rc}, stderr={self._get_stderr_text()!r})"
-                )
-        except Exception as exc:
-            with self._lock:
-                if self._fatal_error is None:
-                    self._fatal_error = exc
-            log(f"  [timeline] FATAL error in D-Bus signal monitor: {exc}")
-            self._monitor_subscribed_event.set()
-            self._container_started_event.set()
 
     def _handle_dbus_signal(self, iface: str, member: str, raw: bytes) -> None:
         ctx = f"{iface}.{member}"
@@ -3626,157 +2194,102 @@ class InitTimelineRecorder:
 
         conc = self._protos.concierge_pb2
         cic = self._protos.cicerone_pb2
-        rel = self._rel_mono()
+        signal_specs: dict[tuple[str, str], tuple[type[Message], str, bool]] = {
+            ("org.chromium.VmConcierge", "VmStartingUpSignal"): (conc.VmStartingUpSignal, "name", True),
+            ("org.chromium.VmConcierge", "VmStartedSignal"): (conc.VmStartedSignal, "name", True),
+            ("org.chromium.VmConcierge", "VmGuestUserlandReadySignal"): (conc.VmGuestUserlandReadySignal, "name", True),
+            ("org.chromium.VmConcierge", "VmStoppingSignal"): (conc.VmStoppingSignal, "name", True),
+            ("org.chromium.VmConcierge", "VmStoppedSignal"): (conc.VmStoppedSignal, "name", True),
+            ("org.chromium.VmCicerone", "ContainerStarted"): (cic.ContainerStartedSignal, "vm_name", True),
+            ("org.chromium.VmCicerone", "ContainerShutdown"): (cic.ContainerShutdownSignal, "vm_name", True),
+            ("org.chromium.VmCicerone", "PendingAppListUpdates"): (cic.PendingAppListUpdatesSignal, "vm_name", False),
+            ("org.chromium.VmCicerone", "TremplinStarted"): (cic.TremplinStartedSignal, "vm_name", True),
+        }
+        spec = signal_specs.get((iface, member))
+        if spec is None:
+            raise ValueError(f"Unhandled D-Bus signal {ctx}")
 
-        if (iface, member) == ("org.chromium.VmConcierge", "VmStartingUpSignal"):
-            sig = parse_and_validate_proto(raw, conc.VmStartingUpSignal, ctx)
-            vm_name = require_non_empty_str(sig.name, "name", ctx, raw)
-            _ = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
-            vm_type_name = require_enum_name(
-                conc.VmInfo.VmType, sig.vm_type, "vm_type", ctx, raw
-            )
+        msg_cls, vm_field, has_owner_id = spec
+        sig: Any = parse_and_validate_proto(raw, msg_cls, ctx)
+        vm_name = require_non_empty_str(getattr(sig, vm_field), vm_field, ctx, raw)
+        owner_id = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw) if has_owner_id else ""
+        rel = self._rel_mono()
+        post_hook: Callable[[], None] | None = None
+
+        if member == "VmStartingUpSignal":
+            vm_type = require_enum_name(conc.VmInfo.VmType, sig.vm_type, "vm_type", ctx, raw)
             if sig.cid <= 0:
                 raise ValueError(f"{ctx}: invalid cid={sig.cid} (hex={raw.hex()})")
-            detail = f"vm={vm_name!r} vm_type={vm_type_name}({sig.vm_type}) cid={sig.cid}"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
+            detail = f"vm={vm_name!r} vm_type={vm_type}({sig.vm_type}) cid={sig.cid}"
             if vm_name == "termina" and self.on_vm_starting_up is not None:
-                self.on_vm_starting_up()
-                self.on_vm_starting_up = None
-            return
-
-        if (iface, member) == ("org.chromium.VmConcierge", "VmStartedSignal"):
-            sig = parse_and_validate_proto(raw, conc.VmStartedSignal, ctx)
-            vm_name = require_non_empty_str(sig.name, "name", ctx, raw)
-            _ = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
+                cb, self.on_vm_starting_up = self.on_vm_starting_up, None
+                post_hook = cb
+        elif member == "VmStartedSignal":
             status_name = require_enum_name(conc.VmStatus, sig.status, "status", ctx, raw)
-            vm_type_name = require_enum_name(
-                conc.VmInfo.VmType, sig.vm_info.vm_type, "vm_info.vm_type", ctx, raw
-            )
+            vm_type = require_enum_name(conc.VmInfo.VmType, sig.vm_info.vm_type, "vm_info.vm_type", ctx, raw)
             if sig.vm_info.pid <= 0 or sig.vm_info.cid <= 0:
                 raise ValueError(
-                    f"{ctx}: invalid vm_info pid={sig.vm_info.pid} cid={sig.vm_info.cid} "
-                    f"(hex={raw.hex()})"
+                    f"{ctx}: invalid vm_info pid={sig.vm_info.pid} cid={sig.vm_info.cid} (hex={raw.hex()})"
                 )
             detail = (
                 f"vm={vm_name!r} status={status_name}({sig.status}) "
-                f"vm_type={vm_type_name}({sig.vm_info.vm_type}) "
-                f"pid={sig.vm_info.pid} cid={sig.vm_info.cid}"
+                f"vm_type={vm_type}({sig.vm_info.vm_type}) pid={sig.vm_info.pid} cid={sig.vm_info.cid}"
             )
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
             if vm_name == "termina" and self.on_vm_started is not None:
-                self.on_vm_started()
-                self.on_vm_started = None
-            return
-
-        if (iface, member) == ("org.chromium.VmConcierge", "VmGuestUserlandReadySignal"):
-            sig = parse_and_validate_proto(raw, conc.VmGuestUserlandReadySignal, ctx)
-            vm_name = require_non_empty_str(sig.name, "name", ctx, raw)
-            _ = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
+                cb, self.on_vm_started = self.on_vm_started, None
+                post_hook = cb
+        elif member == "VmGuestUserlandReadySignal":
             detail = f"vm={vm_name!r} ready={sig.ready}"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-            return
-
-        if (iface, member) == ("org.chromium.VmConcierge", "VmStoppingSignal"):
-            sig = parse_and_validate_proto(raw, conc.VmStoppingSignal, ctx)
-            vm_name = require_non_empty_str(sig.name, "name", ctx, raw)
-            _ = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
+        elif member == "VmStoppingSignal":
             if sig.cid <= 0:
                 raise ValueError(f"{ctx}: invalid cid={sig.cid} (hex={raw.hex()})")
             detail = f"vm={vm_name!r} cid={sig.cid}"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-            return
-
-        if (iface, member) == ("org.chromium.VmConcierge", "VmStoppedSignal"):
-            sig = parse_and_validate_proto(raw, conc.VmStoppedSignal, ctx)
-            vm_name = require_non_empty_str(sig.name, "name", ctx, raw)
-            _ = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
+        elif member == "VmStoppedSignal":
             reason_name = require_enum_name(
-                conc.VmStopReason,
-                sig.reason,
-                "reason",
-                ctx,
-                raw,
-                disallow_zero_unknown=False,
+                conc.VmStopReason, sig.reason, "reason", ctx, raw, disallow_zero_unknown=False
             )
             detail = f"vm={vm_name!r} cid={sig.cid} reason={reason_name}({sig.reason})"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-            return
-
-        if (iface, member) == ("org.chromium.VmCicerone", "ContainerStarted"):
-            sig = parse_and_validate_proto(raw, cic.ContainerStartedSignal, ctx)
-            vm_name = require_non_empty_str(sig.vm_name, "vm_name", ctx, raw)
+        elif member == "ContainerStarted":
             container_name = require_non_empty_str(sig.container_name, "container_name", ctx, raw)
-            owner_id = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
             user = require_non_empty_str(sig.container_username, "container_username", ctx, raw)
             homedir = require_non_empty_str(sig.container_homedir, "container_homedir", ctx, raw)
             if not homedir.startswith("/"):
-                raise ValueError(
-                    f"{ctx}: expected absolute container_homedir, got {homedir!r} (hex={raw.hex()})"
-                )
-            detail = (
-                f"vm={vm_name!r} container={container_name!r} "
-                f"user={user!r} homedir={homedir!r}"
-            )
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-                if vm_name == "termina" and container_name == "penguin":
-                    if owner_id != self.owner_hash:
-                        raise ValueError(
-                            f"{ctx}: owner_id mismatch: expected {self.owner_hash!r}, "
-                            f"got {owner_id!r} (hex={raw.hex()})"
-                        )
-                    if user != self.expected_username:
-                        raise ValueError(
-                            f"{ctx}: container_username mismatch: expected {self.expected_username!r}, "
-                            f"got {user!r} (hex={raw.hex()})"
-                        )
+                raise ValueError(f"{ctx}: expected absolute container_homedir, got {homedir!r} (hex={raw.hex()})")
+            detail = f"vm={vm_name!r} container={container_name!r} user={user!r} homedir={homedir!r}"
+            if vm_name == "termina" and container_name == "penguin":
+                if owner_id != self.owner_hash:
+                    raise ValueError(
+                        f"{ctx}: owner_id mismatch: expected {self.owner_hash!r}, got {owner_id!r} (hex={raw.hex()})"
+                    )
+                if user != self.expected_username:
+                    raise ValueError(
+                        f"{ctx}: container_username mismatch: expected {self.expected_username!r}, got {user!r} (hex={raw.hex()})"
+                    )
+                with self._lock:
+                    self._entries.append(TimelineEntry(rel, "dbus", member, detail))
                     self.container_started_rel_sec = rel
-                    self.container_started_detail = detail
                     self._container_started_event.set()
-            return
-
-        if (iface, member) == ("org.chromium.VmCicerone", "ContainerShutdown"):
-            sig = parse_and_validate_proto(raw, cic.ContainerShutdownSignal, ctx)
-            vm_name = require_non_empty_str(sig.vm_name, "vm_name", ctx, raw)
+                return
+        elif member == "ContainerShutdown":
             container_name = require_non_empty_str(sig.container_name, "container_name", ctx, raw)
-            _ = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
             detail = f"vm={vm_name!r} container={container_name!r}"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-            return
-
-        if (iface, member) == ("org.chromium.VmCicerone", "PendingAppListUpdates"):
-            sig = parse_and_validate_proto(raw, cic.PendingAppListUpdatesSignal, ctx)
-            vm_name = require_non_empty_str(sig.vm_name, "vm_name", ctx, raw)
+        elif member == "PendingAppListUpdates":
             container_name = require_non_empty_str(sig.container_name, "container_name", ctx, raw)
             detail = f"vm={vm_name!r} container={container_name!r} count={sig.count}"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-            return
-
-        if (iface, member) == ("org.chromium.VmCicerone", "TremplinStarted"):
-            sig = parse_and_validate_proto(raw, cic.TremplinStartedSignal, ctx)
-            vm_name = require_non_empty_str(sig.vm_name, "vm_name", ctx, raw)
-            owner_id = require_non_empty_str(sig.owner_id, "owner_id", ctx, raw)
+        else:  # TremplinStarted
             detail = f"vm={vm_name!r} owner_id={owner_id!r}"
-            with self._lock:
-                self._entries.append(TimelineEntry(rel, "dbus", member, detail))
-            return
 
-        raise ValueError(f"Unhandled D-Bus signal {ctx}")
+        with self._lock:
+            self._entries.append(TimelineEntry(rel, "dbus", member, detail))
+        if post_hook is not None:
+            post_hook()
 
     def verify_required_dbus_signal_sequence(self) -> None:
         """Asserts that `VmStartingUpSignal` -> `VmStartedSignal` -> `ContainerStarted` for `termina` arrived in order."""
         with self._lock:
-            dbus_entries = [
-                e for e in self._entries if e.source == "dbus" and "vm='termina'" in e.detail
+            names_in_order = [
+                e.name for e in self._entries if e.source == "dbus" and "vm='termina'" in e.detail
             ]
-        names_in_order = [e.name for e in dbus_entries]
         required = ("VmStartingUpSignal", "VmStartedSignal", "ContainerStarted")
         indices: list[int] = []
         for req_name in required:
@@ -3801,25 +2314,13 @@ class InitTimelineRecorder:
         cic = self._protos.cicerone_pb2
         ctx = "VmCicerone.GetGarconSessionInfo"
         req = cic.GetGarconSessionInfoRequest(
-            vm_name="termina",
-            container_name="penguin",
-            owner_id=self.owner_hash,
-        ).SerializeToString()
-        res = self.vm.ssh(
-            f"dbus-send --system --type=method_call --print-reply "
-            f"--dest=org.chromium.VmCicerone /org/chromium/VmCicerone "
-            f"org.chromium.VmCicerone.GetGarconSessionInfo {to_dbus_byte_arg(req)}",
-            check=True,
-            timeout=15,
+            vm_name="termina", container_name="penguin", owner_id=self.owner_hash
         )
-        raw_resp = parse_dbus_send_byte_array(res.stdout, ctx)
-        resp = parse_and_validate_proto(raw_resp, cic.GetGarconSessionInfoResponse, ctx)
+        resp, raw_resp = self.vm.dbus_call_proto(
+            "org.chromium.VmCicerone", "GetGarconSessionInfo", req, cic.GetGarconSessionInfoResponse
+        )
         require_enum_name(
-            cic.GetGarconSessionInfoResponse.Status,
-            resp.status,
-            "status",
-            ctx,
-            raw_resp,
+            cic.GetGarconSessionInfoResponse.Status, resp.status, "status", ctx, raw_resp
         )
         if resp.status == cic.GetGarconSessionInfoResponse.Status.SUCCEEDED:
             user = require_non_empty_str(resp.container_username, "container_username", ctx, raw_resp)
@@ -3883,17 +2384,11 @@ class InitTimelineRecorder:
             if len(parts) < 4 or not re.match(r"^\d{4}-\d{2}-\d{2}T", parts[0]):
                 continue
             epoch = parse_rfc3339_utc(parts[0])
-            rel = (
-                epoch - self.t_install_vm_epoch
-                if self.t_install_vm_epoch is not None
-                else 0.0
-            )
-            proc_tag = parts[2]
-            msg_body = parts[3]
+            rel = (epoch - self.t_install_vm_epoch) if self.t_install_vm_epoch is not None else 0.0
+            proc_tag, msg_body = parts[2], parts[3]
 
-            # Since vm_concierge is single-threaded, any subsequent vm_concierge log line
-            # (or cicerone LaunchVshd) after SetUpVmUser that isn't a SetUpUser RPC error
-            # marks completion of the synchronous SetUpVmUser handler on vm_concierge's thread.
+            # vm_concierge is single-threaded: any subsequent vm_concierge log line (or cicerone
+            # LaunchVshd) that is not a SetUpUser RPC error marks completion of SetUpVmUser.
             if pending_setup_user is not None:
                 seq_idx, start_rel = pending_setup_user
                 if "SetUpUser RPC failed:" in msg_body or "SetUpUser RPC returned an error:" in msg_body:
@@ -3908,7 +2403,7 @@ class InitTimelineRecorder:
                     )
                     pending_setup_user = None
                     continue
-                elif proc_tag.startswith("vm_concierge") or "Received LaunchVshd request" in msg_body:
+                if proc_tag.startswith("vm_concierge") or "Received LaunchVshd request" in msg_body:
                     dur = max(0.0, rel - start_rel)
                     new_host_entries.append(
                         TimelineEntry(
@@ -3938,24 +2433,18 @@ class InitTimelineRecorder:
                     first_host_setup_user_rel = rel
                 pending_setup_user = (setup_user_seq, rel)
                 new_host_entries.append(
-                    TimelineEntry(
-                        rel, "concierge", "SetUpVmUser", f"call #{setup_user_seq}: {msg_body}"
-                    )
+                    TimelineEntry(rel, "concierge", "SetUpVmUser", f"call #{setup_user_seq}: {msg_body}")
                 )
             elif "Startup of container " in msg_body:
                 new_host_entries.append(TimelineEntry(rel, "cicerone", "ContainerReadyLog", msg_body))
             elif "VM with requested name is already running" in msg_body:
-                new_host_entries.append(
-                    TimelineEntry(rel, "concierge", "StartVmAlreadyRunning", msg_body)
-                )
+                new_host_entries.append(TimelineEntry(rel, "concierge", "StartVmAlreadyRunning", msg_body))
             elif "Garcon channel not connected" in msg_body:
                 new_host_entries.append(TimelineEntry(rel, "cicerone", "GarconChannelWait", msg_body))
             elif "Received LaunchVshd request" in msg_body:
                 new_host_entries.append(TimelineEntry(rel, "cicerone", "LaunchVshd", msg_body))
             elif "Received RegisterVshSession request" in msg_body:
-                new_host_entries.append(
-                    TimelineEntry(rel, "cicerone", "RegisterVshSession", msg_body)
-                )
+                new_host_entries.append(TimelineEntry(rel, "cicerone", "RegisterVshSession", msg_body))
 
         if pending_setup_user is not None:
             seq_idx, start_rel = pending_setup_user
@@ -3980,20 +2469,12 @@ class InitTimelineRecorder:
             if len(parts) < 4 or not re.match(r"^\d{4}-\d{2}-\d{2}T", parts[0]):
                 continue
             epoch = parse_rfc3339_utc(parts[0])
-            rel = (
-                epoch - self.t_install_vm_epoch
-                if self.t_install_vm_epoch is not None
-                else 0.0
-            )
+            rel = (epoch - self.t_install_vm_epoch) if self.t_install_vm_epoch is not None else 0.0
             c_body = parts[3]
             if "Failed to set up baguette user:" in c_body:
-                new_host_entries.append(
-                    TimelineEntry(rel, "chrome", "SetUpBaguetteUserFailed", c_body)
-                )
+                new_host_entries.append(TimelineEntry(rel, "chrome", "SetUpBaguetteUserFailed", c_body))
             elif "Failed to restart Crostini with error code:" in c_body:
-                new_host_entries.append(
-                    TimelineEntry(rel, "chrome", "RestartCrostiniFailed", c_body)
-                )
+                new_host_entries.append(TimelineEntry(rel, "chrome", "RestartCrostiniFailed", c_body))
             elif "Unable to mount files for a container that's not running" in c_body:
                 new_host_entries.append(TimelineEntry(rel, "chrome", "SshfsMountSkipped", c_body))
 
@@ -4005,126 +2486,77 @@ class InitTimelineRecorder:
         conc = self._protos.concierge_pb2
         cic = self._protos.cicerone_pb2
 
-        # 1a. VmConcierge.GetVmInfo
         def _query_get_vm_info() -> None:
             ctx_vm = "VmConcierge.GetVmInfo"
-            req_vm = conc.GetVmInfoRequest(
-                name="termina", owner_id=self.owner_hash
-            ).SerializeToString()
-            res_vm = self.vm.ssh(
-                f"dbus-send --system --type=method_call --print-reply "
-                f"--dest=org.chromium.VmConcierge /org/chromium/VmConcierge "
-                f"org.chromium.VmConcierge.GetVmInfo {to_dbus_byte_arg(req_vm)}",
-                check=True,
-                timeout=15,
+            vm_resp, raw_vm = self.vm.dbus_call_proto(
+                "org.chromium.VmConcierge",
+                "GetVmInfo",
+                conc.GetVmInfoRequest(name="termina", owner_id=self.owner_hash),
+                conc.GetVmInfoResponse,
             )
-            raw_vm = parse_dbus_send_byte_array(res_vm.stdout, ctx_vm)
-            vm_resp = parse_and_validate_proto(raw_vm, conc.GetVmInfoResponse, ctx_vm)
             if not vm_resp.success:
                 if strict_dbus:
                     raise RuntimeError(f"{ctx_vm} returned success=false (hex={raw_vm.hex()})")
-                self.readonly_summary_lines.append(
-                    f"VmConcierge.GetVmInfo(termina): success={vm_resp.success}"
-                )
+                self.readonly_summary_lines.append(f"VmConcierge.GetVmInfo(termina): success={vm_resp.success}")
                 return
-            vm_type_name = require_enum_name(
-                conc.VmInfo.VmType, vm_resp.vm_info.vm_type, "vm_info.vm_type", ctx_vm, raw_vm
-            )
-            vm_status_name = require_enum_name(
-                conc.VmStatus, vm_resp.vm_info.status, "vm_info.status", ctx_vm, raw_vm
-            )
+            vm_type = require_enum_name(conc.VmInfo.VmType, vm_resp.vm_info.vm_type, "vm_info.vm_type", ctx_vm, raw_vm)
+            vm_status = require_enum_name(conc.VmStatus, vm_resp.vm_info.status, "vm_info.status", ctx_vm, raw_vm)
             if vm_resp.vm_info.pid <= 0 or vm_resp.vm_info.cid <= 0:
-                raise ValueError(
-                    f"{ctx_vm}: invalid pid={vm_resp.vm_info.pid} cid={vm_resp.vm_info.cid}"
-                )
+                raise ValueError(f"{ctx_vm}: invalid pid={vm_resp.vm_info.pid} cid={vm_resp.vm_info.cid}")
             self.readonly_summary_lines.append(
                 f"VmConcierge.GetVmInfo(termina): success={vm_resp.success} "
-                f"status={vm_status_name}({vm_resp.vm_info.status}) "
-                f"vm_type={vm_type_name}({vm_resp.vm_info.vm_type}) "
+                f"status={vm_status}({vm_resp.vm_info.status}) "
+                f"vm_type={vm_type}({vm_resp.vm_info.vm_type}) "
                 f"cid={vm_resp.vm_info.cid} pid={vm_resp.vm_info.pid}"
             )
 
-        # 1b. VmConcierge.ListVms
         def _query_list_vms() -> None:
             ctx_lv = "VmConcierge.ListVms"
-            req_lv = conc.ListVmsRequest(owner_id=self.owner_hash).SerializeToString()
-            res_lv = self.vm.ssh(
-                f"dbus-send --system --type=method_call --print-reply "
-                f"--dest=org.chromium.VmConcierge /org/chromium/VmConcierge "
-                f"org.chromium.VmConcierge.ListVms {to_dbus_byte_arg(req_lv)}",
-                check=True,
-                timeout=15,
+            lv_resp, raw_lv = self.vm.dbus_call_proto(
+                "org.chromium.VmConcierge",
+                "ListVms",
+                conc.ListVmsRequest(owner_id=self.owner_hash),
+                conc.ListVmsResponse,
             )
-            raw_lv = parse_dbus_send_byte_array(res_lv.stdout, ctx_lv)
-            lv_resp = parse_and_validate_proto(raw_lv, conc.ListVmsResponse, ctx_lv)
             if not lv_resp.success and strict_dbus:
                 raise RuntimeError(
                     f"{ctx_lv} returned success=false: {lv_resp.failure_reason!r} (hex={raw_lv.hex()})"
                 )
-            vm_names = [
-                require_non_empty_str(entry.name, "vms[].name", ctx_lv, raw_lv)
-                for entry in lv_resp.vms
-            ]
+            vm_names = [require_non_empty_str(entry.name, "vms[].name", ctx_lv, raw_lv) for entry in lv_resp.vms]
             if strict_dbus and "termina" not in vm_names:
                 raise RuntimeError(f"{ctx_lv}: expected 'termina' in running VMs, got {vm_names!r}")
-            self.readonly_summary_lines.append(
-                f"VmConcierge.ListVms: success={lv_resp.success} vms={vm_names}"
-            )
+            self.readonly_summary_lines.append(f"VmConcierge.ListVms: success={lv_resp.success} vms={vm_names}")
 
-        # 1c. VmCicerone.ListRunningContainers
         def _query_list_containers() -> None:
             ctx_lc = "VmCicerone.ListRunningContainers"
-            req_lc = cic.ListRunningContainersRequest(owner_id=self.owner_hash).SerializeToString()
-            res_lc = self.vm.ssh(
-                f"dbus-send --system --type=method_call --print-reply "
-                f"--dest=org.chromium.VmCicerone /org/chromium/VmCicerone "
-                f"org.chromium.VmCicerone.ListRunningContainers {to_dbus_byte_arg(req_lc)}",
-                check=True,
-                timeout=15,
+            lc_resp, raw_lc = self.vm.dbus_call_proto(
+                "org.chromium.VmCicerone",
+                "ListRunningContainers",
+                cic.ListRunningContainersRequest(owner_id=self.owner_hash),
+                cic.ListRunningContainersResponse,
             )
-            raw_lc = parse_dbus_send_byte_array(res_lc.stdout, ctx_lc)
-            lc_resp = parse_and_validate_proto(raw_lc, cic.ListRunningContainersResponse, ctx_lc)
             containers = [
                 f"{require_non_empty_str(c.vm_name, 'containers[].vm_name', ctx_lc, raw_lc)}/"
                 f"{require_non_empty_str(c.container_name, 'containers[].container_name', ctx_lc, raw_lc)}"
                 for c in lc_resp.containers
             ]
             if strict_dbus and "termina/penguin" not in containers:
-                raise RuntimeError(
-                    f"{ctx_lc}: expected 'termina/penguin' in running containers, got {containers!r}"
-                )
-            self.readonly_summary_lines.append(
-                f"VmCicerone.ListRunningContainers: {containers}"
-            )
+                raise RuntimeError(f"{ctx_lc}: expected 'termina/penguin' in running containers, got {containers!r}")
+            self.readonly_summary_lines.append(f"VmCicerone.ListRunningContainers: {containers}")
 
-        # 1d. VmCicerone.GetGarconSessionInfo
         def _query_garcon_info() -> None:
             garcon_info = self.query_garcon_session_info_readonly()
             status_name = cic.GetGarconSessionInfoResponse.Status.Name(garcon_info.status)
             if strict_dbus and garcon_info.status != cic.GetGarconSessionInfoResponse.Status.SUCCEEDED:
-                raise RuntimeError(
-                    f"VmCicerone.GetGarconSessionInfo(termina/penguin) status={status_name}"
-                )
+                raise RuntimeError(f"VmCicerone.GetGarconSessionInfo(termina/penguin) status={status_name}")
             self.readonly_summary_lines.append(
                 f"VmCicerone.GetGarconSessionInfo(termina/penguin): "
                 f"status={status_name}({garcon_info.status}) "
-                f"user={garcon_info.container_username!r} "
-                f"homedir={garcon_info.container_homedir!r}"
+                f"user={garcon_info.container_username!r} homedir={garcon_info.container_homedir!r}"
             )
 
-        for query_fn in (
-            _query_get_vm_info,
-            _query_list_vms,
-            _query_list_containers,
-            _query_garcon_info,
-        ):
-            if strict_dbus:
-                query_fn()
-            else:
-                try:
-                    query_fn()
-                except Exception as exc:
-                    self.readonly_summary_lines.append(f"Read-only D-Bus query error: {exc}")
+        for query_fn in (_query_get_vm_info, _query_list_vms, _query_list_containers, _query_garcon_info):
+            _run_diag(strict_dbus, self.readonly_summary_lines, "Read-only D-Bus query error", query_fn)
 
     def _collect_uma_histograms(self, strict_dbus: bool = True) -> None:
         self.vm.set_step("step5:collect_uma_histograms")
@@ -4136,131 +2568,61 @@ class InitTimelineRecorder:
                 "Crostini.SetupResult",
                 "Crostini.RestarterResult.Installer",
             ):
-                if strict_dbus:
+
+                def _fetch_one(name: str = h_name) -> None:
                     h_res = b_conn.call(
                         "Browser.getHistogram",
-                        {"name": h_name},
-                        op_desc=f"UMA:getHistogram({h_name})",
+                        {"name": name},
+                        allow_error=not strict_dbus,
+                        op_desc=f"UMA:getHistogram({name})",
                     )
+                    if "error" in h_res:
+                        self.readonly_summary_lines.append(
+                            f"UMA {name}: <not recorded ({h_res['error'].get('message', h_res['error'])})>"
+                        )
+                        return
                     hist = h_res.get("histogram")
                     if not isinstance(hist, dict) or not hist:
-                        raise RuntimeError(
-                            f"Browser.getHistogram({h_name!r}) returned empty result: {h_res!r}"
-                        )
-                    buckets = [
-                        f"[{b['low']}..{b['high']}):{b['count']}"
-                        for b in hist.get("buckets", [])
-                    ]
+                        if strict_dbus:
+                            raise RuntimeError(f"Browser.getHistogram({name!r}) returned empty result: {h_res!r}")
+                        self.readonly_summary_lines.append(f"UMA {name}: <not recorded>")
+                        return
+                    buckets = [f"[{b['low']}..{b['high']}):{b['count']}" for b in hist.get("buckets", [])]
                     self.readonly_summary_lines.append(
-                        f"UMA {h_name}: count={hist.get('count')} "
-                        f"sum={hist.get('sum')} buckets={buckets}"
+                        f"UMA {name}: count={hist.get('count')} sum={hist.get('sum')} buckets={buckets}"
                     )
-                else:
-                    try:
-                        h_res = b_conn.call(
-                            "Browser.getHistogram",
-                            {"name": h_name},
-                            allow_error=True,
-                            op_desc=f"UMA:getHistogram({h_name})",
-                        )
-                        if "error" in h_res:
-                            self.readonly_summary_lines.append(
-                                f"UMA {h_name}: <not recorded ({h_res['error'].get('message', h_res['error'])})>"
-                            )
-                            continue
-                        hist = h_res.get("histogram")
-                        if not isinstance(hist, dict) or not hist:
-                            self.readonly_summary_lines.append(f"UMA {h_name}: <not recorded>")
-                            continue
-                        buckets = [
-                            f"[{b['low']}..{b['high']}):{b['count']}"
-                            for b in hist.get("buckets", [])
-                        ]
-                        self.readonly_summary_lines.append(
-                            f"UMA {h_name}: count={hist.get('count')} "
-                            f"sum={hist.get('sum')} buckets={buckets}"
-                        )
-                    except Exception as exc:
-                        self.readonly_summary_lines.append(f"UMA {h_name} query error: {exc}")
+
+                _run_diag(strict_dbus, self.readonly_summary_lines, f"UMA {h_name} query error", _fetch_one)
         finally:
             b_conn.close()
 
     def _collect_guest_diagnostics(
         self, first_host_setup_user_rel: float | None, strict_dbus: bool = True
     ) -> None:
-        # Split guest diagnostics into 5 small, targeted read-only `vsh` commands, each with
-        # its own 25s-30s timeout, running the fastest system/unit/journal checks FIRST:
-        #   1. GUEST_UNIT_TIMING (timeout=25): /proc/uptime + UTC epoch sync, nanosecond `stat`
-        #      mtimes on /etc/passwd, /etc/group, /home/terminauser, /var/lib/systemd/linger/terminauser,
-        #      /dev/.container_token, /etc/ssh/ssh_host_*_key, `systemctl list-jobs`, and
-        #      `systemctl show` monotonic start/exit timestamps for first-boot-cros.service,
-        #      maitred.service, vshd.service, systemd-logind.service, ldconfig.service,
-        #      user-runtime-dir@1000.service, and user@1000.service.
-        #   2. GUEST_JOURNAL_MONO (timeout=30): `journalctl -b -o short-monotonic` filtered
-        #      directly by unit (-u ...) and SYSLOG_IDENTIFIER=... (no full-journal grep pipe).
-        #   3. GUEST_JOURNAL_JSON (timeout=30): `journalctl -b -o json` with the same native
-        #      unit and SYSLOG_IDENTIFIER filters.
-        #   4. GUEST_SYSTEM_ANALYZE (timeout=25): system-level `systemd-analyze blame`,
-        #      `systemd-analyze`, and `systemd-analyze critical-chain`.
-        #   5. GUEST_USER_ANALYZE (timeout=30): user-level `systemd-analyze --user` and
-        #      `systemctl --user status` via `setpriv --reuid=1000 --regid=1000 --init-groups`
-        #      (avoiding PAM/pam_systemd blocking when logind or user@1000 is slow or failed).
-        # When `strict_dbus=True` (passing path), every step runs under `set -euo pipefail`
-        # with `check=True` and `_parse_guest_diagnostics(..., strict=True)` requires all
-        # sections and required maitred/garcon journal events to be present and non-empty.
-        # When `strict_dbus=False` (failure path), each step is isolated in its own try/except
-        # so one slow or failing step never loses the others.
         shell_flags = "set -euo pipefail; " if strict_dbus else "set -uo pipefail; "
-        vsh_prefix = (
-            f"sudo -u chronos CROS_USER_ID_HASH={self.owner_hash} "
-            f"vsh --vm_name=termina --owner_id={self.owner_hash} --user=root -- sh -lc "
-        )
+        q_user = shlex.quote(self.expected_username)
+        id_check_cmd = f"id {q_user} 2>&1; " if strict_dbus else f"id {q_user} 2>&1 || true; "
         journal_filter_args = (
-            "-u first-boot-cros.service "
-            "-u maitred.service "
-            "-u vshd.service "
-            "-u systemd-logind.service "
-            "-u user-runtime-dir@1000.service "
-            "-u user@1000.service "
+            "-u first-boot-cros.service -u maitred.service -u vshd.service "
+            "-u systemd-logind.service -u user-runtime-dir@1000.service -u user@1000.service "
             "-u ldconfig.service "
-            "SYSLOG_IDENTIFIER=first-boot-cros "
-            "SYSLOG_IDENTIFIER=maitred "
-            "SYSLOG_IDENTIFIER=useradd "
-            "SYSLOG_IDENTIFIER=usermod "
-            "SYSLOG_IDENTIFIER=garcon "
-            "SYSLOG_IDENTIFIER=sommelier "
-            "SYSLOG_IDENTIFIER=vshd"
+            "SYSLOG_IDENTIFIER=first-boot-cros SYSLOG_IDENTIFIER=maitred "
+            "SYSLOG_IDENTIFIER=useradd SYSLOG_IDENTIFIER=usermod "
+            "SYSLOG_IDENTIFIER=garcon SYSLOG_IDENTIFIER=sommelier SYSLOG_IDENTIFIER=vshd"
         )
         user_env_prefix = (
             "setpriv --reuid=1000 --regid=1000 --init-groups "
-            "env XDG_RUNTIME_DIR=/run/user/1000 "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
-        )
-
-        id_check_cmd = (
-            f"id {self.expected_username} 2>&1; "
-            if strict_dbus
-            else f"id {self.expected_username} 2>&1 || true; "
+            "env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
         )
         steps: list[tuple[str, int, str]] = [
             (
-                "unit_timing_and_stat",
-                25,
-                vsh_prefix
-                + "'"
-                + shell_flags
+                "system_diag",
+                35,
+                shell_flags
                 + 'echo "===GUEST_CLOCK_SYNC==="; '
                 + "read -r up _ < /proc/uptime; "
                 + 'echo "uptime_sec=$up"; '
                 + 'date -u +"epoch_sec=%s.%N"; '
-                + 'echo "===GUEST_STAT_MTIMES==="; '
-                + "for p in /etc/passwd /etc/group /etc/shadow /etc/gshadow /home /home/"
-                + self.expected_username
-                + " /var/lib/systemd/linger /var/lib/systemd/linger/"
-                + self.expected_username
-                + " /dev/.container_token /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ed25519_key; do "
-                + 'if [ -e "$p" ]; then TZ=UTC0 stat -c "%n|%Y|%y|uid=%u gid=%g mode=%a" "$p"; '
-                + 'else echo "$p|MISSING"; fi; done; '
                 + id_check_cmd
                 + 'echo "===GUEST_LIST_JOBS==="; '
                 + "systemctl list-jobs --no-pager 2>&1; "
@@ -4272,71 +2634,41 @@ class InitTimelineRecorder:
                 + "-p ExecMainStartTimestampMonotonic -p ExecMainExitTimestampMonotonic "
                 + "-p ExecMainStatus "
                 + "first-boot-cros.service maitred.service vshd.service systemd-logind.service "
-                + "ldconfig.service user-runtime-dir@1000.service user@1000.service"
-                + "'",
-            ),
-            (
-                "journal_mono",
-                30,
-                vsh_prefix
-                + "'"
-                + shell_flags
-                + 'echo "===GUEST_JOURNAL_MONO==="; '
-                + f"journalctl -b -o short-monotonic --no-pager {journal_filter_args}"
-                + "'",
-            ),
-            (
-                "journal_json",
-                30,
-                vsh_prefix
-                + "'"
-                + shell_flags
-                + 'echo "===GUEST_JOURNAL_JSON==="; '
-                + f"journalctl -b -o json --no-pager {journal_filter_args}"
-                + "'",
-            ),
-            (
-                "system_analyze",
-                25,
-                vsh_prefix
-                + "'"
-                + shell_flags
-                + 'echo "===GUEST_BLAME==="; '
-                + "systemd-analyze blame --no-pager 2>&1; "
+                + "ldconfig.service user-runtime-dir@1000.service user@1000.service; "
                 + 'echo "===GUEST_ANALYZE==="; '
                 + "systemd-analyze --no-pager 2>&1; "
+                + 'echo "===GUEST_BLAME==="; '
+                + "systemd-analyze blame --no-pager 2>&1; "
                 + 'echo "===GUEST_CRITICAL_CHAIN==="; '
-                + "systemd-analyze critical-chain --no-pager 2>&1"
-                + "'",
+                + "systemd-analyze critical-chain --no-pager 2>&1; "
+                + 'echo "===GUEST_JOURNAL_JSON==="; '
+                + f"journalctl -b -o json --no-pager {journal_filter_args}",
             ),
             (
-                "user_analyze",
+                "user_diag",
                 30,
-                vsh_prefix
-                + "'"
-                + shell_flags
+                shell_flags
                 + 'echo "===GUEST_USER_ANALYZE==="; '
                 + f"{user_env_prefix}systemd-analyze --user --no-pager 2>&1; "
-                + 'echo "===GUEST_USER_CRITICAL_CHAIN==="; '
-                + f"{user_env_prefix}systemd-analyze --user critical-chain --no-pager 2>&1; "
                 + 'echo "===GUEST_USER_BLAME==="; '
                 + f"{user_env_prefix}systemd-analyze --user blame --no-pager 2>&1; "
+                + 'echo "===GUEST_USER_CRITICAL_CHAIN==="; '
+                + f"{user_env_prefix}systemd-analyze --user critical-chain --no-pager 2>&1; "
                 + 'echo "===GUEST_GARCON_STATUS==="; '
                 + f"{user_env_prefix}systemctl --user status cros-garcon.service "
-                + "sommelier@0.service sommelier-x@0.service sommelier@1.service sommelier-x@1.service --no-pager 2>&1"
-                + "'",
+                + "sommelier@0.service sommelier-x@0.service sommelier@1.service sommelier-x@1.service --no-pager 2>&1",
             ),
         ]
 
         combined_chunks: list[str] = []
         step_errors: list[str] = []
-        for step_name, step_timeout, step_cmd in steps:
+        for step_name, step_timeout, remote_sh in steps:
             if strict_dbus:
-                res = self.vm.ssh(step_cmd, check=True, timeout=step_timeout)
+                res = self.vm.vsh("termina", "root", remote_sh, check=True, timeout=step_timeout)
                 combined_chunks.append(res.stdout)
             else:
                 try:
-                    res = self.vm.ssh(step_cmd, check=False, timeout=step_timeout)
+                    res = self.vm.vsh("termina", "root", remote_sh, check=False, timeout=step_timeout)
                     if res.stdout:
                         combined_chunks.append(res.stdout)
                     if res.returncode != 0:
@@ -4349,8 +2681,7 @@ class InitTimelineRecorder:
 
         if step_errors:
             self.guest_summary_lines.append("[guest diagnostic step warnings]")
-            for se in step_errors:
-                self.guest_summary_lines.append(f"  {se}")
+            self.guest_summary_lines.extend(f"  {se}" for se in step_errors)
 
         self._parse_guest_diagnostics(
             "\n".join(combined_chunks),
@@ -4360,34 +2691,34 @@ class InitTimelineRecorder:
 
     def _collect_resource_diagnostics(self, strict_dbus: bool = True) -> None:
         sampler_warnings: list[str] = []
-        with self._lock:
-            res_err = self._res_fatal_error
-        if res_err is not None:
-            if strict_dbus:
-                raise RuntimeError(
-                    f"Fatal ChromeOS resource diagnostics error in background sampler: {res_err}"
-                ) from res_err
-            sampler_warnings.append(f"background sampler error: {res_err}")
+        if self._res_stream is not None:
+            with self._res_stream._lock:
+                res_err = self._res_stream.fatal_error
+            if res_err is not None:
+                if strict_dbus:
+                    raise RuntimeError(
+                        f"Fatal ChromeOS resource diagnostics error in background sampler: {res_err}"
+                    ) from res_err
+                sampler_warnings.append(f"background sampler error: {res_err}")
 
         if self.host_runner_info is None:
-            if strict_dbus:
-                self.host_runner_info = read_local_host_runner_info()
-            else:
-                try:
-                    self.host_runner_info = read_local_host_runner_info()
-                except Exception as exc:
-                    sampler_warnings.append(f"host runner info read failed: {exc}")
+            _run_diag(
+                strict_dbus,
+                sampler_warnings,
+                "host runner info read failed",
+                lambda: setattr(self, "host_runner_info", read_local_host_runner_info()),
+            )
 
         if not self._final_res_snapshot_taken and self.vm is not None:
             if strict_dbus:
                 fin_res = self.vm.ssh(CROS_RESOURCE_SNAPSHOT_CMD, check=True, timeout=20)
-                self._record_raw_resource_block(fin_res.stdout, time.monotonic())
+                self._record_resource_json_line(fin_res.stdout.strip(), time.monotonic())
                 self._final_res_snapshot_taken = True
             else:
                 try:
                     fin_res = self.vm.ssh(CROS_RESOURCE_SNAPSHOT_CMD, check=False, timeout=15)
-                    if fin_res.returncode == 0 and fin_res.stdout:
-                        self._record_raw_resource_block(fin_res.stdout, time.monotonic())
+                    if fin_res.returncode == 0 and fin_res.stdout.strip():
+                        self._record_resource_json_line(fin_res.stdout.strip(), time.monotonic())
                         self._final_res_snapshot_taken = True
                     else:
                         err_snip = (fin_res.stderr or "").strip().replace("\n", " | ")[:200]
@@ -4407,7 +2738,43 @@ class InitTimelineRecorder:
             install_mono=t_inst,
             sampler_warnings=sampler_warnings,
             strict=strict_dbus,
+            include_samples=False,
         )
+        full_with_samples = summarize_resource_diagnostics(
+            self.host_runner_info,
+            samples_copy,
+            install_mono=t_inst,
+            sampler_warnings=sampler_warnings,
+            strict=False,
+            include_samples=True,
+        )
+        self.resource_sample_lines = full_with_samples[len(self.resource_summary_lines) :]
+
+    def _collect_section(
+        self,
+        key: str,
+        err_label: str,
+        err_sink: list[str],
+        strict_dbus: bool,
+        fn: Callable[[], None],
+        rollback_list: list[str] | None = None,
+    ) -> None:
+        if key in self._collected_sections:
+            return
+        mark = len(rollback_list) if rollback_list is not None else 0
+        if strict_dbus:
+            try:
+                fn()
+            except Exception:
+                if rollback_list is not None:
+                    del rollback_list[mark:]
+                raise
+        else:
+            try:
+                fn()
+            except Exception as exc:
+                err_sink.append(f"{err_label}: {exc}")
+        self._collected_sections.add(key)
 
     def stop_and_collect(self, strict_dbus: bool = True) -> None:
         """Stops the D-Bus monitor + resource sampler and collects read-only D-Bus, resource, UMA, and log state."""
@@ -4415,44 +2782,18 @@ class InitTimelineRecorder:
             self.check_no_fatal_error()
 
         self._stop_requested = True
-        for proc in (self._mon_proc, self._res_proc):
-            if proc is not None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        self._mon_proc = None
-        self._res_proc = None
-        for th in (
-            self._reader_thread,
-            self._stderr_thread,
-            self._res_reader_thread,
-            self._res_stderr_thread,
-        ):
-            if th is not None:
-                th.join(timeout=2.0)
-        self._reader_thread = None
-        self._stderr_thread = None
-        self._res_reader_thread = None
-        self._res_stderr_thread = None
+        for stream in (self._mon_stream, self._res_stream):
+            if stream is not None:
+                stream.stop()
 
-        # Collect host + ChromeOS VM periodic resource diagnostics FIRST (over SSH + host /proc,
-        # completely independent of the Arch guest) so even if a later D-Bus/UMA/guest query fails,
-        # the timeline report always includes the resource summary.
-        if "resources" not in self._collected_sections:
-            self.resource_summary_lines.clear()
-            if strict_dbus:
-                self._collect_resource_diagnostics(strict_dbus=True)
-            else:
-                try:
-                    self._collect_resource_diagnostics(strict_dbus=False)
-                except Exception as exc:
-                    self.resource_summary_lines.append(f"Resource diagnostics error: {exc}")
-            self._collected_sections.add("resources")
+        self._collect_section(
+            "resources",
+            "Resource diagnostics error",
+            self.resource_summary_lines,
+            strict_dbus,
+            lambda: self._collect_resource_diagnostics(strict_dbus=strict_dbus),
+            rollback_list=self.resource_summary_lines,
+        )
 
         if strict_dbus:
             self.check_no_fatal_error()
@@ -4461,9 +2802,7 @@ class InitTimelineRecorder:
         if "header" not in self._collected_sections:
             self.readonly_summary_lines.clear()
             with self._lock:
-                ic_entries = [
-                    e for e in self._entries if e.source == "ui" and e.name == "InstallerClosed"
-                ]
+                ic_entries = [e for e in self._entries if e.source == "ui" and e.name == "InstallerClosed"]
                 cs_rel = self.container_started_rel_sec
             if ic_entries and cs_rel is not None:
                 ic_rel = ic_entries[0].rel_sec
@@ -4474,63 +2813,39 @@ class InitTimelineRecorder:
                 )
             self._collected_sections.add("header")
 
-        # 1. Read-only D-Bus queries: GetVmInfo, ListVms, ListRunningContainers, GetGarconSessionInfo
-        if "readonly_dbus" not in self._collected_sections:
-            ro_start = len(self.readonly_summary_lines)
-            if strict_dbus:
-                try:
-                    self._collect_readonly_dbus_snapshot(strict_dbus=True)
-                except Exception:
-                    del self.readonly_summary_lines[ro_start:]
-                    raise
-            else:
-                try:
-                    self._collect_readonly_dbus_snapshot(strict_dbus=False)
-                except Exception as exc:
-                    self.readonly_summary_lines.append(f"Read-only D-Bus snapshot error: {exc}")
-            self._collected_sections.add("readonly_dbus")
-
-        # 2. Chrome UMA histograms via CDP (read-only, raw counts/buckets without timeout inference)
-        if "uma" not in self._collected_sections:
-            uma_start = len(self.readonly_summary_lines)
-            if strict_dbus:
-                try:
-                    self._collect_uma_histograms(strict_dbus=True)
-                except Exception:
-                    del self.readonly_summary_lines[uma_start:]
-                    raise
-            else:
-                try:
-                    self._collect_uma_histograms(strict_dbus=False)
-                except Exception as exc:
-                    self.readonly_summary_lines.append(f"UMA histogram query error: {exc}")
-            self._collected_sections.add("uma")
-
-        # 3. Scrape /var/log/messages and /var/log/chrome/chrome since start()
-        if "host_logs" not in self._collected_sections:
-            if strict_dbus:
-                self._first_host_setup_user_rel = self.scrape_host_logs()
-            else:
-                try:
-                    self._first_host_setup_user_rel = self.scrape_host_logs()
-                except Exception as exc:
-                    self._first_host_setup_user_rel = None
-                    self.readonly_summary_lines.append(f"Host log scrape error: {exc}")
-            self._collected_sections.add("host_logs")
-
-        # 4. Post-hoc read-only guest boot & user-session diagnostics via root vsh
-        if "guest_diag" not in self._collected_sections:
-            self.guest_summary_lines.clear()
-            if strict_dbus:
-                self._collect_guest_diagnostics(self._first_host_setup_user_rel, strict_dbus=True)
-            else:
-                try:
-                    self._collect_guest_diagnostics(
-                        self._first_host_setup_user_rel, strict_dbus=False
-                    )
-                except Exception as exc:
-                    self.guest_summary_lines.append(f"Guest diagnostics error: {exc}")
-            self._collected_sections.add("guest_diag")
+        self._collect_section(
+            "readonly_dbus",
+            "Read-only D-Bus snapshot error",
+            self.readonly_summary_lines,
+            strict_dbus,
+            lambda: self._collect_readonly_dbus_snapshot(strict_dbus=strict_dbus),
+            rollback_list=self.readonly_summary_lines,
+        )
+        self._collect_section(
+            "uma",
+            "UMA histogram query error",
+            self.readonly_summary_lines,
+            strict_dbus,
+            lambda: self._collect_uma_histograms(strict_dbus=strict_dbus),
+            rollback_list=self.readonly_summary_lines,
+        )
+        self._collect_section(
+            "host_logs",
+            "Host log scrape error",
+            self.readonly_summary_lines,
+            strict_dbus,
+            lambda: setattr(self, "_first_host_setup_user_rel", self.scrape_host_logs()),
+        )
+        self._collect_section(
+            "guest_diag",
+            "Guest diagnostics error",
+            self.guest_summary_lines,
+            strict_dbus,
+            lambda: self._collect_guest_diagnostics(
+                self._first_host_setup_user_rel, strict_dbus=strict_dbus
+            ),
+            rollback_list=self.guest_summary_lines,
+        )
 
     def _parse_guest_diagnostics(
         self,
@@ -4547,23 +2862,22 @@ class InitTimelineRecorder:
             elif cur_sec is not None:
                 sections[cur_sec].append(line)
 
-        # Parse guest /proc/uptime + date -u +%s.%N clock sync
         guest_uptime_sec: float | None = None
         guest_epoch_sec: float | None = None
         for cline in sections.get("GUEST_CLOCK_SYNC", []):
             cline = cline.strip()
-            if cline.startswith("uptime_sec="):
-                try:
-                    guest_uptime_sec = float(cline.split("=", 1)[1])
-                except ValueError:
-                    if strict:
-                        raise
-            elif cline.startswith("epoch_sec="):
-                try:
-                    guest_epoch_sec = float(cline.split("=", 1)[1])
-                except ValueError:
-                    if strict:
-                        raise
+            for pfx, attr in (("uptime_sec=", "up"), ("epoch_sec=", "ep")):
+                if cline.startswith(pfx):
+                    try:
+                        val = float(cline.split("=", 1)[1])
+                    except ValueError:
+                        if strict:
+                            raise
+                        val = None
+                    if attr == "up":
+                        guest_uptime_sec = val
+                    else:
+                        guest_epoch_sec = val
         if strict and (
             guest_uptime_sec is None
             or guest_uptime_sec <= 0
@@ -4575,7 +2889,7 @@ class InitTimelineRecorder:
                 f"uptime_sec={guest_uptime_sec!r} epoch_sec={guest_epoch_sec!r}"
             )
 
-        parsed_json: list[dict] = []
+        parsed_json: list[tuple[dict[str, Any], int, int]] = []
         first_guest_setup_mono: float | None = None
         for jline in sections.get("GUEST_JOURNAL_JSON", []):
             jline = jline.strip()
@@ -4587,14 +2901,10 @@ class InitTimelineRecorder:
                 if strict:
                     raise
                 continue
-            parsed_json.append(obj)
-            msg = str(obj.get("MESSAGE", ""))
             raw_mono = obj.get("__MONOTONIC_TIMESTAMP")
             if raw_mono in (None, ""):
                 if strict:
-                    raise ValueError(
-                        f"Guest journal JSON entry missing __MONOTONIC_TIMESTAMP: {obj!r}"
-                    )
+                    raise ValueError(f"Guest journal JSON entry missing __MONOTONIC_TIMESTAMP: {obj!r}")
                 mono_us = 0
             else:
                 try:
@@ -4603,6 +2913,18 @@ class InitTimelineRecorder:
                     if strict:
                         raise
                     mono_us = 0
+            raw_rt = obj.get("__REALTIME_TIMESTAMP")
+            if raw_rt in (None, ""):
+                rt_us = 0
+            else:
+                try:
+                    rt_us = int(raw_rt)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise
+                    rt_us = 0
+            parsed_json.append((obj, mono_us, rt_us))
+            msg = str(obj.get("MESSAGE", ""))
             if (
                 first_guest_setup_mono is None
                 and "Received request to setup a new user" in msg
@@ -4616,97 +2938,24 @@ class InitTimelineRecorder:
             )
 
         guest_boot_rel_sec: float | None = None
-        guest_boot_epoch: float | None = None
-        if guest_uptime_sec is not None and guest_epoch_sec is not None:
-            guest_boot_epoch = guest_epoch_sec - guest_uptime_sec
         if first_host_setup_user_rel is not None and first_guest_setup_mono is not None:
             guest_boot_rel_sec = first_host_setup_user_rel - first_guest_setup_mono
-        elif guest_boot_epoch is not None and self.t_install_vm_epoch is not None:
-            guest_boot_rel_sec = guest_boot_epoch - self.t_install_vm_epoch
+        elif (
+            guest_uptime_sec is not None
+            and guest_epoch_sec is not None
+            and self.t_install_vm_epoch is not None
+        ):
+            guest_boot_rel_sec = (guest_epoch_sec - guest_uptime_sec) - self.t_install_vm_epoch
 
         new_guest_entries: list[TimelineEntry] = []
 
-        # Summarize and project GUEST_STAT_MTIMES (nanosecond UTC mtimes of /etc/passwd, /home/terminauser, linger, etc.)
-        stat_lines = [ln.strip() for ln in sections.get("GUEST_STAT_MTIMES", []) if ln.strip()]
-        if strict and not stat_lines:
-            raise RuntimeError("Guest diagnostics section 'GUEST_STAT_MTIMES' is missing or empty")
-        required_guest_paths = {
-            "/etc/passwd",
-            "/etc/group",
-            f"/home/{self.expected_username}",
-            f"/var/lib/systemd/linger/{self.expected_username}",
-            "/dev/.container_token",
-        }
-        seen_valid_paths: set[str] = set()
-        if stat_lines:
-            self.guest_summary_lines.append("[guest filesystem mtimes & user identity]")
-            for sln in stat_lines:
-                self.guest_summary_lines.append(f"  {sln}")
-                parts = sln.split("|")
-                if len(parts) == 2 and parts[1] == "MISSING":
-                    if strict and parts[0] in required_guest_paths:
-                        raise RuntimeError(
-                            f"Required guest path {parts[0]!r} reported MISSING in GUEST_STAT_MTIMES"
-                        )
-                    continue
-                if len(parts) == 4 and parts[1] != "MISSING":
-                    fpath, epoch_int_s, human_utc, meta_s = parts
-                    mtime_epoch: float | None = None
-                    m_utc = re.match(
-                        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d+))?\s+\+0000$",
-                        human_utc.strip(),
-                    )
-                    if m_utc:
-                        base_s = calendar.timegm(
-                            time.strptime(m_utc.group(1), "%Y-%m-%d %H:%M:%S")
-                        )
-                        frac_s = float(f"0.{m_utc.group(2)}") if m_utc.group(2) else 0.0
-                        mtime_epoch = float(base_s) + frac_s
-                    else:
-                        try:
-                            mtime_epoch = float(epoch_int_s)
-                        except ValueError:
-                            if strict:
-                                raise
-                            mtime_epoch = None
-                    if mtime_epoch is not None:
-                        seen_valid_paths.add(fpath)
-                    if (
-                        mtime_epoch is not None
-                        and self.t_install_vm_epoch is not None
-                        and mtime_epoch >= self.t_install_vm_epoch - 2.0
-                    ):
-                        rel = mtime_epoch - self.t_install_vm_epoch
-                        g_tag = ""
-                        if guest_boot_epoch is not None:
-                            g_tag = f"(guest+{max(0.0, mtime_epoch - guest_boot_epoch):.2f}s) "
-                        elif guest_boot_rel_sec is not None:
-                            g_tag = f"(guest+{max(0.0, rel - guest_boot_rel_sec):.2f}s) "
-                        new_guest_entries.append(
-                            TimelineEntry(
-                                rel,
-                                "guest",
-                                "GuestFileMtime",
-                                f"{g_tag}{fpath} mtime={human_utc.strip()} ({meta_s})",
-                            )
-                        )
-        if strict:
-            missing_req_paths = sorted(required_guest_paths - seen_valid_paths)
-            if missing_req_paths:
-                raise RuntimeError(
-                    f"GUEST_STAT_MTIMES missing required guest paths: {missing_req_paths!r}"
-                )
-
-        # Summarize GUEST_LIST_JOBS
         job_lines = [ln.strip() for ln in sections.get("GUEST_LIST_JOBS", []) if ln.strip()]
         if strict and not job_lines:
             raise RuntimeError("Guest diagnostics section 'GUEST_LIST_JOBS' is missing or empty")
         if job_lines:
             self.guest_summary_lines.append("[systemctl list-jobs (system)]")
-            for jln in job_lines[:30]:
-                self.guest_summary_lines.append(f"  {jln}")
+            self.guest_summary_lines.extend(f"  {jln}" for jln in job_lines[:20])
 
-        # Parse and summarize GUEST_SYSTEMD_UNIT_SHOW monotonic timestamps
         unit_show_raw = "\n".join(sections.get("GUEST_SYSTEMD_UNIT_SHOW", [])).strip()
         if strict and not unit_show_raw:
             raise RuntimeError(
@@ -4737,37 +2986,35 @@ class InitTimelineRecorder:
         if unit_show_raw:
             self.guest_summary_lines.append("[systemd unit monotonic timing (systemctl show)]")
             for block in re.split(r"\n\s*\n", unit_show_raw):
-                props: dict[str, str] = {}
-                for bln in block.splitlines():
-                    if "=" in bln:
-                        k, v = bln.split("=", 1)
-                        props[k.strip()] = v.strip()
+                props = {
+                    k.strip(): v.strip()
+                    for bln in block.splitlines()
+                    if "=" in bln
+                    for k, v in [bln.split("=", 1)]
+                }
                 unit_id = props.get("Id", "")
                 if not unit_id:
                     continue
                 seen_units.add(unit_id)
-                act_state = props.get("ActiveState", "")
-                sub_state = props.get("SubState", "")
-                result = props.get("Result", "")
-                exec_status = props.get("ExecMainStatus", "")
+                act_state, sub_state = props.get("ActiveState", ""), props.get("SubState", "")
+                result, exec_status = props.get("Result", ""), props.get("ExecMainStatus", "")
                 inact_exit_us = _parse_mono_prop(props, "InactiveExitTimestampMonotonic")
                 act_enter_us = _parse_mono_prop(props, "ActiveEnterTimestampMonotonic")
                 exec_start_us = _parse_mono_prop(props, "ExecMainStartTimestampMonotonic")
                 exec_exit_us = _parse_mono_prop(props, "ExecMainExitTimestampMonotonic")
                 start_us = exec_start_us or inact_exit_us
                 end_us = exec_exit_us or act_enter_us
-                start_s = start_us / 1_000_000.0
-                end_s = end_us / 1_000_000.0
+                start_s, end_s = start_us / 1_000_000.0, end_us / 1_000_000.0
                 dur_str = (
                     f"{end_s - start_s:.3f}s"
                     if (start_us > 0 and end_us >= start_us)
                     else "in-flight/n/a"
                 )
-                act_dur_extra = ""
-                if inact_exit_us > 0 and act_enter_us >= inact_exit_us:
-                    act_dur_extra = (
-                        f", activate_dur={(act_enter_us - inact_exit_us) / 1_000_000.0:.3f}s"
-                    )
+                act_dur_extra = (
+                    f", activate_dur={(act_enter_us - inact_exit_us) / 1_000_000.0:.3f}s"
+                    if (inact_exit_us > 0 and act_enter_us >= inact_exit_us)
+                    else ""
+                )
                 host_window = ""
                 if guest_boot_rel_sec is not None and start_us > 0:
                     h_start = guest_boot_rel_sec + start_s
@@ -4781,9 +3028,7 @@ class InitTimelineRecorder:
                     )
                     if end_us >= start_us and end_us > 0:
                         h_end = guest_boot_rel_sec + end_s
-                        host_window = (
-                            f" host={_fmt_rel_t(h_start).strip()}..{_fmt_rel_t(h_end).strip()}"
-                        )
+                        host_window = f" host={_fmt_rel_t(h_start).strip()}..{_fmt_rel_t(h_end).strip()}"
                         if exec_exit_us > 0:
                             new_guest_entries.append(
                                 TimelineEntry(
@@ -4807,56 +3052,43 @@ class InitTimelineRecorder:
                     f"GUEST_SYSTEMD_UNIT_SHOW missing expected systemd units: {missing_units!r}"
                 )
 
-        for label, key, max_lines in (
-            ("systemd-analyze (system)", "GUEST_ANALYZE", 120),
-            ("systemd-analyze critical-chain (system)", "GUEST_CRITICAL_CHAIN", 120),
-            ("systemd-analyze blame top-12 (system)", "GUEST_BLAME", 12),
-            ("systemd-analyze --user (terminauser@)", "GUEST_USER_ANALYZE", 120),
-            ("systemd-analyze --user critical-chain (terminauser@)", "GUEST_USER_CRITICAL_CHAIN", 120),
-            ("systemd-analyze --user blame top-12 (terminauser@)", "GUEST_USER_BLAME", 12),
-            ("systemctl --user status cros-garcon & sommelier", "GUEST_GARCON_STATUS", 120),
-            ("journalctl -b -o short-monotonic (filtered)", "GUEST_JOURNAL_MONO", 160),
+        self.guest_verbose_lines.clear()
+        for label, key, max_lines, verbose_only in (
+            ("systemd-analyze (system)", "GUEST_ANALYZE", 12, False),
+            ("systemd-analyze blame top-8 (system)", "GUEST_BLAME", 8, False),
+            ("systemd-analyze --user (terminauser@)", "GUEST_USER_ANALYZE", 12, False),
+            ("systemd-analyze --user blame top-8 (terminauser@)", "GUEST_USER_BLAME", 8, False),
+            ("systemd-analyze critical-chain (system)", "GUEST_CRITICAL_CHAIN", 80, True),
+            ("systemd-analyze --user critical-chain (terminauser@)", "GUEST_USER_CRITICAL_CHAIN", 80, True),
+            ("systemctl --user status cros-garcon & sommelier", "GUEST_GARCON_STATUS", 80, True),
         ):
             sec_lines = [ln for ln in sections.get(key, []) if ln.strip()]
+            dest = self.guest_verbose_lines if verbose_only else self.guest_summary_lines
             if not sec_lines:
                 if strict:
-                    raise RuntimeError(
-                        f"Guest diagnostics section {key!r} ({label}) is missing or empty"
-                    )
-                self.guest_summary_lines.append(f"[{label}]: <empty or unavailable>")
+                    raise RuntimeError(f"Guest diagnostics section {key!r} ({label}) is missing or empty")
+                dest.append(f"[{label}]: <empty or unavailable>")
                 continue
-            self.guest_summary_lines.append(f"[{label}]")
-            for ln in sec_lines[:max_lines]:
-                self.guest_summary_lines.append(f"  {ln}")
+            dest.append(f"[{label}]")
+            dest.extend(f"  {ln}" for ln in sec_lines[:max_lines])
 
-        # Project key guest journal events onto the unified t+X.Xs / t-X.Xs timeline
+        if parsed_json:
+            self.guest_verbose_lines.append("[journalctl -b (monotonic, filtered)]")
+            for obj, mono_us, _rt_us in parsed_json[:140]:
+                ident_label = str(obj.get("SYSLOG_IDENTIFIER") or obj.get("_COMM") or "guest")
+                self.guest_verbose_lines.append(
+                    f"  [{mono_us / 1_000_000.0:10.6f}] {ident_label}: {obj.get('MESSAGE', '')}"
+                )
+
+        # Project daemon-level guest journal events onto the unified timeline (unit start/done
+        # are already projected above from `systemctl show` monotonic properties).
         setup_user_guest_seq = 0
-        for obj in parsed_json:
+        for obj, mono_us, rt_us in parsed_json:
             msg = str(obj.get("MESSAGE", ""))
             comm = str(obj.get("_COMM", ""))
             syslog_id = str(obj.get("SYSLOG_IDENTIFIER", ""))
             unit = str(obj.get("_SYSTEMD_UNIT", "") or obj.get("UNIT", ""))
             ident = f"{comm} {syslog_id} {unit}".lower()
-            raw_rt = obj.get("__REALTIME_TIMESTAMP")
-            if raw_rt in (None, ""):
-                rt_us = 0
-            else:
-                try:
-                    rt_us = int(raw_rt)
-                except (TypeError, ValueError):
-                    if strict:
-                        raise
-                    rt_us = 0
-            raw_mono = obj.get("__MONOTONIC_TIMESTAMP")
-            if raw_mono in (None, ""):
-                mono_us = 0
-            else:
-                try:
-                    mono_us = int(raw_mono)
-                except (TypeError, ValueError):
-                    if strict:
-                        raise
-                    mono_us = 0
             g_mono = mono_us / 1_000_000.0
             if guest_boot_rel_sec is not None and mono_us > 0:
                 rel = guest_boot_rel_sec + g_mono
@@ -4866,100 +3098,39 @@ class InitTimelineRecorder:
                 continue
             tag = f"(guest+{g_mono:.2f}s) "
 
-            if "Starting First boot script" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "FirstBootStart", tag + msg))
-            elif "first-boot-cros" in ident and (
-                "Resize device" in msg
-                or "FileSystem / has been resized" in msg
-                or "ssh-keygen:" in msg
-                or "Removed " in msg
-            ):
-                new_guest_entries.append(TimelineEntry(rel, "guest", "FirstBootStep", tag + msg))
-            elif "Finished First boot script" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "FirstBootDone", tag + msg))
-            elif "Starting Rebuild Dynamic Linker Cache" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "LdconfigStart", tag + msg))
-            elif "Finished Rebuild Dynamic Linker Cache" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "LdconfigDone", tag + msg))
-            elif "Starting User Login Management" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "LogindStart", tag + msg))
-            elif "Started User Login Management" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "LogindReady", tag + msg))
+            ev_name: str | None = None
+            ev_detail = tag + msg
+            if "first-boot-cros" in ident and "systemd" not in ident:
+                ev_name = "FirstBootStep"
             elif "Started maitred" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "MaitredStarted", tag + msg))
+                ev_name = "MaitredStarted"
             elif "Wrote container token to /dev/.container_token" in msg:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "ContainerTokenWrote", tag + msg)
-                )
+                ev_name = "ContainerTokenWrote"
             elif "Received request to setup a new user" in msg:
                 setup_user_guest_seq += 1
-                new_guest_entries.append(
-                    TimelineEntry(
-                        rel,
-                        "guest",
-                        "MaitredSetUpUser",
-                        f"{tag}call #{setup_user_guest_seq}: {msg}",
-                    )
-                )
+                ev_name = "MaitredSetUpUser"
+                ev_detail = f"{tag}call #{setup_user_guest_seq}: {msg}"
             elif "already exists" in msg and "maitred" in ident:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "MaitredUserExists", tag + msg)
-                )
-            elif "useradd" in ident and "new group:" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "UseraddGroup", tag + msg))
-            elif "useradd" in ident and "new user:" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "UseraddDone", tag + msg))
-            elif "useradd" in ident and "add '" in msg and (
-                "group 'audio'" in msg or "shadow group 'video'" in msg
-            ):
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "UseraddGroupMembership", tag + msg)
-                )
+                ev_name = "MaitredUserExists"
+            elif "useradd" in ident and ("new group:" in msg or "new user:" in msg):
+                ev_name = "UseraddDone" if "new user:" in msg else "UseraddGroup"
             elif "usermod" in ident:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "Usermod", tag + msg))
-            elif "maitred" in ident and (
-                "failed" in msg.lower() or "error" in msg.lower() or "linger" in msg.lower()
-            ):
-                new_guest_entries.append(TimelineEntry(rel, "guest", "MaitredLog", tag + msg))
-            elif "Starting User Runtime Directory /run/user/1000" in msg:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "UserRuntimeDirStart", tag + msg)
-                )
-            elif "Finished User Runtime Directory /run/user/1000" in msg:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "UserRuntimeDirDone", tag + msg)
-                )
-            elif "Starting User Manager for UID 1000" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "User1000Start", tag + msg))
-            elif "Started User Manager for UID 1000" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "User1000Ready", tag + msg))
-            elif "Starting Parent sommelier" in msg or "Starting X11 sommelier" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "SommelierStart", tag + msg))
-            elif "Started Parent sommelier" in msg or "Started X11 sommelier" in msg:
-                new_guest_entries.append(TimelineEntry(rel, "guest", "SommelierReady", tag + msg))
-            elif "sommelier" in msg.lower() and (
-                "timed out" in msg
-                or "failed" in msg.lower()
-                or "scheduled restart" in msg.lower()
-                or "main process exited" in msg.lower()
-            ):
-                new_guest_entries.append(TimelineEntry(rel, "guest", "SommelierIssue", tag + msg))
+                ev_name = "Usermod"
+            elif "maitred" in ident and any(w in msg.lower() for w in ("failed", "error", "linger")):
+                ev_name = "MaitredLog"
             elif "still waiting for /dev/.container_token" in msg:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "SommelierWaitToken", tag + msg)
-                )
-            elif "Started Chromium OS Garcon Bridge" in msg:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "GarconServiceStarted", tag + msg)
-                )
+                ev_name = "SommelierWaitToken"
+            elif "sommelier" in msg.lower() and any(
+                w in msg.lower() for w in ("timed out", "failed", "scheduled restart", "main process exited")
+            ):
+                ev_name = "SommelierIssue"
             elif "garcon" in ident and "systemd" not in ident:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "GarconLog", tag + msg[:140])
-                )
+                ev_name, ev_detail = "GarconLog", tag + msg[:140]
             elif "vshd" in ident and "systemd" not in ident:
-                new_guest_entries.append(
-                    TimelineEntry(rel, "guest", "GuestVshd", tag + msg[:140])
-                )
+                ev_name, ev_detail = "GuestVshd", tag + msg[:140]
+
+            if ev_name is not None:
+                new_guest_entries.append(TimelineEntry(rel, "guest", ev_name, ev_detail))
 
         with self._lock:
             self._guest_log_entries = new_guest_entries
@@ -4971,26 +3142,25 @@ class InitTimelineRecorder:
             lines.append(f"  {_fmt_rel_t(e.rel_sec)}  [{e.source:<9}] {e.name}: {e.detail}")
         lines.append("  --- Runner & ChromeOS Resource Diagnostics (read-only) ---")
         if self.resource_summary_lines:
-            for r_line in self.resource_summary_lines:
-                lines.append(f"  {r_line}")
+            lines.extend(f"  {r_line}" for r_line in self.resource_summary_lines)
+            if include_raw_logs and self.resource_sample_lines:
+                lines.extend(f"  {s_line}" for s_line in self.resource_sample_lines)
         else:
             lines.append("  <not collected>")
         lines.append("  --- Read-Only D-Bus & UMA Snapshot ---")
-        for s_line in self.readonly_summary_lines:
-            lines.append(f"  {s_line}")
+        lines.extend(f"  {s_line}" for s_line in self.readonly_summary_lines)
         if self.guest_summary_lines:
             lines.append("  --- Guest Boot & Service Timing Summary (read-only) ---")
-            for g_line in self.guest_summary_lines:
-                lines.append(f"  {g_line}")
+            lines.extend(f"  {g_line}" for g_line in self.guest_summary_lines)
+            if include_raw_logs and self.guest_verbose_lines:
+                lines.extend(f"  {v_line}" for v_line in self.guest_verbose_lines)
         if include_raw_logs:
             if self.messages_excerpt:
                 lines.append("  --- /var/log/messages excerpt ---")
-                for m_line in self.messages_excerpt.splitlines()[-40:]:
-                    lines.append(f"    {m_line}")
+                lines.extend(f"    {m_line}" for m_line in self.messages_excerpt.splitlines()[-40:])
             if self.chrome_excerpt:
                 lines.append("  --- /var/log/chrome/chrome excerpt ---")
-                for c_line in self.chrome_excerpt.splitlines()[-30:]:
-                    lines.append(f"    {c_line}")
+                lines.extend(f"    {c_line}" for c_line in self.chrome_excerpt.splitlines()[-30:])
         lines.append("===========================================================")
         return "\n".join(lines)
 
@@ -5121,9 +3291,8 @@ class ChromeOSVM:
     def get_step(self) -> str:
         return self._current_step
 
-    def _ssh_base_cmd(self) -> list[str]:
+    def _ssh_common_opts(self) -> list[str]:
         return [
-            "ssh",
             "-i",
             str(self.ssh_key),
             "-o",
@@ -5132,6 +3301,12 @@ class ChromeOSVM:
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
+        ]
+
+    def _ssh_base_cmd(self) -> list[str]:
+        return [
+            "ssh",
+            *self._ssh_common_opts(),
             "-o",
             "ConnectTimeout=5",
             "-o",
@@ -5163,22 +3338,67 @@ class ChromeOSVM:
             raise
 
     def scp_to(self, local_path: Path, remote_path: str) -> None:
-        cmd = [
-            "scp",
-            "-i",
-            str(self.ssh_key),
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-P",
-            str(self.ssh_port),
-            str(local_path),
-            f"root@127.0.0.1:{remote_path}",
-        ]
-        subprocess.run(cmd, check=True, timeout=180)
+        subprocess.run(
+            [
+                "scp",
+                *self._ssh_common_opts(),
+                "-P",
+                str(self.ssh_port),
+                str(local_path),
+                f"root@127.0.0.1:{remote_path}",
+            ],
+            check=True,
+            timeout=180,
+        )
+
+    def dbus_call_proto(
+        self,
+        dest: str,
+        method: str,
+        req_msg: Message,
+        resp_cls: type[TMessage],
+        timeout: int = 15,
+    ) -> tuple[TMessage, bytes]:
+        """Executes a synchronous D-Bus protobuf method call on the system bus and validates the reply."""
+        obj_path = "/" + dest.replace(".", "/")
+        ctx = f"{dest.rsplit('.', 1)[-1]}.{method}"
+        res = self.ssh(
+            f"dbus-send --system --type=method_call --print-reply "
+            f"--dest={dest} {obj_path} {dest}.{method} "
+            f"{to_dbus_byte_arg(req_msg.SerializeToString())}",
+            check=True,
+            timeout=timeout,
+        )
+        raw_resp = parse_dbus_send_byte_array(res.stdout, ctx)
+        return parse_and_validate_proto(raw_resp, resp_cls, ctx), raw_resp
+
+    def vsh(
+        self,
+        vm_name: str,
+        user: str,
+        sh_script: str,
+        *,
+        check: bool = True,
+        timeout: int = 30,
+    ) -> subprocess.CompletedProcess[str]:
+        """Runs `sh -lc <sh_script>` inside `vm_name` via `vsh` as `chronos`."""
+        assert self.owner_hash
+        cmd = (
+            f"sudo -u chronos CROS_USER_ID_HASH={shlex.quote(self.owner_hash)} "
+            f"vsh --vm_name={shlex.quote(vm_name)} --owner_id={shlex.quote(self.owner_hash)} "
+            f"--user={shlex.quote(user)} -- sh -lc {shlex.quote(sh_script)}"
+        )
+        return self.ssh(cmd, check=check, timeout=timeout)
+
+    def vmc(self, *args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+        """Runs non-interactive `vmc <args...>` as `chronos`."""
+        assert self.owner_hash
+        quoted = " ".join(shlex.quote(a) for a in args)
+        return self.ssh(
+            f"sudo -u chronos CROS_USER_ID_HASH={shlex.quote(self.owner_hash)} "
+            f"VMC_NONINTERACTIVE=1 vmc {quoted}",
+            timeout=timeout,
+        )
 
     def wait_for_ssh(
         self, timeout_sec: int = 90, different_from_boot_id: str | None = None
@@ -5300,16 +3520,8 @@ class ChromeOSVM:
         )
 
     def stop(self) -> None:
-        if self._devtools_fwd_proc is not None:
-            try:
-                self._devtools_fwd_proc.terminate()
-                self._devtools_fwd_proc.wait(timeout=3)
-            except Exception:
-                try:
-                    self._devtools_fwd_proc.kill()
-                except Exception:
-                    pass
-            self._devtools_fwd_proc = None
+        _terminate_proc(self._devtools_fwd_proc)
+        self._devtools_fwd_proc = None
 
         if self.pid_file.exists():
             try:
@@ -5448,14 +3660,13 @@ dbus-send --system --type=method_call --print-reply \
             except Exception as exc:
                 last_err = exc
                 time.sleep(0.3)
-        elapsed = time.monotonic() - t0
         ctx = format_cdp_error_context(
             operation="SSH -L DevTools tunnel readiness probe",
             target_label="DevToolsTunnel",
             target_url=f"http://127.0.0.1:{self._local_dt_port}/json/list",
             target_id="browser",
             step=self.get_step(),
-            elapsed_sec=elapsed,
+            elapsed_sec=time.monotonic() - t0,
             timeout_sec=tunnel_timeout,
         )
         raise CDPTimeoutError(
@@ -5506,6 +3717,64 @@ dbus-send --system --type=method_call --print-reply \
                 )
         return targets
 
+    def wait_for_cdp_target(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        operation: str,
+        target_label: str,
+        target_url: str,
+        target_id: str = "<pending>",
+        timeout: float = 30.0,
+        interval: float = 0.4,
+        require_ws: bool = True,
+        err_prefix: str | None = None,
+    ) -> dict[str, Any]:
+        """Polls `list_cdp_targets()` until `predicate(tgt)` matches or raises `CDPTimeoutError`."""
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        while time.monotonic() < deadline:
+            for tgt in self.list_cdp_targets():
+                if (not require_ws or "webSocketDebuggerUrl" in tgt) and predicate(tgt):
+                    return tgt
+            time.sleep(interval)
+        ctx = format_cdp_error_context(
+            operation=operation,
+            target_label=target_label,
+            target_url=target_url,
+            target_id=target_id,
+            step=self.get_step(),
+            elapsed_sec=time.monotonic() - t0,
+            timeout_sec=timeout,
+        )
+        prefix = err_prefix or f"Timed out waiting for CDP target {target_label!r}"
+        raise CDPTimeoutError(f"{prefix} ({ctx})")
+
+    def connect_cdp_target(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        operation: str,
+        target_label: str,
+        target_url: str,
+        target_id: str = "<pending>",
+        timeout: float = 30.0,
+        interval: float = 0.4,
+        err_prefix: str | None = None,
+    ) -> CDPConnection:
+        tgt = self.wait_for_cdp_target(
+            predicate,
+            operation=operation,
+            target_label=target_label,
+            target_url=target_url,
+            target_id=target_id,
+            timeout=timeout,
+            interval=interval,
+            require_ws=True,
+            err_prefix=err_prefix,
+        )
+        return CDPConnection.from_target(tgt, label=target_label, step_getter=self.get_step)
+
     def open_crosh_tab(self, label: str) -> CroshTab:
         self.set_step(f"open_crosh_tab({label})")
         browser_conn = self.connect_browser_cdp(label=f"Browser-CreateCrosh({label})")
@@ -5518,58 +3787,32 @@ dbus-send --system --type=method_call --print-reply \
         finally:
             browser_conn.close()
 
-        attach_timeout = 30.0
-        t0 = time.monotonic()
-        deadline = t0 + attach_timeout
-        while time.monotonic() < deadline:
-            for tgt in self.list_cdp_targets():
-                if tgt.get("id") == tid and "webSocketDebuggerUrl" in tgt:
-                    conn = CDPConnection.from_target(
-                        tgt, label=label, step_getter=self.get_step
-                    )
-                    tab = CroshTab(label, conn)
-                    tab.wait_for(
-                        lambda txt: txt.rstrip().endswith("crosh>"),
-                        timeout=45.0,
-                        desc=f"{label} initial crosh> prompt",
-                    )
-                    log(f"Opened {label} (`chrome-untrusted://crosh/`, target={tid})")
-                    return tab
-            time.sleep(0.3)
-        elapsed = time.monotonic() - t0
-        ctx = format_cdp_error_context(
+        conn = self.connect_cdp_target(
+            lambda tgt: tgt.get("id") == tid,
             operation=f"attach_target({label})",
             target_label=label,
             target_url="chrome-untrusted://crosh/",
             target_id=str(tid),
-            step=self.get_step(),
-            elapsed_sec=elapsed,
-            timeout_sec=attach_timeout,
+            timeout=30.0,
+            interval=0.3,
+            err_prefix="Failed to attach to crosh tab",
         )
-        raise CDPTimeoutError(f"Failed to attach to crosh tab ({ctx})")
+        tab = CroshTab(label, conn)
+        tab.wait_for(
+            lambda txt: txt.rstrip().endswith("crosh>"),
+            timeout=45.0,
+            desc=f"{label} initial crosh> prompt",
+        )
+        log(f"Opened {label} (`chrome-untrusted://crosh/`, target={tid})")
+        return tab
 
     def verify_guest_user_session(self, vm_name: str, expected_username: str) -> None:
-        assert self.owner_hash
-        uid_res = self.ssh(
-            f"sudo -u chronos CROS_USER_ID_HASH={self.owner_hash} "
-            f"vsh --vm_name={vm_name} --owner_id={self.owner_hash} --user=root -- id -nu 1000",
-            timeout=30,
-        )
-        actual_username = uid_res.stdout.strip()
-        log(f"  [{vm_name}] UID 1000 user in guest: '{actual_username}'")
-        if actual_username != expected_username:
-            raise RuntimeError(
-                f"Expected UID 1000 username '{expected_username}', got '{actual_username}'"
-            )
-
         log(
             f"Verifying in-guest OS, UID/GID 1000, primary group '{expected_username}', "
             f"exact supplementary groups {sorted(EXPECTED_GUEST_SUPPLEMENTARY_GROUPS)}, "
             f"and active cros-garcon.service for VM '{vm_name}'..."
         )
-        check_cmd = (
-            f"sudo -u chronos CROS_USER_ID_HASH={self.owner_hash} "
-            f"vsh --vm_name={vm_name} --owner_id={self.owner_hash} --user={actual_username} -- sh -lc '"
+        check_script = (
             "set -euo pipefail; "
             'grep -q "Arch Linux" /etc/os-release; '
             'echo "OS=$(. /etc/os-release && echo $PRETTY_NAME)"; '
@@ -5581,9 +3824,9 @@ dbus-send --system --type=method_call --print-reply \
             'echo "GROUPS=$(id -Gn)"; '
             "GARCON=$(systemctl --user is-active cros-garcon.service); "
             'echo "GARCON=$GARCON"; '
-            '[ "$GARCON" = "active" ]\''
+            '[ "$GARCON" = "active" ]'
         )
-        res = self.ssh(check_cmd, timeout=30)
+        res = self.vsh(vm_name, expected_username, check_script, timeout=30)
         kv: dict[str, str] = {}
         for line in res.stdout.strip().splitlines():
             log(f"  [{vm_name}] {line}")
@@ -5604,7 +3847,6 @@ dbus-send --system --type=method_call --print-reply \
         self,
         username: str,
         timeline: InitTimelineRecorder,
-        throttler: HostQemuCpuThrottler | None = None,
     ) -> dict:
         """Drives ChromeOS Settings -> About ChromeOS -> Developers -> Set up -> crostini-installer.
 
@@ -5645,43 +3887,23 @@ dbus-send --system --type=method_call --print-reply \
         finally:
             browser_conn.close()
 
-        settings_attach_timeout = 30.0
-        t_att0 = time.monotonic()
-        settings_conn: CDPConnection | None = None
-        while time.monotonic() - t_att0 < settings_attach_timeout:
-            for tgt in self.list_cdp_targets():
-                if "chrome://os-settings" in tgt.get("url", "") and "webSocketDebuggerUrl" in tgt:
-                    settings_conn = CDPConnection.from_target(
-                        tgt, label="OS-Settings", step_getter=self.get_step
-                    )
-                    break
-            if settings_conn is not None:
-                break
-            time.sleep(0.5)
-        if settings_conn is None:
-            ctx = format_cdp_error_context(
-                operation="find_target(chrome://os-settings)",
-                target_label="OS-Settings",
-                target_url="chrome://os-settings/",
-                target_id="<pending>",
-                step=self.get_step(),
-                elapsed_sec=time.monotonic() - t_att0,
-                timeout_sec=settings_attach_timeout,
-            )
-            raise CDPTimeoutError(f"Could not find `chrome://os-settings/` target in CDP ({ctx})")
-
+        settings_conn = self.connect_cdp_target(
+            lambda tgt: "chrome://os-settings" in tgt.get("url", ""),
+            operation="find_target(chrome://os-settings)",
+            target_label="OS-Settings",
+            target_url="chrome://os-settings/",
+            timeout=30.0,
+            interval=0.5,
+            err_prefix="Could not find `chrome://os-settings/` target in CDP",
+        )
         try:
             self.set_step("step2:navigate_os_settings_click_setup")
             log(
                 "Navigating OS Settings UI: clicking `About ChromeOS` -> "
                 "`Developers` -> `Linux development environment` -> `Set up`..."
             )
-            nav_timeout = 30.0
-            t_nav0 = time.monotonic()
-            nav_res: Any = None
-            while time.monotonic() - t_nav0 < nav_timeout:
-                nav_res = settings_conn.eval_js(
-                    """(() => {
+            nav_res = settings_conn.poll_js(
+                """(() => {
                     const ui = document.querySelector('os-settings-ui');
                     if (!ui || !ui.shadowRoot) return 'no-ui';
                     const menu = ui.shadowRoot.querySelector('os-settings-menu');
@@ -5706,61 +3928,28 @@ dbus-send --system --type=method_call --print-reply \
                     btn.click();
                     return 'CLICKED_SETUP:' + header + ' | ' + label + ' | ' + btnText;
                 })()""",
-                    op_desc="OS-Settings:navigate_and_click_setup",
-                )
-                if isinstance(nav_res, str) and nav_res.startswith("CLICKED_SETUP:"):
-                    log(f"  OS Settings UI action: {nav_res}")
-                    break
-                time.sleep(0.5)
-            else:
-                ctx = settings_conn._ctx(
-                    "OS-Settings:click_setup_button", time.monotonic() - t_nav0, nav_timeout
-                )
-                raise CDPTimeoutError(
-                    f"Failed to click Set up button in OS Settings ({ctx}; last state={nav_res!r})"
-                )
+                lambda val: isinstance(val, str) and val.startswith("CLICKED_SETUP:"),
+                op_desc="OS-Settings:navigate_and_click_setup",
+                timeout=30.0,
+            )
+            log(f"  OS Settings UI action: {nav_res}")
         finally:
             settings_conn.close()
 
         self.set_step("step2:attach_crostini_installer")
-        inst_attach_timeout = 30.0
-        t_inst_att0 = time.monotonic()
-        installer_conn: CDPConnection | None = None
-        while time.monotonic() - t_inst_att0 < inst_attach_timeout:
-            for tgt in self.list_cdp_targets():
-                if (
-                    "chrome://crostini-installer" in tgt.get("url", "")
-                    and "webSocketDebuggerUrl" in tgt
-                ):
-                    installer_conn = CDPConnection.from_target(
-                        tgt, label="Crostini-Installer", step_getter=self.get_step
-                    )
-                    break
-            if installer_conn is not None:
-                break
-            time.sleep(0.5)
-        if installer_conn is None:
-            ctx = format_cdp_error_context(
-                operation="find_target(chrome://crostini-installer)",
-                target_label="Crostini-Installer",
-                target_url="chrome://crostini-installer/",
-                target_id="<pending>",
-                step=self.get_step(),
-                elapsed_sec=time.monotonic() - t_inst_att0,
-                timeout_sec=inst_attach_timeout,
-            )
-            raise CDPTimeoutError(
-                f"`chrome://crostini-installer` dialog did not open after clicking Set up ({ctx})"
-            )
-
+        installer_conn = self.connect_cdp_target(
+            lambda tgt: "chrome://crostini-installer" in tgt.get("url", ""),
+            operation="find_target(chrome://crostini-installer)",
+            target_label="Crostini-Installer",
+            target_url="chrome://crostini-installer/",
+            timeout=30.0,
+            interval=0.5,
+            err_prefix="`chrome://crostini-installer` dialog did not open after clicking Set up",
+        )
         try:
             self.set_step("step2:installer_click_next")
-            next_timeout = 30.0
-            t_next0 = time.monotonic()
-            step1: Any = None
-            while time.monotonic() - t_next0 < next_timeout:
-                step1 = installer_conn.eval_js(
-                    """(() => {
+            installer_conn.poll_js(
+                """(() => {
                     const app = document.querySelector('crostini-installer-app');
                     if (!app || !app.shadowRoot) return 'no-app';
                     const nextBtn = app.shadowRoot.querySelector('#next');
@@ -5768,27 +3957,15 @@ dbus-send --system --type=method_call --print-reply \
                     nextBtn.click();
                     return 'CLICKED_NEXT';
                 })()""",
-                    op_desc="Crostini-Installer:click_next",
-                )
-                if step1 == "CLICKED_NEXT":
-                    log("  Clicked `Next` in `chrome://crostini-installer`.")
-                    break
-                time.sleep(0.5)
-            else:
-                ctx = installer_conn._ctx(
-                    "Crostini-Installer:click_next", time.monotonic() - t_next0, next_timeout
-                )
-                raise CDPTimeoutError(
-                    f"Failed to click `#next` in `chrome://crostini-installer` ({ctx}; last state={step1!r})"
-                )
+                lambda val: val == "CLICKED_NEXT",
+                op_desc="Crostini-Installer:click_next",
+                timeout=30.0,
+            )
+            log("  Clicked `Next` in `chrome://crostini-installer`.")
 
             self.set_step("step2:installer_click_install")
-            inst_btn_timeout = 30.0
-            t_ibtn0 = time.monotonic()
-            step2: Any = None
-            while time.monotonic() - t_ibtn0 < inst_btn_timeout:
-                step2 = installer_conn.eval_js(
-                    f"""(() => {{
+            step2 = installer_conn.poll_js(
+                f"""(() => {{
                     const app = document.querySelector('crostini-installer-app');
                     if (!app || !app.shadowRoot) return 'no-app';
                     const input = app.shadowRoot.querySelector('#username');
@@ -5801,22 +3978,12 @@ dbus-send --system --type=method_call --print-reply \
                     installBtn.click();
                     return 'CLICKED_INSTALL:' + input.value;
                 }})()""",
-                    op_desc="Crostini-Installer:set_username_and_click_install",
-                )
-                if isinstance(step2, str) and step2.startswith("CLICKED_INSTALL:"):
-                    timeline.mark_install_clicked(username)
-                    log(f"  Clicked `Install` in `chrome://crostini-installer` ({step2}).")
-                    break
-                time.sleep(0.5)
-            else:
-                ctx = installer_conn._ctx(
-                    "Crostini-Installer:set_username_and_click_install",
-                    time.monotonic() - t_ibtn0,
-                    inst_btn_timeout,
-                )
-                raise CDPTimeoutError(
-                    f"Failed to set username and click `#install` in `chrome://crostini-installer` ({ctx}; last state={step2!r})"
-                )
+                lambda val: isinstance(val, str) and val.startswith("CLICKED_INSTALL:"),
+                op_desc="Crostini-Installer:set_username_and_click_install",
+                timeout=30.0,
+            )
+            timeline.mark_install_clicked(username)
+            log(f"  Clicked `Install` in `chrome://crostini-installer` ({step2}).")
 
             self.set_step("step2:wait_installer_complete")
             log("  Waiting for `chrome://crostini-installer` to finish provisioning `termina`...")
@@ -5841,35 +4008,20 @@ dbus-send --system --type=method_call --print-reply \
                         f"closed after {elapsed:.1f}s (last_progress={last_status.get('installing')!r})",
                     )
                     self.set_step("step2:attach_initial_terminal_vmshell")
-                    term_attach_timeout = 45.0
-                    t_term0 = time.monotonic()
-                    term_deadline = t_term0 + term_attach_timeout
-                    vmshell_tgt: dict | None = None
-                    while time.monotonic() < term_deadline:
-                        for x in self.list_cdp_targets():
-                            if "chrome-untrusted://terminal/html/terminal.html?command=vmshell" in x.get(
-                                "url", ""
-                            ):
-                                vmshell_tgt = x
-                                break
-                        if vmshell_tgt is not None:
-                            break
-                        time.sleep(0.5)
-                    if vmshell_tgt is None:
-                        ctx = format_cdp_error_context(
-                            operation="wait_for_target(Terminal-App-Initial vmshell)",
-                            target_label="Terminal-App-Initial",
-                            target_url="chrome-untrusted://terminal/html/terminal.html?command=vmshell",
-                            target_id="<pending>",
-                            step=self.get_step(),
-                            elapsed_sec=time.monotonic() - t_term0,
-                            timeout_sec=term_attach_timeout,
-                        )
-                        raise CDPTimeoutError(
-                            "`chrome://crostini-installer` closed after "
-                            f"{elapsed:.1f}s (last progress: {last_status.get('installing')!r}), "
-                            f"but the ChromeOS Terminal app (`chrome-untrusted://terminal` vmshell tab) did not open ({ctx})"
-                        )
+                    vmshell_tgt = self.wait_for_cdp_target(
+                        lambda x: "chrome-untrusted://terminal/html/terminal.html?command=vmshell"
+                        in x.get("url", ""),
+                        operation="wait_for_target(Terminal-App-Initial vmshell)",
+                        target_label="Terminal-App-Initial",
+                        target_url="chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+                        timeout=45.0,
+                        interval=0.5,
+                        err_prefix=(
+                            f"`chrome://crostini-installer` closed after {elapsed:.1f}s "
+                            f"(last progress: {last_status.get('installing')!r}), but the ChromeOS "
+                            "Terminal app (`chrome-untrusted://terminal` vmshell tab) did not open"
+                        ),
+                    )
                     log(
                         f"  `chrome://crostini-installer` completed and closed in {elapsed:.1f}s "
                         f"(last progress: {last_status.get('installing')!r}, "
@@ -5923,43 +4075,19 @@ dbus-send --system --type=method_call --print-reply \
     def _open_fresh_terminal_from_home(self, old_target_ids: set[str]) -> CroshTab:
         """Clicks `penguin` in `chrome-untrusted://terminal/html/terminal.html#home` to launch a fresh Terminal tab."""
         self.set_step("step3:relaunch_fresh_terminal_from_home")
-        home_find_timeout = 15.0
-        t_home0 = time.monotonic()
-        home_tgt: dict | None = None
-        while time.monotonic() - t_home0 < home_find_timeout:
-            for tgt in self.list_cdp_targets():
-                if (
-                    "chrome-untrusted://terminal/html/terminal.html#home" in tgt.get("url", "")
-                    and "webSocketDebuggerUrl" in tgt
-                ):
-                    home_tgt = tgt
-                    break
-            if home_tgt is not None:
-                break
-            time.sleep(0.4)
-        if home_tgt is None:
-            ctx = format_cdp_error_context(
-                operation="find_target(Terminal-Home #home)",
-                target_label="Terminal-Home",
-                target_url="chrome-untrusted://terminal/html/terminal.html#home",
-                target_id="<missing>",
-                step=self.get_step(),
-                elapsed_sec=time.monotonic() - t_home0,
-                timeout_sec=home_find_timeout,
-            )
-            raise CDPTimeoutError(
-                f"Could not find `chrome-untrusted://terminal/html/terminal.html#home` target to relaunch Terminal ({ctx})"
-            )
-        home_conn = CDPConnection.from_target(
-            home_tgt, label="Terminal-Home", step_getter=self.get_step
+        home_conn = self.connect_cdp_target(
+            lambda tgt: "chrome-untrusted://terminal/html/terminal.html#home" in tgt.get("url", ""),
+            operation="find_target(Terminal-Home #home)",
+            target_label="Terminal-Home",
+            target_url="chrome-untrusted://terminal/html/terminal.html#home",
+            target_id="<missing>",
+            timeout=15.0,
+            interval=0.4,
+            err_prefix="Could not find `chrome-untrusted://terminal/html/terminal.html#home` target to relaunch Terminal",
         )
         try:
-            click_timeout = 30.0
-            t_clk0 = time.monotonic()
-            click_res: Any = None
-            while time.monotonic() - t_clk0 < click_timeout:
-                click_res = home_conn.eval_js(
-                    """(() => {
+            click_res = home_conn.poll_js(
+                """(() => {
                     const app = document.querySelector('terminal-home-app');
                     if (!app || !app.shadowRoot) return 'no-app';
                     const links = Array.from(app.shadowRoot.querySelectorAll('a[href*="command=vmshell"]'));
@@ -5968,55 +4096,69 @@ dbus-send --system --type=method_call --print-reply \
                     links[0].click();
                     return 'CLICKED:' + href;
                 })()""",
-                    op_desc="Terminal-Home:click_penguin_vmshell",
-                )
-                if isinstance(click_res, str) and click_res.startswith("CLICKED:"):
-                    log(f"  [Terminal-Home] Launched fresh Terminal tab via `{click_res}`")
-                    break
-                time.sleep(0.5)
-            else:
-                ctx = home_conn._ctx(
-                    "Terminal-Home:click_penguin_vmshell",
-                    time.monotonic() - t_clk0,
-                    click_timeout,
-                )
-                raise CDPTimeoutError(
-                    f"Failed to click penguin container in Terminal Home ({ctx}; last state={click_res!r})"
-                )
+                lambda val: isinstance(val, str) and val.startswith("CLICKED:"),
+                op_desc="Terminal-Home:click_penguin_vmshell",
+                timeout=30.0,
+            )
+            log(f"  [Terminal-Home] Launched fresh Terminal tab via `{click_res}`")
         finally:
             home_conn.close()
 
-        fresh_attach_timeout = 45.0
-        t_fatt0 = time.monotonic()
-        deadline = t_fatt0 + fresh_attach_timeout
-        while time.monotonic() < deadline:
-            for tgt in self.list_cdp_targets():
-                tid = tgt.get("id", "")
-                if (
-                    tid not in old_target_ids
-                    and "chrome-untrusted://terminal/html/terminal.html?command=vmshell" in tgt.get("url", "")
-                    and "webSocketDebuggerUrl" in tgt
-                ):
-                    log(f"  Attached to fresh Terminal vmshell tab (target={tid})")
-                    return CroshTab(
-                        "Terminal-App-Fresh",
-                        CDPConnection.from_target(
-                            tgt, label="Terminal-App-Fresh", step_getter=self.get_step
-                        ),
-                    )
-            time.sleep(0.4)
-        ctx = format_cdp_error_context(
+        fresh_tgt = self.wait_for_cdp_target(
+            lambda tgt: (
+                tgt.get("id", "") not in old_target_ids
+                and "chrome-untrusted://terminal/html/terminal.html?command=vmshell" in tgt.get("url", "")
+            ),
             operation="wait_for_target(Terminal-App-Fresh vmshell)",
             target_label="Terminal-App-Fresh",
             target_url="chrome-untrusted://terminal/html/terminal.html?command=vmshell",
-            target_id="<pending>",
-            step=self.get_step(),
-            elapsed_sec=time.monotonic() - t_fatt0,
-            timeout_sec=fresh_attach_timeout,
+            timeout=45.0,
+            interval=0.4,
+            err_prefix="Timed out waiting for fresh Terminal vmshell tab after clicking penguin in Terminal Home",
         )
-        raise CDPTimeoutError(
-            f"Timed out waiting for fresh Terminal vmshell tab after clicking penguin in Terminal Home ({ctx})"
+        log(f"  Attached to fresh Terminal vmshell tab (target={fresh_tgt.get('id')})")
+        return CroshTab(
+            "Terminal-App-Fresh",
+            CDPConnection.from_target(
+                fresh_tgt, label="Terminal-App-Fresh", step_getter=self.get_step
+            ),
         )
+
+    def _observe_terminal_until_prompt_or_error(
+        self,
+        tab: CroshTab,
+        username: str,
+        timeline: InitTimelineRecorder,
+        *,
+        timeout: float,
+        first_output_event: str,
+        log_first_output: bool = False,
+    ) -> tuple[str, str]:
+        """Polls `tab` until prompt (`'prompt'`), vmshell error (`'error'`), or deadline (`'timeout'`)."""
+        deadline = time.monotonic() + timeout
+        first_output_logged = False
+        last_txt = ""
+        while time.monotonic() < deadline:
+            timeline.check_no_fatal_error()
+            txt = tab.get_text()
+            last_txt = txt
+            if not first_output_logged and txt.strip():
+                first_output_logged = True
+                first_ln = txt.strip().splitlines()[0][:140]
+                fo_rel = timeline.record_ui(first_output_event, first_ln)
+                if log_first_output:
+                    log(f"  [{tab.label}] First output at t+{fo_rel:.1f}s: {first_ln}")
+            if f"[{username}@" in txt and txt.rstrip().endswith("$"):
+                return "prompt", txt
+            if (
+                txt.strip() == KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR
+                or "Launching vmshell failed:" in txt
+                or "[process exited" in txt
+                or "ERROR vsh:" in txt
+            ):
+                return "error", txt
+            time.sleep(0.5)
+        return "timeout", last_txt
 
     def verify_terminal_app_with_readiness_gate(
         self,
@@ -6039,31 +4181,15 @@ dbus-send --system --type=method_call --print-reply \
         active_tab: CroshTab | None = None
         try:
             log("  Observing installer-opened ChromeOS Terminal app window...")
-            obs_deadline = time.monotonic() + 120.0
-            initial_reached_prompt = False
-            initial_first_output_logged = False
-            initial_final_buffer = ""
-            while time.monotonic() < obs_deadline:
-                timeline.check_no_fatal_error()
-                txt = initial_tab.get_text()
-                initial_final_buffer = txt
-                if not initial_first_output_logged and txt.strip():
-                    initial_first_output_logged = True
-                    first_ln = txt.strip().splitlines()[0][:140]
-                    timeline.record_ui("InitialTerminalFirstOutput", first_ln)
-                if f"[{username}@" in txt and txt.rstrip().endswith("$"):
-                    initial_reached_prompt = True
-                    break
-                if (
-                    txt.strip() == KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR
-                    or "Launching vmshell failed:" in txt
-                    or "[process exited" in txt
-                    or "ERROR vsh:" in txt
-                ):
-                    break
-                time.sleep(0.5)
+            outcome, initial_final_buffer = self._observe_terminal_until_prompt_or_error(
+                initial_tab,
+                username,
+                timeline,
+                timeout=120.0,
+                first_output_event="InitialTerminalFirstOutput",
+            )
 
-            if initial_reached_prompt:
+            if outcome == "prompt":
                 # Ensure ContainerStarted is also recorded on the timeline
                 self.set_step("step3:wait_container_started")
                 cs_rel = timeline.wait_for_container_started(timeout=60.0)
@@ -6117,34 +4243,24 @@ dbus-send --system --type=method_call --print-reply \
                     self.set_step("step3:observe_fresh_terminal")
                     fresh_timeout = 180.0
                     t_fresh0 = time.monotonic()
-                    fresh_deadline = t_fresh0 + fresh_timeout
-                    fresh_first_output_logged = False
-                    last_ftxt = ""
-                    while time.monotonic() < fresh_deadline:
-                        timeline.check_no_fatal_error()
-                        ftxt = fresh_tab.get_text()
-                        last_ftxt = ftxt
-                        if not fresh_first_output_logged and ftxt.strip():
-                            fresh_first_output_logged = True
-                            first_ln = ftxt.strip().splitlines()[0][:140]
-                            fo_rel = timeline.record_ui("FreshTerminalFirstOutput", first_ln)
-                            log(f"  [Terminal-App-Fresh] First output at t+{fo_rel:.1f}s: {first_ln}")
-                        if f"[{username}@" in ftxt and ftxt.rstrip().endswith("$"):
-                            pr_rel = timeline.record_ui(
-                                "FreshTerminalPromptReached",
-                                f"reached prompt [{username}@penguin]$",
-                            )
-                            log(f"  [Terminal-App-Fresh] Reached prompt at t+{pr_rel:.1f}s.")
-                            break
-                        if (
-                            "Launching vmshell failed:" in ftxt
-                            or "[process exited" in ftxt
-                            or "ERROR vsh:" in ftxt
-                        ):
-                            raise RuntimeError(
-                                "Fresh Terminal tab failed even after ContainerStarted:\n" + ftxt
-                            )
-                        time.sleep(0.5)
+                    f_outcome, last_ftxt = self._observe_terminal_until_prompt_or_error(
+                        fresh_tab,
+                        username,
+                        timeline,
+                        timeout=fresh_timeout,
+                        first_output_event="FreshTerminalFirstOutput",
+                        log_first_output=True,
+                    )
+                    if f_outcome == "prompt":
+                        pr_rel = timeline.record_ui(
+                            "FreshTerminalPromptReached",
+                            f"reached prompt [{username}@penguin]$",
+                        )
+                        log(f"  [Terminal-App-Fresh] Reached prompt at t+{pr_rel:.1f}s.")
+                    elif f_outcome == "error":
+                        raise RuntimeError(
+                            "Fresh Terminal tab failed even after ContainerStarted:\n" + last_ftxt
+                        )
                     else:
                         ctx = fresh_tab.conn._ctx(
                             "Terminal-App-Fresh:wait_for_shell_prompt",
@@ -6244,7 +4360,7 @@ dbus-send --system --type=method_call --print-reply \
             log("Step 2: Starting passive D-Bus init timeline monitor & driving ChromeOS Settings UI...")
             timeline.start()
             initial_vmshell_tgt = self.run_settings_crostini_installer_ui(
-                username=username, timeline=timeline, throttler=throttler
+                username=username, timeline=timeline
             )
 
             log("Step 3: Verifying ChromeOS Terminal app (`chrome-untrusted://terminal`) gated on `ContainerStarted`...")
@@ -6293,12 +4409,8 @@ dbus-send --system --type=method_call --print-reply \
             throttler.stop()
             crosh.close()
             if not failed:
-                self.ssh(
-                    f"sudo -u chronos CROS_USER_ID_HASH={h} VMC_NONINTERACTIVE=1 vmc stop termina"
-                )
-                self.ssh(
-                    f"sudo -u chronos CROS_USER_ID_HASH={h} VMC_NONINTERACTIVE=1 vmc destroy termina"
-                )
+                self.vmc("stop", "termina")
+                self.vmc("destroy", "termina")
         log("=== Flow (`termina`) PASSED ===")
 
 

@@ -51,10 +51,11 @@ jobs:
         with:
           version: "0.13.6"
 
-      - name: Sync locked Python test dependencies and run offline self-test
+      - name: Sync locked Python test dependencies and run offline unit tests
         run: |
           set -euo pipefail
           uv sync --locked
+          uv run --locked python3 -m unittest discover -s tests -p 'test_*.py' -v
           uv run --locked scripts/test_user_flows.py --self-test
 
       - name: Download built image artifact from workflow run
