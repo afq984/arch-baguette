@@ -1,0 +1,91 @@
+# End-to-end verification of the documented user setup flow in a nested-KVM
+# ChromiumOS VM (board and release pinned in `scripts/protos/metadata.json`):
+#   - `termina` VM creation in `crosh` + official ChromeOS Settings Linux UI installer + `vsh termina penguin`
+name: test-user-flows
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: 'Workflow run artifact name containing baguette_arch_rootfs.img.zst (from build-image)'
+        type: string
+        required: false
+        default: ''
+      baguette_release:
+        description: 'arch-baguette release tag to download when artifact_name is empty'
+        type: string
+        required: false
+        default: 'latest'
+  workflow_dispatch:
+    inputs:
+      baguette_release:
+        description: 'arch-baguette release tag to test (when run via workflow_dispatch)'
+        type: string
+        default: 'latest'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-user-flows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Reclaim runner disk space and install host dependencies
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            qemu-system-x86 qemu-utils gdisk parted openssh-client curl xz-utils zstd \
+            python3
+          sudo chmod 0666 /dev/kvm
+          df -h /
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.6"
+
+      - name: Sync locked Python test dependencies and run offline self-test
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          uv run --locked scripts/test_user_flows.py --self-test
+
+      - name: Download built image artifact from workflow run
+        if: inputs.artifact_name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: out/image
+
+      - name: Fetch baguette_arch_rootfs.img.zst from GitHub Releases
+        if: inputs.artifact_name == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.baguette_release || 'latest' }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/image
+          gh release download "${TAG}" \
+            --repo "${GH_REPO}" \
+            --pattern 'baguette_arch_rootfs.img.zst*' \
+            --dir out/image
+
+      - name: Verify image SHA256
+        run: |
+          set -euo pipefail
+          cd out/image
+          sha256sum -c baguette_arch_rootfs.img.zst.sha256
+
+      - name: Run Python E2E test of ChromeOS UI user setup flow
+        run: |
+          uv run --locked scripts/test_user_flows.py \
+            --baguette-image out/image/baguette_arch_rootfs.img.zst \
+            --cache-dir "${RUNNER_TEMP}/cros-vm-cache"

@@ -1,10 +1,13 @@
-# Build (and on main: release) the Baguette image.
+# Build (and on main: E2E-verify and release) the Baguette image.
 #
-#   PRs touching image/**:  --fast build, workflow artifacts only.
+#   PRs touching image/**, E2E test scripts/workflows, or README.md:
+#     --fast build, verify, and run nested-KVM ChromeOS E2E user-flow tests;
+#     workflow artifacts only.
 #   weekly cron / dispatch / after a successful packages publish on main:
 #     full production (userless) build baking the published signed
-#     [baguette] repo URL, released to a dated tag vYYYY.MM.DD(.N) and
-#     mirrored to the rolling `latest` release.
+#     [baguette] repo URL, E2E user-flow verification in a nested-KVM
+#     ChromiumOS VM, and release to a dated tag vYYYY.MM.DD(.N) mirrored to
+#     the rolling `latest` release.
 #
 # Hermetic: job 1 builds the packages from THIS checkout and job 2 builds
 # the image against that freshly-built repo — never against the published
@@ -27,6 +30,10 @@ on:
         description: 'zstd compression level (1..22)'
         type: string
         default: '19'
+      skip_e2e:
+        description: 'Skip nested-KVM E2E user-flow test before publishing (manual bypass)'
+        type: boolean
+        default: false
   workflow_run:
     workflows: [packages]
     types: [completed]
@@ -34,7 +41,13 @@ on:
   pull_request:
     paths:
       - 'image/**'
+      - 'scripts/test_user_flows.py'
+      - 'scripts/protos/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'README.md'
       - .github/workflows/image.yaml
+      - .github/workflows/test-user-flows.yaml
 
 # Default: read-only. Only the publish job gets contents: write.
 permissions:
@@ -220,16 +233,33 @@ jobs:
           path: out/image/
           if-no-files-found: error
 
+  test-user-flows:
+    needs: build-image
+    if: >-
+      (inputs.flavor || 'prod') != 'dev' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.skip_e2e)
+    uses: ./.github/workflows/test-user-flows.yaml
+    with:
+      artifact_name: image-${{ inputs.flavor || 'prod' }}
+
   publish:
     name: Publish dated release + rolling latest
-    needs: build-image
+    needs: [build-image, test-user-flows]
     # main only, never for PRs, never for the dev flavor (baked credentials
     # must not reach Releases). schedule/workflow_run always run on main.
+    # Hard-gated on test-user-flows succeeding, unless deliberately bypassed
+    # via workflow_dispatch input skip_e2e=true.
     if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_run' ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.ref == 'refs/heads/main' && inputs.flavor != 'dev')
+      always() &&
+      needs.build-image.result == 'success' &&
+      (needs.test-user-flows.result == 'success' ||
+       (needs.test-user-flows.result == 'skipped' &&
+        github.event_name == 'workflow_dispatch' &&
+        inputs.skip_e2e)) &&
+      (github.event_name == 'schedule' ||
+       github.event_name == 'workflow_run' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' && inputs.flavor != 'dev'))
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -268,12 +298,11 @@ jobs:
 
           sha256: \`${sha}\`
 
-          Create the VM from crosh (see README.md for details):
+          Create the \`termina\` VM disk from crosh, then click **Set up** under **ChromeOS Settings** › **About ChromeOS** › **Developers** › **Linux development environment** (see README.md for details):
           \`\`\`
           vmc create --vm-type BAGUETTE --size 10G \\
             --source /home/chronos/user/MyFiles/Downloads/baguette_arch_rootfs.img.zst \\
-            arch
-          vmc start --vm-type BAGUETTE arch
+            termina
           \`\`\`"
 
           gh release create "${tag}" \
