@@ -16,6 +16,8 @@
 name: packages
 
 on:
+  # The main-branch path filter only limits re-signing and re-publishing the
+  # repo; it does not skip any PR test (PRs always run the build + namcap).
   push:
     branches: [main]
     paths:
@@ -23,10 +25,6 @@ on:
       - scripts/build-repo.sh
       - .github/workflows/packages.yaml
   pull_request:
-    paths:
-      - 'packages/**'
-      - scripts/build-repo.sh
-      - .github/workflows/packages.yaml
   workflow_dispatch:
 
 # Default: read-only. Only the publish job gets contents: write.

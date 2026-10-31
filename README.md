@@ -142,8 +142,8 @@ release builds are what CI does: no `--dev-user`, default `zstd -19`, plus
 
 | workflow | what it does |
 |---|---|
-| `packages.yaml` | PRs: build + namcap, unsigned artifact. Main: sign packages + db and publish the flat repo to the rolling `repo-x86_64` release. |
-| `image.yaml` | PRs touching `image/**`, `scripts/test_user_flows.py`, `scripts/protos/**`, `pyproject.toml`, `uv.lock`, `.github/workflows/test-user-flows.yaml`, or `README.md`: `--fast` build + verify, then runs `test-user-flows.yaml` against the built artifact. Weekly cron / dispatch / after each `packages` publish on `main`: hermetic rebuild (fresh packages → image), verify, hard-gated on `test-user-flows.yaml` (bypassable on manual `workflow_dispatch` via `skip_e2e: true`), and release to dated `vYYYY.MM.DD` + rolling `latest`. |
+| `packages.yaml` | Every PR: build + namcap, unsigned artifact. Main: sign packages + db and publish the flat repo to the rolling `repo-x86_64` release. |
+| `image.yaml` | Every PR (no path filter): `--fast` build + verify, then runs `test-user-flows.yaml` against the built artifact. Weekly cron / dispatch / after each `packages` publish on `main`: hermetic rebuild (fresh packages → image), verify, hard-gated on `test-user-flows.yaml` (bypassable on manual `workflow_dispatch` via `skip_e2e: true`), and release to dated `vYYYY.MM.DD` + rolling `latest`. |
 | `test-user-flows.yaml` | Reusable workflow (`workflow_call`) + manual `workflow_dispatch`: runs the offline README/proto self-test (`--self-test`), boots a nested-KVM ChromiumOS VM (board and release pinned in `scripts/protos/metadata.json`), and drives the `termina` + ChromeOS Settings UI setup flow, the ChromeOS Terminal app (`chrome-untrusted://terminal`), and `crosh` shell entry (`vsh termina penguin`) gated on `VmCicerone.ContainerStarted`. |
 | `uprev.yaml` | Daily: if cros-container-guest-tools main moved past the PKGBUILD pin, opens a PR bumping `_commit`/`pkgver` (pkgrel reset to 1). |
 

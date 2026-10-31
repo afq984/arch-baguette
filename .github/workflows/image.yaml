@@ -1,6 +1,8 @@
 # Build (and on main: E2E-verify and release) the Baguette image.
 #
-#   PRs touching image/**, E2E test scripts/workflows, or README.md:
+#   every PR (no path filter: packages, build scripts, the image, the E2E
+#   test and the README it reads can all change what ships or what is
+#   tested, so no change is presumed safe to skip):
 #     --fast build, verify, and run nested-KVM ChromeOS E2E user-flow tests;
 #     workflow artifacts only.
 #   weekly cron / dispatch / after a successful packages publish on main:
@@ -39,15 +41,6 @@ on:
     types: [completed]
     branches: [main]
   pull_request:
-    paths:
-      - 'image/**'
-      - 'scripts/test_user_flows.py'
-      - 'scripts/protos/**'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - 'README.md'
-      - .github/workflows/image.yaml
-      - .github/workflows/test-user-flows.yaml
 
 # Default: read-only. Only the publish job gets contents: write.
 permissions:
