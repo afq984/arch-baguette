@@ -2122,8 +2122,9 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
             self.assertTrue(first_line)
             (fp / "uptime").write_text("145.00 500.00\n", encoding="utf-8")
             _write_proc(fp, 4338, "chrome", 550, 600, b"/opt/google/chrome/chrome\x00--type=renderer\x00")
-            loop_proc.stdin.close()
-            out_rest, err_rest = loop_proc.communicate(timeout=5.0)
+            # communicate(input="") closes stdin (EOF) itself; closing it manually first makes
+            # Python 3.12's communicate() fail flushing the already-closed pipe.
+            out_rest, err_rest = loop_proc.communicate(input="", timeout=5.0)
             self.assertEqual(loop_proc.returncode, 0, err_rest)
             final_obj = json.loads(out_rest.strip().splitlines()[-1])
             self.assertGreater(final_obj["proc_dt_sec"], 0.0)
