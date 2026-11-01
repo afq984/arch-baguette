@@ -3,8 +3,12 @@
 # ChromeOS Baguette guest glue. Content parity source of truth:
 # platform2/vm_tools/baguette_image/src/data/ (official Debian image data).
 # Files are byte-identical to the official ones except where noted:
-#   - first-boot-cros{,.service}: /usr/local/bin -> /usr/lib/baguette,
-#     dpkg-reconfigure openssh-server -> ssh-keygen -A, fail-loud semantics.
+#   - first-boot-cros{,.service}: /usr/local/bin -> /usr/lib/baguette, ordered
+#     Before=maitred.service with `systemctl --no-reload disable`, fail-loud
+#     `btrfs filesystem resize max /` + `rm -fv /etc/ssh/ssh_host_*` (omits
+#     full-system `sync` and `dpkg-reconfigure openssh-server` / `ssh-keygen -A`,
+#     relying on Arch's `sshdgenkeys.service` on demand if `sshd` is enabled, so
+#     first boot never contends with maitred's 20 s SetUpUser deadline).
 #   - update-cros-list{,.service} is NOT ported: it rewrites the apt
 #     sources.list milestone, which has no pacman equivalent (repo updates
 #     come via pacman -Syu of the [baguette] repo instead).
@@ -33,7 +37,7 @@
 
 pkgname=baguette-base
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='ChromeOS Baguette guest integration glue (maitred/vshd units, contract groups, sudoers, /mnt layout)'
 arch=('any')
 url='https://chromium.googlesource.com/chromiumos/platform2/+/HEAD/vm_tools/baguette_image/'
@@ -64,7 +68,7 @@ package() {
   install -Dm644 50-baguette.preset \
     -t "$pkgdir/usr/lib/systemd/system-preset/"
 
-  # First-boot helper (btrfs grow + ssh host key regeneration).
+  # First-boot helper (btrfs grow + scrub any baked ssh host keys).
   install -Dm755 first-boot-cros "$pkgdir/usr/lib/baguette/first-boot-cros"
 
   # maitred config is read from /etc (matches the official image).

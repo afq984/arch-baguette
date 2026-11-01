@@ -2,20 +2,23 @@
 # Arch adaptation of the official Baguette first-boot script
 # (platform2/vm_tools/baguette_image/src/data/usr/local/bin/first-boot-cros).
 #
-# Grows the root filesystem to the full disk concierge allocated, then
-# regenerates the ssh host keys so every VM instance gets unique keys.
+# Grows the shrunk root btrfs filesystem to the full disk concierge allocated
+# and removes any baked ssh host keys so no two VM instances can share keys.
 # Errors fail loud (no blanket `|| true`): the unit logs to journal+console.
+#
+# Deliberately omits full-system `sync` and eager `ssh-keygen -A`:
+#   - `sshd.service` is disabled by default (`openssh` is installed for
+#     `sftp-server`), and Arch's `openssh` ships `sshdgenkeys.service`
+#     (`Wants=`/`After=` on both `sshd.service` and `sshd@.service`) to
+#     generate unique host keys on demand if a user enables SSH.
+#   - Running `ssh-keygen -A` and full-system `sync` on first boot contended
+#     with `maitred`'s 20 s `SetUpUser` gRPC deadline on slow nested-KVM
+#     runners; `btrfs filesystem resize max /` alone is a fast online metadata
+#     update ordered `Before=maitred.service`.
 set -euo pipefail
 
 btrfs filesystem resize max /
-sync
 
-# The image is built without ssh host keys; `-f` keeps the rm idempotent
-# when there is nothing to delete. Debian runs `dpkg-reconfigure
-# openssh-server` here; `ssh-keygen -A` is the Arch equivalent, run only if
-# openssh is actually installed.
+# The production image is built without ssh host keys; `-f` keeps the rm
+# idempotent when there is nothing to delete while still scrubbing custom builds.
 rm -fv /etc/ssh/ssh_host_*
-if command -v ssh-keygen >/dev/null; then
-  ssh-keygen -A
-fi
-sync

@@ -129,7 +129,7 @@ scripts/deploy-test.sh                   # boot it in the nested ChromeOS rig
 
 # End-to-end ChromeOS UI + crosh user-flow verification:
 uv sync --locked
-uv run --locked scripts/test_user_flows.py --self-test
+uv run --locked python3 -m unittest discover -s tests -p 'test_*.py' -v
 uv run --locked scripts/test_user_flows.py --baguette-image out/image/baguette_arch_rootfs.img.zst
 ```
 
@@ -144,7 +144,7 @@ release builds are what CI does: no `--dev-user`, default `zstd -19`, plus
 |---|---|
 | `packages.yaml` | Every PR: build + namcap, unsigned artifact. Main: sign packages + db and publish the flat repo to the rolling `repo-x86_64` release. |
 | `image.yaml` | Every PR (no path filter): `--fast` build + verify, then runs `test-user-flows.yaml` against the built artifact. Weekly cron / dispatch / after each `packages` publish on `main`: hermetic rebuild (fresh packages → image), verify, hard-gated on `test-user-flows.yaml` (bypassable on manual `workflow_dispatch` via `skip_e2e: true`), and release to dated `vYYYY.MM.DD` + rolling `latest`. |
-| `test-user-flows.yaml` | Reusable workflow (`workflow_call`) + manual `workflow_dispatch`: runs the offline README/proto self-test (`--self-test`), boots a nested-KVM ChromiumOS VM (board and release pinned in `scripts/protos/metadata.json`), and drives the `termina` + ChromeOS Settings UI setup flow, the ChromeOS Terminal app (`chrome-untrusted://terminal`), and `crosh` shell entry (`vsh termina penguin`) gated on `VmCicerone.ContainerStarted`. |
+| `test-user-flows.yaml` | Reusable workflow (`workflow_call`) + manual `workflow_dispatch`: runs the offline unit test suite (`tests/test_user_flows_unit.py`), boots a nested-KVM ChromiumOS VM (board and release pinned in `scripts/protos/metadata.json`), and drives the `termina` + ChromeOS Settings UI setup flow, the ChromeOS Terminal app (`chrome-untrusted://terminal`), and `crosh` shell entry (`vsh termina penguin`) gated on `VmCicerone.ContainerStarted`. |
 | `uprev.yaml` | Daily: if cros-container-guest-tools main moved past the PKGBUILD pin, opens a PR bumping `_commit`/`pkgver` (pkgrel reset to 1). |
 
 First-time signing/bootstrap setup: see [keys/README.md](keys/README.md).
@@ -159,6 +159,7 @@ First-time signing/bootstrap setup: see [keys/README.md](keys/README.md).
   ChromeOS rig deploy/boot-test), `test_user_flows.py` + `scripts/protos/`
   (automated ChromeOS UI/crosh E2E user-flow test and vendored ChromiumOS D-Bus
   `.proto` schemas pinned to the test image release)
+- `tests/` — offline `unittest` suite (`test_user_flows_unit.py`)
 - `pyproject.toml`, `uv.lock` — hash-locked Python test dependencies (`uv`)
 - `keys/` — repo signing public key + key management docs
 - `out/`, `build/` — build products (gitignored)

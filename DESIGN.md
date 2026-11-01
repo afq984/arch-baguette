@@ -88,8 +88,12 @@ arch-baguette-v2/
 │       └── verify-image.sh      # image-level asserts (guestfish/btrfs inspect)
 ├── scripts/
 │   ├── build-repo.sh            # makepkg all packages → out/repo (repo-add)
-│   └── deploy-test.sh           # push image into the nested ChromeOS rig
-├── .github/workflows/           # packages.yaml, image.yaml, uprev.yaml (phase D)
+│   ├── deploy-test.sh           # push image into the nested ChromeOS rig
+│   ├── test_user_flows.py       # nested-KVM ChromeOS UI + crosh E2E user-flow test
+│   └── protos/                  # SHA-256-pinned ChromiumOS D-Bus .proto schemas
+├── tests/
+│   └── test_user_flows_unit.py  # offline stdlib unittest suite for test_user_flows.py
+├── .github/workflows/           # packages.yaml, image.yaml, test-user-flows.yaml, uprev.yaml
 └── out/                         # build products (gitignored)
     ├── packages/                # *.pkg.tar.zst
     ├── repo/                    # baguette.db + packages (local pacman repo)
@@ -122,11 +126,13 @@ Debian data files) and the units written inline by
 `/home/r/baguette/arch-baguette/build-arch-baguette.sh`. Ships:
 
 - `maitred.service`, `vshd.service`, `opt-google-cros\x2dcontainers.mount`
-  (What=LABEL=cros-vm-tools, ro), `first-boot-cros.service` +
-  `/usr/lib/baguette/first-boot-cros` script (btrfs resize max /, regenerate
-  ssh host keys **without** `|| true` blanket — fail loud, but ssh-keygen only
-  if openssh present), all byte-equivalent to official semantics adapted to
-  Arch paths.
+  (What=LABEL=cros-vm-tools, ro), `first-boot-cros.service` (ordered
+  `Before=maitred.service`, self-disables via `systemctl --no-reload disable`)
+  + `/usr/lib/baguette/first-boot-cros` script (`btrfs filesystem resize max /`
+  + `rm -fv /etc/ssh/ssh_host_*` **without** `|| true` blanket — fail loud;
+  omits full-system `sync` and eager `ssh-keygen -A`, relying on Arch's
+  `sshdgenkeys.service` on demand if `sshd` is enabled so first boot finishes
+  before `maitred`'s 20 s `SetUpUser` deadline), adapted to Arch paths.
 - `/etc/maitred/50-mount-fonts.textproto` (maitred config is read from /etc —
   exception to the vendor-dir rule, matches official).
 - `sysusers.d/baguette.conf`: `g cdrom`, `g dialout`, `g netdev`, `g plugdev`,
@@ -203,7 +209,11 @@ this repo. Requirements:
 - `image/tests/verify-rootfs.sh <rootfs-dir>`: userns-chroot asserts —
   all 11 contract groups resolve; `/usr/sbin/useradd` resolves; enabled units
   (system + user wants-symlinks) present; `/etc/machine-id` empty; no
-  `ssh_host_*`; no passwd entries uid ≥ 1000 (unless --dev-user build);
+  `ssh_host_*` (`sshd.service` + `sshdgenkeys.service` disabled by default,
+  `sshdgenkeys.service` present for on-demand host key generation);
+  `first-boot-cros` grows `/` and scrubs `ssh_host_*` without `ssh-keygen` or
+  `sync`, ordered `Before=maitred.service` with `--no-reload` self-disable;
+  no passwd entries uid ≥ 1000 (unless --dev-user build);
   sudoers file mode 0440 & visudo-parses; `/mnt` layout; empty pacman cache;
   profile.d files present; sommelier symlinks dangling-but-correct.
 - `image/tests/verify-image.sh <img>`: btrfs check; default subvol is
@@ -215,6 +225,18 @@ this repo. Requirements:
   a VM named `v2test` by default (NEVER touch `baguette` (stock) or the
   rig-owned `archtest`), captures os-release / is-system-running / df / id
   evidence.
+- `scripts/test_user_flows.py` + `scripts/protos/`: automated nested-KVM
+  ChromiumOS E2E test driving the documented `README.md` `termina` + ChromeOS
+  Settings Linux installer flow over CDP, gating Terminal readiness on
+  `VmCicerone.ContainerStarted` (validated against vendored SHA-256-pinned
+  `.proto` schemas matching `/etc/lsb-release`), verifying `vsh termina penguin`
+  re-entry, guest UID/GID `1000`, the 10 `SetUpUser` supplementary groups, and
+  active `cros-garcon.service`, and recording passive D-Bus/UMA/resource/guest
+  diagnostics.
+- `tests/test_user_flows_unit.py`: offline stdlib `unittest` suite covering
+  `README.md` command extraction, vendored `.proto` digests and strict wire
+  decoding, D-Bus/CDP parsers, slow-runner error-50 classification, and
+  resource/guest diagnostics.
 
 ## CI (phase D — GitHub Actions)
 

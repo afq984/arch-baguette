@@ -301,8 +301,9 @@ if [ -n "${DEV_USER:-}" ]; then
     touch "/var/lib/systemd/linger/${DEV_USER}"
 fi
 
-# Production defaults: no ssh host keys (first-boot-cros regenerates), empty
-# machine-id (first boot initializes). Keep these LAST.
+# Production defaults: no ssh host keys (sshdgenkeys.service generates on
+# demand if sshd is enabled), empty machine-id (first boot initializes).
+# Keep these LAST.
 rm -f /etc/ssh/ssh_host_*
 : > /etc/machine-id
 CONFEOF
