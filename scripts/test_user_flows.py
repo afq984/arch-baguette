@@ -15,6 +15,7 @@ import calendar
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -1285,6 +1286,14 @@ class PsiResource:
 
 
 @dataclasses.dataclass(frozen=True)
+class CrosTopProc:
+    pid: int
+    comm: str
+    hint: str
+    ticks: int
+
+
+@dataclasses.dataclass(frozen=True)
 class CrosResourceSample:
     mono_ts: float
     rel_sec: float
@@ -1305,6 +1314,8 @@ class CrosResourceSample:
     host_cpu: CpuStatCounters
     host_load1: float
     host_mem_avail_mib: float
+    proc_dt_sec: float = 0.0
+    top_procs: tuple[CrosTopProc, ...] = ()
 
 
 # Read-only ChromeOS VM JSONL resource snapshot script executed via `python3 -u` over SSH
@@ -1312,41 +1323,145 @@ class CrosResourceSample:
 _CROS_RESOURCE_PY_SCRIPT = r"""
 import json, os, sys, time
 
+PROC = os.environ.get("CROS_RES_PROC_ROOT", "/proc")
 NPROC = os.cpu_count() or 1
 CLK_TCK = int(os.sysconf("SC_CLK_TCK"))
+SELF_PID = os.getpid()
 MEM_KEYS = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty", "Writeback"}
+_prev_uptime = None
+_prev_procs = None
+_cl_cache = {}
+
+def _clean(s: str, limit: int) -> str:
+    return " ".join("".join(c if 32 <= ord(c) < 127 else " " for c in s).split())[:limit]
+
+def _parse_cl(pid: int, raw_cl: bytes) -> tuple[bool, str, str]:
+    if pid == SELF_PID:
+        return False, "cros_res_sampler", ""
+    if not raw_cl:
+        return False, "kthread", ""
+    first_chunk = raw_cl.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    args = (
+        first_chunk.split()
+        if " --" in first_chunk
+        else [a.decode("utf-8", "replace") for a in raw_cl.split(b"\x00") if a]
+    )
+    if not args:
+        return False, "", ""
+    arg0 = args[0].rsplit("/", 1)[-1]
+    if arg0 == "crosvm":
+        sub = "crosvm"
+        for i, a in enumerate(args[1:], 1):
+            if a in ("run", "device", "devices"):
+                nxt = args[i + 1] if a != "run" and i + 1 < len(args) else ""
+                sub = f"{a}:{nxt}" if nxt and not nxt.startswith("-") else a
+                break
+        return True, _clean(sub, 24), arg0
+    if arg0 == "chrome":
+        ctype = sub = gl = ""
+        ext = False
+        for a in args[1:]:
+            if a.startswith("--type="):
+                ctype = a.split("=", 1)[1]
+            elif a.startswith("--utility-sub-type="):
+                sub = a.split("=", 1)[1].rsplit(".", 1)[-1]
+            elif a == "--extension-process":
+                ext = True
+            elif a.startswith("--use-angle="):
+                gl = a.split("=", 1)[1]
+            elif a.startswith("--use-gl=") and not gl:
+                gl = a.split("=", 1)[1]
+        if not ctype:
+            return False, "browser", arg0
+        tag = sub if ctype == "utility" else ("ext" if ctype == "renderer" and ext else (gl if ctype == "gpu-process" else ""))
+        return False, _clean(f"--type={ctype}({tag})" if tag else f"--type={ctype}", 48), arg0
+    if "base64.b64decode" in " ".join(args[:4]):
+        return False, "cros_res_oneshot", arg0
+    return False, _clean(" ".join(args[1:3]), 48), _clean(arg0, 48)
+
+def _scan_procs(uptime_sec: float) -> tuple[float, list[dict]]:
+    global _prev_uptime, _prev_procs, _cl_cache
+    cur_procs, rows = {}, []
+    for ent in os.listdir(PROC):
+        if not ent.isdigit():
+            continue
+        pid = int(ent)
+        try:
+            with open(f"{PROC}/{ent}/stat", "rb") as f:
+                raw = f.read()
+            lp, rp = raw.find(b"("), raw.rfind(b") ")
+            if lp < 0 or rp < 0:
+                continue
+            comm = _clean(raw[lp + 1 : rp].decode("utf-8", "replace"), 48) or "?"
+            rest = raw[rp + 2 :].split()
+            ticks, st = int(rest[11]) + int(rest[12]), int(rest[19])
+        except (OSError, ValueError, IndexError):
+            continue
+        key = (pid, st)
+        cur_procs[key] = ticks
+        rows.append((key, pid, comm, ticks, st))
+    _cl_cache = {k: _cl_cache[k] for k in cur_procs if k in _cl_cache}
+    if _prev_procs is None or _prev_uptime is None or uptime_sec <= _prev_uptime:
+        _prev_procs, _prev_uptime = cur_procs, uptime_sec
+        return 0.0, []
+    dt_sec = max(1e-4, round(uptime_sec - _prev_uptime, 4))
+    new_floor = max(0, int(_prev_uptime * CLK_TCK) - CLK_TCK)
+    cands, c_subs, c_ticks, c_cnt = [], {}, 0, 0
+    for key, pid, comm, ticks, st in rows:
+        dt = (ticks - _prev_procs[key]) if key in _prev_procs else (ticks if st >= new_floor else 0)
+        if dt <= 0:
+            continue
+        meta = _cl_cache.get(key)
+        if meta is None:
+            try:
+                with open(f"{PROC}/{pid}/cmdline", "rb") as f:
+                    raw_cl = f.read(8192)
+            except OSError:
+                raw_cl = b""
+            meta = _cl_cache[key] = _parse_cl(pid, raw_cl)
+        is_c, cl_hint, arg0 = meta
+        if is_c or comm.startswith("crosvm"):
+            c_ticks += dt
+            c_cnt += 1
+            sub = comm if comm != "crosvm" else (cl_hint or "crosvm")
+            c_subs[sub] = c_subs.get(sub, 0) + dt
+        else:
+            cands.append((dt, pid, comm, cl_hint or (arg0 if arg0 != comm else "")))
+    if c_ticks > 0:
+        subs = ",".join(k for k, _ in sorted(c_subs.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+        cands.append((c_ticks, 0, "crosvm", _clean(f"{c_cnt}p:{subs}" if subs else f"{c_cnt}p", 48)))
+    cands.sort(key=lambda r: (-r[0], r[2], r[1]))
+    _prev_procs, _prev_uptime = cur_procs, uptime_sec
+    return dt_sec, [{"pid": p, "comm": c, "hint": h, "ticks": t} for t, p, c, h in cands[:5]]
 
 def emit_once() -> None:
-    with open("/proc/uptime", "r", encoding="utf-8") as f:
+    with open(f"{PROC}/uptime", "r", encoding="utf-8") as f:
         uptime_sec = float(f.read().split()[0])
-    with open("/proc/loadavg", "r", encoding="utf-8") as f:
+    with open(f"{PROC}/loadavg", "r", encoding="utf-8") as f:
         load1 = float(f.read().split()[0])
-    with open("/proc/stat", "r", encoding="utf-8") as f:
+    with open(f"{PROC}/stat", "r", encoding="utf-8") as f:
         stat_cpu = f.readline().strip()
     psi = {}
     for p in ("cpu", "memory", "io"):
-        pp = f"/proc/pressure/{p}"
+        pp = f"{PROC}/pressure/{p}"
         if os.path.exists(pp):
             with open(pp, "r", encoding="utf-8") as f:
                 psi[p] = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
         else:
             psi[p] = []
     mem = {}
-    with open("/proc/meminfo", "r", encoding="utf-8") as f:
+    with open(f"{PROC}/meminfo", "r", encoding="utf-8") as f:
         for ml in f:
             parts = ml.split()
             if len(parts) >= 2:
                 k = parts[0].rstrip(":")
                 if k in MEM_KEYS:
                     mem[k] = int(parts[1])
+    proc_dt_sec, top_procs = _scan_procs(uptime_sec)
     print(json.dumps({
-        "nproc": NPROC,
-        "clk_tck": CLK_TCK,
-        "uptime_sec": uptime_sec,
-        "load1": load1,
-        "stat_cpu": stat_cpu,
-        "psi": psi,
-        "mem_kib": mem,
+        "nproc": NPROC, "clk_tck": CLK_TCK, "uptime_sec": uptime_sec, "load1": load1,
+        "stat_cpu": stat_cpu, "psi": psi, "mem_kib": mem,
+        "proc_dt_sec": proc_dt_sec, "top_procs": top_procs,
     }), flush=True)
 
 if len(sys.argv) > 1 and sys.argv[1] == "--loop":
@@ -1355,6 +1470,9 @@ if len(sys.argv) > 1 and sys.argv[1] == "--loop":
         emit_once()
         time.sleep(interval)
 else:
+    with open(f"{PROC}/uptime", "r", encoding="utf-8") as f:
+        _scan_procs(float(f.read().split()[0]))
+    time.sleep(float(os.environ.get("CROS_RES_ONESHOT_SEC", "0.25")))
     emit_once()
 """.strip()
 
@@ -1535,11 +1653,13 @@ def read_local_host_dynamic_sample() -> tuple[CpuStatCounters, float, float]:
 
 
 _REQUIRED_CROS_RES_KEYS = frozenset(
-    {"nproc", "clk_tck", "uptime_sec", "load1", "stat_cpu", "psi", "mem_kib"}
+    {"nproc", "clk_tck", "uptime_sec", "load1", "stat_cpu", "psi", "mem_kib", "proc_dt_sec", "top_procs"}
 )
 _REQUIRED_CROS_MEM_KEYS = frozenset(
     {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty", "Writeback"}
 )
+_REQUIRED_TOP_PROC_KEYS = frozenset({"pid", "comm", "hint", "ticks"})
+_MAX_CROS_TOP_PROCS = 5
 
 
 def _require_strict_int(val: Any, name: str) -> int:
@@ -1549,8 +1669,8 @@ def _require_strict_int(val: Any, name: str) -> int:
 
 
 def _require_strict_num(val: Any, name: str) -> float:
-    if isinstance(val, bool) or not isinstance(val, (int, float)):
-        raise ValueError(f"Expected float/int for {name}, got {val!r}")
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+        raise ValueError(f"Expected finite float/int for {name}, got {val!r}")
     return float(val)
 
 
@@ -1582,7 +1702,8 @@ def parse_cros_resource_json(
     clk_tck = _require_strict_int(obj["clk_tck"], "clk_tck")
     uptime_sec = _require_strict_num(obj["uptime_sec"], "uptime_sec")
     load1 = _require_strict_num(obj["load1"], "load1")
-    if nproc <= 0 or clk_tck <= 0 or uptime_sec <= 0.0 or load1 < 0.0:
+    proc_dt_sec = _require_strict_num(obj["proc_dt_sec"], "proc_dt_sec")
+    if nproc <= 0 or clk_tck <= 0 or uptime_sec <= 0.0 or load1 < 0.0 or proc_dt_sec < 0.0:
         raise ValueError(f"Out-of-range ChromeOS scalar resource fields: {obj!r}")
     if not isinstance(obj["stat_cpu"], str):
         raise ValueError(f"Expected string stat_cpu, got {obj['stat_cpu']!r}")
@@ -1605,6 +1726,33 @@ def parse_cros_resource_json(
     if mem_ints["MemTotal"] <= 0 or any(v < 0 for v in mem_ints.values()):
         raise ValueError(f"Invalid ChromeOS mem_kib values: {mem_ints!r}")
 
+    raw_top = obj["top_procs"]
+    if not isinstance(raw_top, list) or len(raw_top) > _MAX_CROS_TOP_PROCS:
+        raise ValueError(f"Expected top_procs list of <={_MAX_CROS_TOP_PROCS} entries, got {raw_top!r}")
+    if proc_dt_sec == 0.0 and raw_top:
+        raise ValueError(f"Expected empty top_procs when proc_dt_sec == 0.0, got {raw_top!r}")
+    top_procs: list[CrosTopProc] = []
+    seen_crosvm = False
+    for idx, item in enumerate(raw_top):
+        if not isinstance(item, dict) or frozenset(item.keys()) != _REQUIRED_TOP_PROC_KEYS:
+            raise ValueError(f"Invalid top_procs[{idx}] object: {item!r}")
+        pid = _require_strict_int(item["pid"], f"top_procs[{idx}].pid")
+        ticks = _require_strict_int(item["ticks"], f"top_procs[{idx}].ticks")
+        comm, hint = item["comm"], item["hint"]
+        if (
+            pid < 0 or ticks <= 0
+            or not isinstance(comm, str) or not (1 <= len(comm) <= 64)
+            or not isinstance(hint, str) or len(hint) > 64
+        ):
+            raise ValueError(f"Invalid field values in top_procs[{idx}]: {item!r}")
+        if pid == 0 and comm != "crosvm":
+            raise ValueError(f"pid=0 reserved for grouped crosvm entry, got {item!r}")
+        if comm == "crosvm":
+            if pid != 0 or seen_crosvm:
+                raise ValueError(f"Unaggregated or duplicate crosvm entry in top_procs: {raw_top!r}")
+            seen_crosvm = True
+        top_procs.append(CrosTopProc(pid=pid, comm=comm, hint=hint, ticks=ticks))
+
     return CrosResourceSample(
         mono_ts=mono_ts,
         rel_sec=rel_sec,
@@ -1625,7 +1773,65 @@ def parse_cros_resource_json(
         host_cpu=host_cpu,
         host_load1=host_load1,
         host_mem_avail_mib=host_mem_avail_mib,
+        proc_dt_sec=proc_dt_sec,
+        top_procs=tuple(top_procs),
     )
+
+
+def _format_top_procs(
+    intervals: list[CrosResourceSample],
+    *,
+    limit: int = _MAX_CROS_TOP_PROCS,
+    pct_only: bool = False,
+) -> tuple[float, list[str]]:
+    valid = [s for s in intervals if s.proc_dt_sec > 0.0]
+    total_dt = sum(s.proc_dt_sec for s in valid)
+    if total_dt <= 0.0:
+        return 0.0, []
+    crosvm_sec = 0.0
+    crosvm_peak_p = 0
+    crosvm_subs: dict[str, float] = {}
+    by_proc: dict[tuple[str, str], float] = {}
+    proc_pids: dict[tuple[str, str], set[int]] = {}
+    for s in valid:
+        tck = float(s.clk_tck if s.clk_tck > 0 else 100)
+        for p in s.top_procs:
+            cpu_s = p.ticks / tck
+            if p.pid == 0:
+                crosvm_sec += cpu_s
+                cnt_part, sep, subs_part = p.hint.partition(":")
+                if cnt_part.endswith("p") and cnt_part[:-1].isdigit():
+                    crosvm_peak_p = max(crosvm_peak_p, int(cnt_part[:-1]))
+                elif not sep and p.hint:
+                    crosvm_subs[p.hint] = crosvm_subs.get(p.hint, 0.0) + cpu_s
+                if subs_part:
+                    subs_list = [x for x in subs_part.split(",") if x]
+                    share = cpu_s / max(1, len(subs_list))
+                    for sub in subs_list:
+                        crosvm_subs[sub] = crosvm_subs.get(sub, 0.0) + share
+            else:
+                key = (p.comm, p.hint)
+                by_proc[key] = by_proc.get(key, 0.0) + cpu_s
+                proc_pids.setdefault(key, set()).add(p.pid)
+    ranked: list[tuple[float, str]] = []
+    if crosvm_sec > 0.0:
+        top_subs = [k for k, _ in sorted(crosvm_subs.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
+        p_lbl = f"{crosvm_peak_p}p" if crosvm_peak_p > 0 else "grp"
+        ranked.append(
+            (crosvm_sec, f"crosvm[{p_lbl}:{','.join(top_subs)}]" if top_subs else f"crosvm[{p_lbl}]")
+        )
+    for (comm, hint), cpu_s in by_proc.items():
+        pids = proc_pids[(comm, hint)]
+        pid_lbl = f"#{next(iter(pids))}" if len(pids) == 1 else f"[{len(pids)}pids]"
+        hint_lbl = f"({hint})" if hint else ""
+        ranked.append((cpu_s, f"{comm}{pid_lbl}{hint_lbl}"))
+    ranked.sort(key=lambda r: (-r[0], r[1]))
+    fmt = (
+        (lambda lbl, s: f"{lbl}:{100.0 * s / total_dt:.0f}%")
+        if pct_only
+        else (lambda lbl, s: f"{lbl}={s:.2f}s({100.0 * s / total_dt:.1f}%)")
+    )
+    return total_dt, [fmt(lbl, sec) for sec, lbl in ranked[:limit]]
 
 
 def summarize_resource_diagnostics(
@@ -1633,6 +1839,7 @@ def summarize_resource_diagnostics(
     samples: list[CrosResourceSample],
     *,
     install_mono: float | None = None,
+    installer_closed_rel_sec: float | None = None,
     sampler_warnings: list[str] | None = None,
     strict: bool = True,
     include_samples: bool = False,
@@ -1690,6 +1897,10 @@ def summarize_resource_diagnostics(
         s_base, s_end = reanchored[0], reanchored[-1]
 
     window_samples = [s for s in reanchored if s.mono_ts >= s_base.mono_ts]
+    if strict and not any(s.proc_dt_sec > 0.0 for s in window_samples[1:]):
+        raise RuntimeError(
+            "Expected >=1 ChromeOS resource sample interval with proc_dt_sec > 0"
+        )
     span_sec = max(0.0, s_end.uptime_sec - s_base.uptime_sec)
     host_delta = (
         compute_cpu_delta_pct(s_base.host_cpu, s_end.host_cpu)
@@ -1761,6 +1972,29 @@ def summarize_resource_diagnostics(
         f"(+{swap_growth_mib:.0f}MiB) dirty+wb_pk={dirty_peak_mib:.1f}MiB"
     )
 
+    run_intervals = [s for s in window_samples[1:] if s.proc_dt_sec > 0.0]
+    run_proc_dt, run_top_strs = _format_top_procs(run_intervals)
+    if run_proc_dt > 0.0:
+        out.append(
+            f"ChromeOS top CPU (run, sampled={run_proc_dt:.1f}s, 100%=1vCPU): "
+            f"{', '.join(run_top_strs) if run_top_strs else '<idle>'}"
+        )
+    if installer_closed_rel_sec is not None:
+        strict_post = [
+            s for s in run_intervals if (s.rel_sec - s.proc_dt_sec) >= installer_closed_rel_sec
+        ]
+        post_intervals = (
+            strict_post
+            if sum(s.proc_dt_sec for s in strict_post) >= 2.0
+            else [s for s in run_intervals if s.rel_sec > installer_closed_rel_sec]
+        )
+        post_dt, post_top_strs = _format_top_procs(post_intervals)
+        if post_dt > 0.0:
+            out.append(
+                f"ChromeOS top CPU (post-InstallerClosed t{installer_closed_rel_sec:+.1f}s+, "
+                f"sampled={post_dt:.1f}s): {', '.join(post_top_strs) if post_top_strs else '<idle>'}"
+            )
+
     bottleneck_tags: list[str] = []
     if host_delta.steal_pct >= 5.0 or cros_delta.steal_pct >= 5.0:
         bottleneck_tags.append(
@@ -1789,9 +2023,10 @@ def summarize_resource_diagnostics(
         for pos, idx in enumerate(chosen_indices):
             cur = window_samples[idx]
             if pos == 0:
-                c_cpu_str, h_stl_str, dswp_str = "baseline", "base", "+0MiB"
+                c_cpu_str, h_stl_str, dswp_str, top_str = "baseline", "base", "+0MiB", ""
             else:
-                prv = window_samples[chosen_indices[pos - 1]]
+                prev_idx = chosen_indices[pos - 1]
+                prv = window_samples[prev_idx]
                 cd = compute_cpu_delta_pct(prv.cros_cpu, cur.cros_cpu)
                 hd = compute_cpu_delta_pct(prv.host_cpu, cur.host_cpu)
                 c_cpu_str = f"{cd.busy_pct:4.1f}%(iow={cd.iowait_pct:.1f}%,stl={cd.steal_pct:.1f}%)"
@@ -1799,12 +2034,16 @@ def summarize_resource_diagnostics(
                 prv_swp = prv.swap_total_kib - prv.swap_free_kib
                 cur_swp = cur.swap_total_kib - cur.swap_free_kib
                 dswp_str = f"{(cur_swp - prv_swp) / 1024.0:+.0f}MiB"
+                _, row_top = _format_top_procs(
+                    window_samples[prev_idx + 1 : idx + 1], pct_only=True
+                )
+                top_str = f" top=[{', '.join(row_top)}]" if row_top else " top=[<idle>]"
             avail_m = cur.mem_avail_kib / 1024.0
             swp_m = (cur.swap_total_kib - cur.swap_free_kib) / 1024.0
             out.append(
                 f"  {_fmt_rel_t(cur.rel_sec)}: load1={cur.load1:4.2f} cros_cpu={c_cpu_str} "
                 f"psi10(c/m/i)={cur.psi_cpu.some.avg10:.1f}/{cur.psi_memory.some.avg10:.1f}/{cur.psi_io.some.avg10:.1f} "
-                f"avail={avail_m:.0f}MiB swap={swp_m:.0f}MiB({dswp_str}) host_stl={h_stl_str}"
+                f"avail={avail_m:.0f}MiB swap={swp_m:.0f}MiB({dswp_str}) host_stl={h_stl_str}{top_str}"
             )
     return out
 
@@ -2699,11 +2938,16 @@ class InitTimelineRecorder:
         with self._lock:
             samples_copy = list(self._resource_samples)
             t_inst = self.t_install_mono
+            ic_entries = [
+                e for e in self._entries if e.source == "ui" and e.name == "InstallerClosed"
+            ]
+        ic_rel = ic_entries[0].rel_sec if ic_entries else None
 
         self.resource_summary_lines = summarize_resource_diagnostics(
             self.host_runner_info,
             samples_copy,
             install_mono=t_inst,
+            installer_closed_rel_sec=ic_rel,
             sampler_warnings=sampler_warnings,
             strict=strict_dbus,
             include_samples=False,
@@ -2712,6 +2956,7 @@ class InitTimelineRecorder:
             self.host_runner_info,
             samples_copy,
             install_mono=t_inst,
+            installer_closed_rel_sec=ic_rel,
             sampler_warnings=sampler_warnings,
             strict=False,
             include_samples=True,

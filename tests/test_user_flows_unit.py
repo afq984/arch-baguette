@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
 import os
 import shutil
@@ -1026,6 +1028,8 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
                 "Dirty": 512,
                 "Writeback": 0,
             },
+            "proc_dt_sec": 0.0,
+            "top_procs": [],
         }
         base.update(overrides)
         return base
@@ -1041,6 +1045,7 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
 
         c0 = tuf.parse_proc_stat_cpu_line("cpu  100 10 50 800 20 5 5 10 30 0\n", "c0", clk_tck=100)
         c1 = tuf.parse_proc_stat_cpu_line("cpu  250 10 100 830 50 5 5 50 80 0\n", "c1", clk_tck=100)
+        c2 = tuf.parse_proc_stat_cpu_line("cpu  450 10 180 860 50 5 5 50 80 0\n", "c2", clk_tck=100)
         cdelta = tuf.compute_cpu_delta_pct(c0, c1)
         self.assertAlmostEqual(cdelta.busy_pct, 200.0 / 3.0, places=2)
         self.assertAlmostEqual(cdelta.iowait_pct, 10.0, places=2)
@@ -1055,68 +1060,96 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
             host_load1=1.2,
             host_mem_avail_mib=12000.0,
         )
+        stressed_mem = {
+            "MemTotal": 4096000, "MemAvailable": 420000, "SwapTotal": 6144000,
+            "SwapFree": 5900000, "Dirty": 16384, "Writeback": 4096,
+        }
         rs1 = tuf.parse_cros_resource_json(
-            json.dumps(
-                self._sample_json_dict(
-                    uptime_sec=60.0,
-                    load1=3.20,
-                    stat_cpu="cpu  1900 0 500 9350 150 10 10 80 1100 0",
-                    psi={
-                        "cpu": [
-                            "some avg10=48.00 avg60=15.00 avg300=4.00 total=3600000",
-                            "full avg10=0.00 avg60=0.00 avg300=0.00 total=0",
-                        ],
-                        "memory": [
-                            "some avg10=6.50 avg60=2.00 avg300=0.50 total=610000",
-                            "full avg10=2.10 avg60=0.80 avg300=0.20 total=205000",
-                        ],
-                        "io": [
-                            "some avg10=18.40 avg60=5.00 avg300=1.00 total=1700000",
-                            "full avg10=12.00 avg60=3.50 avg300=0.70 total=1150000",
-                        ],
-                    },
-                    mem_kib={
-                        "MemTotal": 4096000,
-                        "MemAvailable": 420000,
-                        "SwapTotal": 6144000,
-                        "SwapFree": 5900000,
-                        "Dirty": 16384,
-                        "Writeback": 4096,
-                    },
-                )
-            ),
-            mono_ts=109.0,
-            rel_sec=9.0,
-            host_cpu=c1,
-            host_load1=2.4,
-            host_mem_avail_mib=11500.0,
+            json.dumps(self._sample_json_dict(
+                uptime_sec=60.0, load1=3.20,
+                stat_cpu="cpu  1900 0 500 9350 150 10 10 80 1100 0",
+                psi={
+                    "cpu": ["some avg10=48.00 avg60=15.00 avg300=4.00 total=3600000", "full avg10=0.00 avg60=0.00 avg300=0.00 total=0"],
+                    "memory": ["some avg10=6.50 avg60=2.00 avg300=0.50 total=610000", "full avg10=2.10 avg60=0.80 avg300=0.20 total=205000"],
+                    "io": ["some avg10=18.40 avg60=5.00 avg300=1.00 total=1700000", "full avg10=12.00 avg60=3.50 avg300=0.70 total=1150000"],
+                },
+                mem_kib=stressed_mem,
+                proc_dt_sec=10.0,
+                top_procs=[
+                    {"pid": 0, "comm": "crosvm", "hint": "3p:run,v_wl", "ticks": 1400},
+                    {"pid": 2745, "comm": "chrome", "hint": "--type=gpu-process(swiftshader)", "ticks": 300},
+                    {"pid": 2707, "comm": "chrome", "hint": "browser", "ticks": 150},
+                ],
+            )),
+            mono_ts=109.0, rel_sec=9.0, host_cpu=c1, host_load1=2.4, host_mem_avail_mib=11500.0,
+        )
+        rs2 = tuf.parse_cros_resource_json(
+            json.dumps(self._sample_json_dict(
+                uptime_sec=70.0, load1=4.80,
+                stat_cpu="cpu  3100 0 900 9400 150 10 10 80 1100 0",
+                psi={
+                    "cpu": ["some avg10=60.00 avg60=25.00 avg300=8.00 total=7600000"],
+                    "memory": ["some avg10=6.50 avg60=2.00 avg300=0.50 total=610000", "full avg10=2.10 avg60=0.80 avg300=0.20 total=205000"],
+                    "io": ["some avg10=18.40 avg60=5.00 avg300=1.00 total=3200000", "full avg10=12.00 avg60=3.50 avg300=0.70 total=2150000"],
+                },
+                mem_kib=stressed_mem,
+                proc_dt_sec=10.0,
+                top_procs=[
+                    {"pid": 3102, "comm": "chrome", "hint": "--type=gpu-process(swiftshader)", "ticks": 900},
+                    {"pid": 4866, "comm": "crash_reporter", "hint": "--user=2745:6:1000:1000:chrome", "ticks": 600},
+                    {"pid": 0, "comm": "crosvm", "hint": "2p:run", "ticks": 400},
+                ],
+            )),
+            mono_ts=119.0, rel_sec=19.0, host_cpu=c2, host_load1=2.6, host_mem_avail_mib=11400.0,
         )
 
-        # Compact green-run summary omits periodic table; failure-mode summary includes it
+        # Compact green-run summary includes aggregate top CPU (whole run + post-InstallerClosed)
+        # and omits per-sample rows/top=[...]
         compact = "\n".join(
             tuf.summarize_resource_diagnostics(
-                host_amd, [rs0, rs1], install_mono=100.0, strict=True, include_samples=False
+                host_amd,
+                [rs0, rs1, rs2],
+                install_mono=100.0,
+                installer_closed_rel_sec=9.0,
+                strict=True,
+                include_samples=False,
             )
         )
         self.assertIn("vendor=AuthenticAMD", compact)
-        self.assertIn("steal=13.33%", compact)
-        self.assertIn("cpu_some=3.50s (35.0%, pk10=48.0)", compact)
-        self.assertIn("io_some=1.50s (15.0%, pk10=18.4)", compact)
+        self.assertIn("ChromeOS top CPU (run, sampled=20.0s, 100%=1vCPU):", compact)
+        self.assertIn("crosvm[3p:run,v_wl]=18.00s(90.0%)", compact)
+        self.assertIn("chrome[2pids](--type=gpu-process(swiftshader))=12.00s(60.0%)", compact)
+        self.assertIn("ChromeOS top CPU (post-InstallerClosed t+9.0s+, sampled=10.0s):", compact)
+        self.assertIn("chrome#3102(--type=gpu-process(swiftshader))=9.00s(90.0%)", compact)
+        self.assertIn("crash_reporter#4866(--user=2745:6:1000:1000:chrome)=6.00s(60.0%)", compact)
         self.assertIn("CPU-contention", compact)
         self.assertIn("IO-stall", compact)
         self.assertIn("memory/reclaim", compact)
         self.assertNotIn("[periodic samples", compact)
+        self.assertNotIn("top=[", compact)
 
         verbose = "\n".join(
             tuf.summarize_resource_diagnostics(
-                host_amd, [rs0, rs1], install_mono=100.0, strict=True, include_samples=True
+                host_amd,
+                [rs0, rs1, rs2],
+                install_mono=100.0,
+                installer_closed_rel_sec=9.0,
+                strict=True,
+                include_samples=True,
             )
         )
-        self.assertIn("[periodic samples (2/2 shown", verbose)
+        self.assertIn("[periodic samples (3/3 shown", verbose)
+        self.assertIn("top=[crosvm[3p:run,v_wl]:140%", verbose)
+        self.assertIn("top=[chrome#3102(--type=gpu-process(swiftshader)):90%", verbose)
 
-        # Strict vs non-strict checks
+        # Strict vs non-strict checks (including missing interval proc_dt_sec > 0)
+        rs1_zero_dt = dataclasses.replace(rs1, proc_dt_sec=0.0, top_procs=())
         for desc, kwargs in (
             ("only 1 sample", {"host_info": host_amd, "samples": [rs0], "install_mono": 100.0}),
+            (
+                "no sample with proc_dt_sec > 0",
+                {"host_info": host_amd, "samples": [rs0, rs1_zero_dt], "install_mono": 100.0},
+            ),
             (
                 "sampler warning present",
                 {
@@ -1136,86 +1169,42 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
                     1,
                 )
 
-        # Negative parser checks (including boolean-as-int, missing/extra keys, backwards CPU ticks)
+        # Negative parser checks (boolean-as-int, bounds, >5 top_procs, crosvm grouping invariants)
+        def _parse_override(**kw: Any) -> tuf.CrosResourceSample:
+            return tuf.parse_cros_resource_json(
+                json.dumps(self._sample_json_dict(**kw)),
+                mono_ts=1.0,
+                rel_sec=0.0,
+                host_cpu=c0,
+                host_load1=1.0,
+                host_mem_avail_mib=1000.0,
+            )
+
         neg_cases: list[tuple[str, Any]] = [
-            (
-                "missing CPU vendor_id",
-                lambda: tuf.parse_host_runner_info(
-                    "model name : X\n", "MemTotal: 100 kB\nMemAvailable: 50 kB\n", 2
-                ),
-            ),
+            ("missing CPU vendor_id", lambda: tuf.parse_host_runner_info("model name : X\n", "MemTotal: 100 kB\nMemAvailable: 50 kB\n", 2)),
             ("short /proc/stat line", lambda: tuf.parse_proc_stat_cpu_line("cpu 1 2 3\n", "bad")),
             ("backwards CPU ticks", lambda: tuf.compute_cpu_delta_pct(c1, c0)),
-            (
-                "boolean as int for nproc",
-                lambda: tuf.parse_cros_resource_json(
-                    json.dumps(self._sample_json_dict(nproc=True)),
-                    mono_ts=1.0,
-                    rel_sec=0.0,
-                    host_cpu=c0,
-                    host_load1=1.0,
-                    host_mem_avail_mib=1000.0,
-                ),
-            ),
-            (
-                "unexpected extra top-level key",
-                lambda: tuf.parse_cros_resource_json(
-                    json.dumps(self._sample_json_dict(extra_key=1)),
-                    mono_ts=1.0,
-                    rel_sec=0.0,
-                    host_cpu=c0,
-                    host_load1=1.0,
-                    host_mem_avail_mib=1000.0,
-                ),
-            ),
-            (
-                "missing psi.io",
-                lambda: tuf.parse_cros_resource_json(
-                    json.dumps(
-                        self._sample_json_dict(
-                            psi={
-                                "cpu": ["some avg10=0.0 avg60=0.0 avg300=0.0 total=0"],
-                                "memory": [
-                                    "some avg10=0.0 avg60=0.0 avg300=0.0 total=0",
-                                    "full avg10=0.0 avg60=0.0 avg300=0.0 total=0",
-                                ],
-                            }
-                        )
-                    ),
-                    mono_ts=1.0,
-                    rel_sec=0.0,
-                    host_cpu=c0,
-                    host_load1=1.0,
-                    host_mem_avail_mib=1000.0,
-                ),
-            ),
-            (
-                "missing MemAvailable in mem_kib",
-                lambda: tuf.parse_cros_resource_json(
-                    json.dumps(
-                        self._sample_json_dict(
-                            mem_kib={
-                                "MemTotal": 4096000,
-                                "SwapTotal": 1024,
-                                "SwapFree": 1024,
-                                "Dirty": 0,
-                                "Writeback": 0,
-                            }
-                        )
-                    ),
-                    mono_ts=1.0,
-                    rel_sec=0.0,
-                    host_cpu=c0,
-                    host_load1=1.0,
-                    host_mem_avail_mib=1000.0,
-                ),
-            ),
+            ("boolean as int for nproc", lambda: _parse_override(nproc=True)),
+            ("boolean for proc_dt_sec", lambda: _parse_override(proc_dt_sec=True)),
+            ("negative proc_dt_sec", lambda: _parse_override(proc_dt_sec=-0.1)),
+            ("non-empty top_procs with proc_dt_sec=0", lambda: _parse_override(proc_dt_sec=0.0, top_procs=[{"pid": 10, "comm": "chrome", "hint": "browser", "ticks": 5}])),
+            (">5 entries in top_procs", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 10 + i, "comm": "p", "hint": "", "ticks": 10 - i} for i in range(6)])),
+            ("boolean pid in top_procs", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": True, "comm": "chrome", "hint": "", "ticks": 5}])),
+            ("boolean ticks in top_procs", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 10, "comm": "chrome", "hint": "", "ticks": True}])),
+            ("zero ticks in top_procs", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 10, "comm": "chrome", "hint": "", "ticks": 0}])),
+            ("pid=0 on non-crosvm", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 0, "comm": "chrome", "hint": "browser", "ticks": 5}])),
+            ("ungrouped crosvm pid > 0", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 3825, "comm": "crosvm", "hint": "1p:run", "ticks": 5}])),
+            ("duplicate crosvm entries", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 0, "comm": "crosvm", "hint": "1p:run", "ticks": 10}, {"pid": 0, "comm": "crosvm", "hint": "1p:v_wl", "ticks": 5}])),
+            ("extra key in top_procs item", lambda: _parse_override(proc_dt_sec=1.0, top_procs=[{"pid": 10, "comm": "c", "hint": "", "ticks": 5, "x": 1}])),
+            ("unexpected extra top-level key", lambda: _parse_override(extra_key=1)),
+            ("missing psi.io", lambda: _parse_override(psi={"cpu": ["some avg10=0.0 avg60=0.0 avg300=0.0 total=0"], "memory": ["some avg10=0.0 avg60=0.0 avg300=0.0 total=0", "full avg10=0.0 avg60=0.0 avg300=0.0 total=0"]})),
+            ("missing MemAvailable in mem_kib", lambda: _parse_override(mem_kib={"MemTotal": 4096000, "SwapTotal": 1024, "SwapFree": 1024, "Dirty": 0, "Writeback": 0})),
         ]
         for desc, fn in neg_cases:
             with self.subTest(desc=desc), self.assertRaises(ValueError):
                 fn()
 
-        # Downsampling cap (<=24 rows) + displayed-row delta preservation across skipped samples
+        # Downsampling cap (<=24 rows) + displayed-row delta & top_procs preservation across skipped samples
         for test_n in (25, 33, 45, 60, 89):
             many = [
                 dataclasses.replace(
@@ -1231,6 +1220,12 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
                         rs0.host_cpu, user=rs0.host_cpu.user + i * 20, idle=rs0.host_cpu.idle + i * 80
                     ),
                     swap_free_kib=6133760 - (51200 if i >= 18 else 0),
+                    proc_dt_sec=0.0 if i == 0 else 1.0,
+                    top_procs=(
+                        (tuf.CrosTopProc(4866, "crash_reporter", "--user=chrome", 95),)
+                        if i == 18
+                        else ((tuf.CrosTopProc(0, "crosvm", "2p:run", 20),) if i > 0 else ())
+                    ),
                 )
                 for i in range(test_n)
             ]
@@ -1247,6 +1242,89 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
                     )
                 )
                 self.assertIn("(+50MiB)", ds_out)
+                self.assertIn("crash_reporter#4866(--user=chrome)", ds_out)
+
+    def test_remote_sampler_script_top_procs_and_crosvm_grouping(self) -> None:
+        def _write_stat(proc_dir: Path, pid: int, comm: str, utime: int, stime: int, start: int, cmdline: bytes) -> None:
+            d = proc_dir / str(pid)
+            d.mkdir(exist_ok=True)
+            fields_after_comm = ["S"] + ["0"] * 10 + [str(utime), str(stime)] + ["0"] * 6 + [str(start)] + ["0"] * 20
+            (d / "stat").write_bytes(f"{pid} ({comm}) {' '.join(fields_after_comm)}\n".encode("utf-8"))
+            (d / "cmdline").write_bytes(cmdline)
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            fp = Path(tmp_str)
+            (fp / "pressure").mkdir()
+            (fp / "pressure/cpu").write_text("some avg10=1.00 avg60=0.50 avg300=0.10 total=1000\n", encoding="utf-8")
+            for p in ("memory", "io"):
+                (fp / f"pressure/{p}").write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n", encoding="utf-8")
+            (fp / "loadavg").write_text("2.50 1.00 0.50 2/200 5000\n", encoding="utf-8")
+            (fp / "stat").write_text("cpu  100 0 50 900 0 0 0 0 0 0\n", encoding="utf-8")
+            (fp / "meminfo").write_text("MemTotal: 4096000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 1024 kB\nSwapFree: 1024 kB\nDirty: 0 kB\nWriteback: 0 kB\n", encoding="utf-8")
+            (fp / "uptime").write_text("100.00 380.00\n", encoding="utf-8")
+            for pid, comm, u, s, st, cl in (
+                (3800, "crosvm", 200, 50, 1000, b"/usr/bin/crosvm\x00--syslog-tag\x00VM(32)\x00run\x00"),
+                (3801, "v_wl", 40, 10, 1002, b"/usr/bin/crosvm\x00--syslog-tag\x00VM(32)\x00run\x00"),
+                (3802, "crosvm", 10, 5, 1003, b"/usr/bin/crosvm\x00device\x00block\x00--socket=/x\x00"),
+                (2700, "chrome", 100, 20, 500, b"/opt/google/chrome/chrome\x00--enable-wayland-server\x00"),
+                (2740, "chrome", 80, 10, 510, b"/opt/google/chrome/chrome --type=gpu-process --homedir=/home/chronos/u-abc --use-angle=swiftshader\x00*=2,chrome_browser_main_posix=2\x00"),
+                (2760, "chrome", 20, 5, 520, b"/opt/google/chrome/chrome\x00--type=utility\x00--utility-sub-type=network.mojom.NetworkService\x00"),
+                (900, "(odd) worker", 50, 0, 600, b""),
+            ):
+                _write_stat(fp, pid, comm, u, s, st, cl)
+
+            script_head = tuf._CROS_RESOURCE_PY_SCRIPT.split("\nif len(sys.argv)", 1)[0]
+            prev_env = os.environ.get("CROS_RES_PROC_ROOT")
+            os.environ["CROS_RES_PROC_ROOT"] = str(fp)
+            try:
+                ns: dict[str, Any] = {}
+                exec(script_head, ns)
+                buf0, buf1 = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf0):
+                    ns["emit_once"]()
+                (fp / "uptime").write_text("105.00 395.00\n", encoding="utf-8")
+                for pid, comm, u, s, st, cl in (
+                    (3800, "crosvm", 450, 100, 1000, b"/usr/bin/crosvm\x00--syslog-tag\x00VM(32)\x00run\x00"),
+                    (3801, "v_wl", 90, 20, 1002, b"/usr/bin/crosvm\x00--syslog-tag\x00VM(32)\x00run\x00"),
+                    (3802, "crosvm", 20, 10, 1003, b"/usr/bin/crosvm\x00device\x00block\x00--socket=/x\x00"),
+                    (2700, "chrome", 140, 30, 500, b"/opt/google/chrome/chrome\x00--enable-wayland-server\x00"),
+                    (2740, "chrome", 260, 30, 510, b"/opt/google/chrome/chrome --type=gpu-process --homedir=/home/chronos/u-abc --use-angle=swiftshader\x00*=2,chrome_browser_main_posix=2\x00"),
+                    (2760, "chrome", 30, 5, 520, b"/opt/google/chrome/chrome\x00--type=utility\x00--utility-sub-type=network.mojom.NetworkService\x00"),
+                    (900, "(odd) worker", 25, 0, 10200, b""),
+                    (4866, "crash_reporter", 110, 10, 10150, b"/sbin/crash_reporter\x00--user=2740:6:chrome\x00"),
+                    (55, "old_missed", 9999, 0, 100, b"/sbin/old\x00"),
+                ):
+                    _write_stat(fp, pid, comm, u, s, st, cl)
+                with contextlib.redirect_stdout(buf1):
+                    ns["emit_once"]()
+            finally:
+                if prev_env is None:
+                    os.environ.pop("CROS_RES_PROC_ROOT", None)
+                else:
+                    os.environ["CROS_RES_PROC_ROOT"] = prev_env
+
+            host_cpu = tuf.parse_proc_stat_cpu_line("cpu 10 0 10 100 0 0 0 0 0 0\n", "h")
+            s0 = tuf.parse_cros_resource_json(
+                buf0.getvalue().strip(), mono_ts=1.0, rel_sec=0.0, host_cpu=host_cpu, host_load1=0.5, host_mem_avail_mib=8000.0
+            )
+            self.assertEqual(s0.proc_dt_sec, 0.0)
+            self.assertEqual(s0.top_procs, ())
+
+            s1 = tuf.parse_cros_resource_json(
+                buf1.getvalue().strip(), mono_ts=6.0, rel_sec=5.0, host_cpu=host_cpu, host_load1=0.5, host_mem_avail_mib=8000.0
+            )
+            self.assertAlmostEqual(s1.proc_dt_sec, 5.0, places=3)
+            self.assertEqual(len(s1.top_procs), 5)
+            # #1: grouped crosvm = (550-250) + (110-50) + (30-15) = 300 + 60 + 15 = 375 ticks
+            self.assertEqual(s1.top_procs[0], tuf.CrosTopProc(0, "crosvm", "3p:run,v_wl,device:block", 375))
+            # #2: chrome gpu-process = 290 - 90 = 200 ticks
+            self.assertEqual(s1.top_procs[1], tuf.CrosTopProc(2740, "chrome", "--type=gpu-process(swiftshader)", 200))
+            # #3: newly spawned crash_reporter = 120 ticks
+            self.assertEqual(s1.top_procs[2], tuf.CrosTopProc(4866, "crash_reporter", "--user=2740:6:chrome", 120))
+            # #4: chrome browser = 170 - 120 = 50 ticks
+            self.assertEqual(s1.top_procs[3], tuf.CrosTopProc(2700, "chrome", "browser", 50))
+            # #5: reused PID 900 `(odd) worker` = 25 ticks (old_missed PID 55 had dt=0)
+            self.assertEqual(s1.top_procs[4], tuf.CrosTopProc(900, "(odd) worker", "kthread", 25))
 
     def test_pid_matches_qemu(self) -> None:
         with tempfile.TemporaryDirectory() as fake_proc_str:
