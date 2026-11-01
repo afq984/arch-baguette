@@ -233,10 +233,10 @@ this repo. Requirements:
   re-entry, guest UID/GID `1000`, the 10 `SetUpUser` supplementary groups, and
   active `cros-garcon.service`, and recording passive D-Bus/UMA/resource/guest
   diagnostics.
-- `tests/test_user_flows_unit.py`: offline stdlib `unittest` suite (also invoked
-  via `scripts/test_user_flows.py --self-test`) covering `README.md` command
-  extraction, vendored `.proto` digests and strict wire decoding, D-Bus/CDP
-  parsers, slow-runner error-50 classification, and resource/guest diagnostics.
+- `tests/test_user_flows_unit.py`: offline stdlib `unittest` suite covering
+  `README.md` command extraction, vendored `.proto` digests and strict wire
+  decoding, D-Bus/CDP parsers, slow-runner error-50 classification, and
+  resource/guest diagnostics.
 
 ## CI (phase D — GitHub Actions)
 

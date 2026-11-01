@@ -765,38 +765,6 @@ def classify_initial_terminal_failure(
             )
 
 
-def run_self_test(readme_path: Path = DEFAULT_README_PATH) -> None:
-    """Thin shim delegating `--self-test` to `tests/test_user_flows_unit.py` via stdlib `unittest`."""
-    import unittest
-
-    tests_dir = REPO_ROOT / "tests"
-    if not (tests_dir / "test_user_flows_unit.py").is_file():
-        raise FileNotFoundError(f"Offline unit test suite not found under {tests_dir}")
-    prev_env = os.environ.get("BAGUETTE_TEST_README")
-    os.environ["BAGUETTE_TEST_README"] = str(readme_path.resolve())
-    try:
-        suite = unittest.defaultTestLoader.discover(
-            start_dir=str(tests_dir), pattern="test_*.py"
-        )
-        result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)
-    finally:
-        if prev_env is None:
-            os.environ.pop("BAGUETTE_TEST_README", None)
-        else:
-            os.environ["BAGUETTE_TEST_README"] = prev_env
-    if result.testsRun == 0 or not result.wasSuccessful():
-        raise RuntimeError(
-            f"Offline unit test suite failed (ran={result.testsRun}, "
-            f"failures={len(result.failures)}, errors={len(result.errors)})"
-        )
-    cmds = extract_readme_commands(readme_path)
-    log(
-        f"Self-test passed ({result.testsRun} unit tests)! Extracted README commands:\n"
-        f"  Setup create:       {cmds.termina_create}\n"
-        f"  Setup vsh re-entry: {cmds.termina_reentry_vsh}"
-    )
-
-
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -954,7 +922,7 @@ class CDPConnection:
             if connect_fn is not None:
                 self.ws = connect_fn(ws_url, timeout=timeout, suppress_origin=True)
             else:
-                import websocket  # Imported lazily so `--self-test` can run even before venv setup if needed
+                import websocket  # Imported lazily so offline unit tests can import this module
 
                 self.ws = websocket.create_connection(
                     ws_url, timeout=timeout, suppress_origin=True
@@ -4417,11 +4385,6 @@ dbus-send --system --type=method_call --print-reply \
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--self-test",
-        action="store_true",
-        help="Run fast offline self-test of README command extraction, vendored protos, and D-Bus parsers",
-    )
-    parser.add_argument(
         "--readme",
         type=Path,
         default=DEFAULT_README_PATH,
@@ -4485,10 +4448,6 @@ def main() -> int:
         help="Start --qemu-cpu-quota-pct throttling immediately at VmStartingUpSignal (0s delay) so inner crosvm boot and SetUpVmUser #1 are also throttled",
     )
     args = parser.parse_args()
-
-    if args.self_test:
-        run_self_test(args.readme)
-        return 0
 
     protos = load_cros_protos()
     log(

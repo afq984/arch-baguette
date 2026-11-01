@@ -59,10 +59,9 @@ class _FakeWS:
 
 class ReadmeAndVendoredProtosTests(unittest.TestCase):
     def test_extract_readme_commands_positive_and_negative(self) -> None:
-        readme_override = os.environ.get("BAGUETTE_TEST_README")
-        readme_path = Path(readme_override) if readme_override else tuf.DEFAULT_README_PATH
-        cmds = tuf.extract_readme_commands(readme_path)
+        cmds = tuf.extract_readme_commands(tuf.DEFAULT_README_PATH)
         self.assertTrue(cmds.termina_create.startswith("vmc create "), cmds.termina_create)
+        self.assertIn("--vm-type BAGUETTE", cmds.termina_create)
         self.assertTrue(cmds.termina_create.endswith(" termina"), cmds.termina_create)
         self.assertEqual(cmds.termina_reentry_vsh, "vsh termina penguin")
 

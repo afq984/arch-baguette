@@ -56,7 +56,6 @@ jobs:
           set -euo pipefail
           uv sync --locked
           uv run --locked python3 -m unittest discover -s tests -p 'test_*.py' -v
-          uv run --locked scripts/test_user_flows.py --self-test
 
       - name: Download built image artifact from workflow run
         if: inputs.artifact_name != ''
