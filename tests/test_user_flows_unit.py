@@ -541,6 +541,12 @@ class IdentityAndSlowRunnerClassifierTests(unittest.TestCase):
                 ci_entries,
                 150.0,
             ),
+            (
+                "pre-gate different terminal error code",
+                "Launching vmshell failed: Error starting crostini for terminal: 22 (CONTAINER_START_FAILED)",
+                [e for e in ci_entries if e.name not in ("ContainerReadyLog", "ContainerStarted")],
+                None,
+            ),
             ("progress bar timeout without error 50", "[===] Configuring", ci_entries, 150.0),
             (
                 "InstallerClosed at/after ContainerStarted",
@@ -558,6 +564,18 @@ class IdentityAndSlowRunnerClassifierTests(unittest.TestCase):
                     for e in ci_entries
                 ],
                 150.0,
+            ),
+            (
+                "pre-gate failure at/after ContainerReadyLog",
+                tuf.KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+                [
+                    tuf.TimelineEntry(145.0, e.source, e.name, e.detail)
+                    if e.name == "ContainerReadyLog"
+                    else e
+                    for e in ci_entries
+                    if e.name != "ContainerStarted"
+                ],
+                None,
             ),
             (
                 "SetUpVmUser call #2 preceded call #1 completion",
@@ -583,6 +601,12 @@ class IdentityAndSlowRunnerClassifierTests(unittest.TestCase):
                 150.0,
             ),
             (
+                "pre-gate missing SetUpVmUserFailed",
+                tuf.KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+                [e for e in ci_entries if e.name not in ("SetUpVmUserFailed", "ContainerReadyLog", "ContainerStarted")],
+                None,
+            ),
+            (
                 "duplicate RestartCrostiniFailed",
                 tuf.KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
                 [
@@ -599,6 +623,170 @@ class IdentityAndSlowRunnerClassifierTests(unittest.TestCase):
         ):
             with self.subTest(desc=desc), self.assertRaises(RuntimeError):
                 tuf.classify_initial_terminal_failure(buf, entries, cs_rel)
+
+        # Pre-gate valid case (before ContainerReadyLog / ContainerStarted arrive) succeeds
+        pre_gate_entries = [
+            e for e in ci_entries if e.name not in ("ContainerReadyLog", "ContainerStarted")
+        ]
+        tuf.classify_initial_terminal_failure(
+            tuf.KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR,
+            pre_gate_entries,
+            container_started_rel_sec=None,
+        )
+
+    def test_pre_gate_initial_terminal_close_and_home_relaunch(self) -> None:
+        order: list[str] = []
+        pre_gate_logs = [
+            tuf.TimelineEntry(10.0, "ui", "InstallerClosed", "closed after 10.0s"),
+            tuf.TimelineEntry(20.0, "concierge", "SetUpVmUser", "call #1: Received request: SetUpVmUser"),
+            tuf.TimelineEntry(50.0, "concierge", "SetUpVmUserDone", "call #1 completed in <=30.0s"),
+            tuf.TimelineEntry(55.0, "concierge", "SetUpVmUser", "call #2: Received request: SetUpVmUser"),
+            tuf.TimelineEntry(75.0, "concierge", "SetUpVmUserFailed", "call #2 failed after 20.0s: SetUpUser RPC failed: Deadline Exceeded"),
+            tuf.TimelineEntry(75.0, "chrome", "SetUpBaguetteUserFailed", "Failed to set up baguette user: Deadline Exceeded"),
+            tuf.TimelineEntry(
+                75.0,
+                "chrome",
+                "RestartCrostiniFailed",
+                'Failed to restart Crostini with error code: 50, container: (type:6:BAGUETTE vm:"termina" container:"penguin")',
+            ),
+        ]
+
+        class _FakeTimeline:
+            def __init__(self) -> None:
+                self.entries: list[tuf.TimelineEntry] = list(pre_gate_logs)
+                self.post_gate = False
+
+            def check_no_fatal_error(self) -> None:
+                pass
+
+            def is_container_started(self) -> bool:
+                return False
+
+            def record_ui(self, name: str, detail: str) -> float:
+                order.append(f"ui:{name}")
+                self.entries.append(tuf.TimelineEntry(80.0, "ui", name, detail))
+                return 80.0
+
+            def scrape_host_logs(self) -> float | None:
+                order.append("scrape_host_logs")
+                if self.post_gate and not any(e.name == "ContainerReadyLog" for e in self.entries):
+                    self.entries.append(
+                        tuf.TimelineEntry(
+                            118.0,
+                            "cicerone",
+                            "ContainerReadyLog",
+                            "Startup of container penguin at IP  for VM termina completed.",
+                        )
+                    )
+                return 20.0
+
+            def all_entries(self) -> list[tuf.TimelineEntry]:
+                return sorted(self.entries, key=lambda e: e.rel_sec)
+
+            def wait_for_container_started(self, timeout: float = 300.0) -> float:
+                order.append(f"wait_for_container_started:{timeout:.0f}")
+                self.post_gate = True
+                return 120.0
+
+        class _FakeConn:
+            def __init__(self, tid: str) -> None:
+                self.target_id = tid
+
+            def eval_js(self, *_a: Any, **_kw: Any) -> dict[str, Any]:
+                return {
+                    "hasScreen": True,
+                    "webgl1": False,
+                    "webgl2": False,
+                    "canvas2dCanvases": 2,
+                    "non2dCanvases": 0,
+                    "domRowCount": 0,
+                }
+
+            def close(self) -> None:
+                pass
+
+        class _FakeFreshTab:
+            def __init__(self) -> None:
+                self.label = "Terminal-App-Fresh"
+                self.conn = _FakeConn("FRESH_TID")
+
+            def send_line(self, _line: str) -> None:
+                order.append("fresh:send_line")
+
+            def wait_for(self, *_a: Any, **_kw: Any) -> str:
+                order.append("fresh:wait_for")
+                return "[terminauser@penguin ~]$"
+
+            def suppress_beforeunload(self) -> None:
+                pass
+
+            def close(self) -> None:
+                order.append("fresh:close")
+
+        vm = object.__new__(tuf.ChromeOSVM)
+        vm._current_step = "init"
+        vm._PRE_GATE_LOG_FLUSH_TIMEOUT_SEC = 0.0
+        obs_outcomes = iter(
+            [
+                ("error", tuf.KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR),
+                ("prompt", "[terminauser@penguin ~]$"),
+            ]
+        )
+        vm._observe_terminal_until_prompt_or_error = lambda *_a, **_kw: next(obs_outcomes)  # type: ignore[method-assign]
+        vm.close_crosh_tab = lambda tab: order.append(f"close_crosh_tab:{tab.conn.target_id}")  # type: ignore[method-assign]
+        vm._open_fresh_terminal_from_home = lambda old_ids: (order.append(f"open_fresh:{sorted(old_ids)}") or _FakeFreshTab())  # type: ignore[method-assign]
+        vm.close_cdp_targets_matching = lambda url_substr, *, label, exclude_ids=None: (order.append(f"close_matching:{label}") or 0)  # type: ignore[method-assign]
+
+        tl = _FakeTimeline()
+        init_tgt = {"id": "INIT_TID", "url": "chrome-untrusted://terminal/?command=vmshell", "webSocketDebuggerUrl": "ws://127.0.0.1:9/x"}
+        with mock.patch.object(tuf.CDPConnection, "from_target", side_effect=lambda tgt, **_kw: _FakeConn(tgt["id"])):  # type: ignore[misc]
+            vm.verify_terminal_app_with_readiness_gate(init_tgt, "terminauser", tl)  # type: ignore[arg-type]
+
+        close_idx = order.index("close_crosh_tab:INIT_TID")
+        ui_closed_idx = order.index("ui:InitialTerminalClosed")
+        gate_idx = order.index("wait_for_container_started:300")
+        fresh_idx = order.index("open_fresh:['INIT_TID']")
+        self.assertLess(close_idx, gate_idx)
+        self.assertLess(ui_closed_idx, gate_idx)
+        self.assertLess(gate_idx, fresh_idx)
+
+        # Unrecognized initial Terminal error fails fast BEFORE wait_for_container_started
+        order.clear()
+        vm._observe_terminal_until_prompt_or_error = lambda *_a, **_kw: (  # type: ignore[method-assign]
+            "error",
+            "Launching vmshell failed: Error starting crostini for terminal: 22 (CONTAINER_START_FAILED)",
+        )
+        tl_bad = _FakeTimeline()
+        with mock.patch.object(tuf.CDPConnection, "from_target", side_effect=lambda tgt, **_kw: _FakeConn(tgt["id"])):  # type: ignore[misc]
+            with self.assertRaisesRegex(RuntimeError, "unrecognized or incomplete buffer"):
+                vm.verify_terminal_app_with_readiness_gate(init_tgt, "terminauser", tl_bad)  # type: ignore[arg-type]
+        self.assertNotIn("wait_for_container_started:300", order)
+        self.assertNotIn("close_crosh_tab:INIT_TID", order)
+
+        # _open_fresh_terminal_from_home launches #home SWA if missing from list_cdp_targets()
+        vm2 = object.__new__(tuf.ChromeOSVM)
+        vm2._current_step = "init"
+        launched_urls: list[str] = []
+        vm2.list_cdp_targets = lambda timeout=20.0: []  # type: ignore[method-assign]
+        vm2._launch_swa_or_target = lambda url, *, label, op_desc: launched_urls.append(url)  # type: ignore[method-assign]
+
+        class _FakeHomeConn:
+            def poll_js(self, *_a: Any, **_kw: Any) -> str:
+                return "CLICKED:?command=vmshell"
+
+            def close(self) -> None:
+                pass
+
+        vm2.connect_cdp_target = lambda *_a, **_kw: _FakeHomeConn()  # type: ignore[method-assign]
+        vm2.wait_for_cdp_target = lambda *_a, **_kw: {  # type: ignore[method-assign]
+            "id": "FRESH2",
+            "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9/f2",
+        }
+        with mock.patch.object(tuf.CDPConnection, "from_target", side_effect=lambda tgt, **_kw: _FakeConn(tgt["id"])):  # type: ignore[misc]
+            ft = vm2._open_fresh_terminal_from_home({"INIT_TID"})
+        self.assertEqual(launched_urls, ["chrome-untrusted://terminal/html/terminal.html#home"])
+        self.assertEqual(ft.conn.target_id, "FRESH2")
 
 
 class DiagnosticsAndLogScraperTests(unittest.TestCase):
@@ -1162,6 +1350,137 @@ class CDPClientMockTests(unittest.TestCase):
         sent_close_ids = [json.loads(s)["params"]["targetId"] for s in browser_ws.sent]
         self.assertEqual(sent_close_ids, ["9F2A1B", "T1"])
 
+    def test_snapshot_cdp_renderer_pids_and_compact_urls(self) -> None:
+        self.assertEqual(
+            tuf.compact_cdp_target_url(
+                "chrome-untrusted://terminal/html/terminal.html?command=vmshell&args[]=--vm_name%3Dtermina"
+            ),
+            "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+        )
+        self.assertEqual(
+            tuf.compact_cdp_target_url("chrome-untrusted://terminal/html/terminal.html#home"),
+            "chrome-untrusted://terminal/html/terminal.html#home",
+        )
+        self.assertEqual(
+            tuf.compact_cdp_target_url("chrome-extension://abcdefghijklmnop/background.html"),
+            "chrome-extension://abcdefgh/background.html",
+        )
+        self.assertEqual(tuf.compact_cdp_target_url("about:blank", "MyHelper"), "about:blank[MyHelper]")
+
+        trace_ws = _FakeWS(
+            [
+                # 1: Target.getTargets
+                json.dumps(
+                    {
+                        "id": 1,
+                        "result": {
+                            "targetInfos": [
+                                {"targetId": "B0", "type": "browser", "url": "", "title": ""},
+                                {"targetId": "SW1", "type": "service_worker", "url": "chrome://os-settings/sw.js", "title": ""},
+                                {
+                                    "targetId": "HOME_T",
+                                    "type": "page",
+                                    "url": "chrome-untrusted://terminal/html/terminal.html#home",
+                                    "title": "Terminal",
+                                },
+                                {
+                                    "targetId": "VMSH_T",
+                                    "type": "page",
+                                    "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell&args[]=x",
+                                    "title": "terminauser@penguin",
+                                },
+                            ]
+                        },
+                    }
+                ),
+                # HOME_T: 2=attach, 3=Tracing.start, 4=Tracing.end, then events, 5=detach
+                json.dumps({"id": 2, "result": {"sessionId": "SID_HOME"}}),
+                json.dumps({"id": 3, "sessionId": "SID_HOME", "result": {}}),
+                json.dumps({"id": 4, "sessionId": "SID_HOME", "result": {}}),
+                json.dumps(
+                    {
+                        "method": "Tracing.dataCollected",
+                        "sessionId": "SID_HOME",
+                        "params": {
+                            "value": [
+                                {
+                                    "name": "TracingStartedInBrowser",
+                                    "args": {
+                                        "data": {
+                                            "frames": [
+                                                {
+                                                    "frame": "HOME_T",
+                                                    "url": "chrome-untrusted://terminal/html/terminal.html",
+                                                    "processId": 4137,
+                                                }
+                                            ]
+                                        }
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps({"method": "Tracing.tracingComplete", "sessionId": "SID_HOME", "params": {}}),
+                json.dumps({"id": 5, "result": {}}),
+                # VMSH_T: 6=attach, 7=Tracing.start, 8=Tracing.end, then events (incl speculative warmup frame), 9=detach
+                json.dumps({"id": 6, "result": {"sessionId": "SID_VMSH"}}),
+                json.dumps({"id": 7, "sessionId": "SID_VMSH", "result": {}}),
+                json.dumps({"id": 8, "sessionId": "SID_VMSH", "result": {}}),
+                json.dumps(
+                    {
+                        "method": "Tracing.dataCollected",
+                        "sessionId": "SID_VMSH",
+                        "params": {
+                            "value": [
+                                {
+                                    "name": "TracingStartedInBrowser",
+                                    "args": {
+                                        "data": {
+                                            "frames": [
+                                                {
+                                                    "frame": "WARMUP_F",
+                                                    "url": "https://www.google.com/search/warmup.html",
+                                                    "processId": 4153,
+                                                },
+                                                {
+                                                    "frame": "VMSH_T",
+                                                    "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+                                                    "processId": 4338,
+                                                },
+                                            ]
+                                        }
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps({"method": "Tracing.tracingComplete", "sessionId": "SID_VMSH", "params": {}}),
+                json.dumps({"id": 9, "result": {}}),
+            ]
+        )
+        vm = object.__new__(tuf.ChromeOSVM)
+        vm._current_step = "step5:collect_resources"
+        vm._local_dt_port = 41234
+        vm._browser_ws_path = "/devtools/browser/root"
+        vm.renderer_pid_urls = {9999: "chrome://os-settings/"}
+        vm.connect_browser_cdp = lambda label="Browser-Root": tuf.CDPConnection(  # type: ignore[method-assign]
+            "ws://127.0.0.1:41234/devtools/browser/root",
+            target_label=label,
+            connect_fn=lambda *_a, **_kw: trace_ws,
+        )
+        mapped = vm.snapshot_cdp_renderer_pids()
+        self.assertEqual(
+            mapped,
+            {
+                9999: "chrome://os-settings/",
+                4137: "chrome-untrusted://terminal/html/terminal.html#home",
+                4153: "https://www.google.com/search/warmup.html",
+                4338: "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+            },
+        )
+
 
 class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
     def _sample_json_dict(self, **overrides: Any) -> dict[str, Any]:
@@ -1191,6 +1510,7 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
                 "Writeback": 0,
             },
             "proc_dt_sec": 0.0,
+            "sampler_ticks": 0,
             "top_procs": [],
         }
         base.update(overrides)
@@ -1637,6 +1957,321 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, err_pat):
                 tuf.verify_terminal_renderer_fallback(bad_probe)
+
+    def test_sampler_budget_cmdline_cache_and_stdin_eof(self) -> None:
+        self.assertEqual(tuf.CROS_RESOURCE_SAMPLE_INTERVAL_SEC, 15)
+        self.assertAlmostEqual(tuf.CROS_SAMPLER_MAX_CPU_PCT, 3.0, places=2)
+
+        host_intel = tuf.HostRunnerInfo("GenuineIntel", "Intel Xeon", 4, 16000.0, 12000.0)
+        c0 = tuf.parse_proc_stat_cpu_line("cpu  100 0 50 850 0 0 0 0 0 0\n", "c0")
+        c1 = tuf.parse_proc_stat_cpu_line("cpu  200 0 100 2200 0 0 0 0 0 0\n", "c1")
+
+        # Strict JSONL rejection of invalid sampler_ticks
+        for bad_kw in (
+            {"sampler_ticks": True, "proc_dt_sec": 15.0},
+            {"sampler_ticks": -1, "proc_dt_sec": 15.0},
+            {"sampler_ticks": 3, "proc_dt_sec": 0.0},
+        ):
+            with self.assertRaises(ValueError):
+                tuf.parse_cros_resource_json(
+                    json.dumps(self._sample_json_dict(**bad_kw)),
+                    mono_ts=1.0,
+                    rel_sec=0.0,
+                    host_cpu=c0,
+                    host_load1=0.5,
+                    host_mem_avail_mib=8000.0,
+                )
+
+        s_base = tuf.parse_cros_resource_json(
+            json.dumps(self._sample_json_dict()),
+            mono_ts=99.0,
+            rel_sec=-1.0,
+            host_cpu=c0,
+            host_load1=0.5,
+            host_mem_avail_mib=8000.0,
+        )
+        # 22 ticks over 15.0s (clk_tck=100) => 0.22s = 1.47% <= 3.0% budget (passes)
+        s_ok = tuf.parse_cros_resource_json(
+            json.dumps(
+                self._sample_json_dict(
+                    uptime_sec=65.0,
+                    stat_cpu="cpu  600 0 250 10550 50 10 10 30 0 0",
+                    proc_dt_sec=15.0,
+                    sampler_ticks=22,
+                    top_procs=[{"pid": 0, "comm": "crosvm", "hint": "2p:run", "ticks": 300}],
+                )
+            ),
+            mono_ts=114.0,
+            rel_sec=14.0,
+            host_cpu=c1,
+            host_load1=0.6,
+            host_mem_avail_mib=8000.0,
+        )
+        ok_lines = tuf.summarize_resource_diagnostics(
+            host_intel, [s_base, s_ok], install_mono=100.0, strict=True
+        )
+        self.assertTrue(
+            any("ChromeOS sampler: cpu=0.22s (1.47% of 1vCPU, peak=1.5%, budget<=3.0%, interval=15s)" in ln for ln in ok_lines),
+            ok_lines,
+        )
+
+        # 60 ticks over 15.0s => 0.60s = 4.00% > 3.0% budget (fails strict, succeeds non-strict)
+        s_over = dataclasses.replace(s_ok, sampler_ticks=60)
+        with self.assertRaisesRegex(RuntimeError, "exceeded CPU budget: 4.00% of 1vCPU > 3.0%"):
+            tuf.summarize_resource_diagnostics(
+                host_intel, [s_base, s_over], install_mono=100.0, strict=True
+            )
+        non_strict_over = tuf.summarize_resource_diagnostics(
+            host_intel, [s_base, s_over], install_mono=100.0, strict=False
+        )
+        self.assertTrue(any("4.00% of 1vCPU" in ln for ln in non_strict_over))
+
+        # Verify zero-delta fast-skip, cmdline caching, process-only scan, and --loop stdin-EOF wakeup
+        def _write_proc(proc_dir: Path, pid: int, comm: str, ticks: int, start: int, cl: bytes) -> None:
+            d = proc_dir / str(pid)
+            d.mkdir(exist_ok=True)
+            rest = ["S"] + ["0"] * 10 + [str(ticks), "0"] + ["0"] * 6 + [str(start)] + ["0"] * 20
+            (d / "stat").write_bytes(f"{pid} ({comm}) {' '.join(rest)}\n".encode("utf-8"))
+            (d / "cmdline").write_bytes(cl)
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            fp = Path(tmp_str)
+            (fp / "pressure").mkdir()
+            (fp / "pressure/cpu").write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n", encoding="utf-8")
+            for p in ("memory", "io"):
+                (fp / f"pressure/{p}").write_text(
+                    "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+                    encoding="utf-8",
+                )
+            (fp / "loadavg").write_text("0.50 0.20 0.10 1/100 2000\n", encoding="utf-8")
+            (fp / "stat").write_text("cpu  100 0 50 900 0 0 0 0 0 0\n", encoding="utf-8")
+            (fp / "meminfo").write_text(
+                "MemTotal: 4096000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 1024 kB\nSwapFree: 1024 kB\nDirty: 0 kB\nWriteback: 0 kB\n",
+                encoding="utf-8",
+            )
+            (fp / "uptime").write_text("100.00 380.00\n", encoding="utf-8")
+            self_pid = os.getpid()
+            _write_proc(fp, self_pid, "python3", 10, 500, b"python3\x00-u\x00sampler\x00")
+            _write_proc(fp, 2001, "idle_daemon", 50, 400, b"/usr/sbin/idle_daemon\x00")
+            _write_proc(fp, 4338, "chrome", 100, 600, b"/opt/google/chrome/chrome\x00--type=renderer\x00")
+            # Subdirectory `task/9999` under 4338 must NEVER be scanned
+            task_dir = fp / "4338/task/9999"
+            task_dir.mkdir(parents=True)
+            (task_dir / "stat").write_bytes(b"9999 (thread_x) S " + b" ".join([b"9999"] * 35) + b"\n")
+
+            cmdline_opens: list[str] = []
+            real_os_open = os.open
+
+            def _spy_open(path: str | bytes, flags: int, *a: Any) -> int:
+                p_str = path.decode() if isinstance(path, bytes) else str(path)
+                if p_str.endswith("/cmdline"):
+                    cmdline_opens.append(Path(p_str).parent.name)
+                if "/task/" in p_str:
+                    raise AssertionError(f"Sampler unexpectedly opened thread path {p_str}")
+                return real_os_open(path, flags, *a)
+
+            script_head = tuf._CROS_RESOURCE_PY_SCRIPT.split("\nif len(sys.argv)", 1)[0]
+            prev_env = os.environ.get("CROS_RES_PROC_ROOT")
+            os.environ["CROS_RES_PROC_ROOT"] = str(fp)
+            try:
+                ns: dict[str, Any] = {}
+                exec(script_head, ns)
+                b0, b1, b2 = io.StringIO(), io.StringIO(), io.StringIO()
+                with mock.patch.object(os, "open", side_effect=_spy_open):
+                    with contextlib.redirect_stdout(b0):
+                        ns["emit_once"]()
+                    self.assertEqual(cmdline_opens, [])
+
+                    # Sample 1: 2001 has 0 delta (cmdline NEVER opened!), 4338 active (opened once), self_pid +4 ticks
+                    (fp / "uptime").write_text("115.00 420.00\n", encoding="utf-8")
+                    _write_proc(fp, self_pid, "python3", 14, 500, b"python3\x00-u\x00sampler\x00")
+                    _write_proc(fp, 4338, "chrome", 250, 600, b"/opt/google/chrome/chrome\x00--type=renderer\x00")
+                    with contextlib.redirect_stdout(b1):
+                        ns["emit_once"]()
+                    self.assertEqual(cmdline_opens, ["4338"])
+
+                    # Sample 2: 4338 still active with same starttime -> cmdline cached (0 new opens!)
+                    (fp / "uptime").write_text("130.00 460.00\n", encoding="utf-8")
+                    _write_proc(fp, self_pid, "python3", 17, 500, b"python3\x00-u\x00sampler\x00")
+                    _write_proc(fp, 4338, "chrome", 400, 600, b"/opt/google/chrome/chrome\x00--type=renderer\x00")
+                    with contextlib.redirect_stdout(b2):
+                        ns["emit_once"]()
+                    self.assertEqual(cmdline_opens, ["4338"])
+            finally:
+                if prev_env is None:
+                    os.environ.pop("CROS_RES_PROC_ROOT", None)
+                else:
+                    os.environ["CROS_RES_PROC_ROOT"] = prev_env
+
+            j1 = json.loads(b1.getvalue().strip())
+            j2 = json.loads(b2.getvalue().strip())
+            self.assertEqual(j1["sampler_ticks"], 4)
+            self.assertEqual(j2["sampler_ticks"], 3)
+
+            # Subprocess --loop mode exits promptly on stdin EOF and emits final delta sample
+            loop_proc = subprocess.Popen(
+                [sys.executable, "-u", "-c", tuf._CROS_RESOURCE_PY_SCRIPT, "--loop", "60"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "CROS_RES_PROC_ROOT": str(fp)},
+            )
+            assert loop_proc.stdin is not None and loop_proc.stdout is not None
+            first_line = loop_proc.stdout.readline().strip()
+            self.assertTrue(first_line)
+            (fp / "uptime").write_text("145.00 500.00\n", encoding="utf-8")
+            _write_proc(fp, 4338, "chrome", 550, 600, b"/opt/google/chrome/chrome\x00--type=renderer\x00")
+            loop_proc.stdin.close()
+            out_rest, err_rest = loop_proc.communicate(timeout=5.0)
+            self.assertEqual(loop_proc.returncode, 0, err_rest)
+            final_obj = json.loads(out_rest.strip().splitlines()[-1])
+            self.assertGreater(final_obj["proc_dt_sec"], 0.0)
+            self.assertEqual(final_obj["top_procs"][0]["pid"], 4338)
+
+    def test_renderer_url_attribution_and_perf_guard(self) -> None:
+        host_amd = tuf.HostRunnerInfo("AuthenticAMD", "AMD EPYC 7763", 4, 16000.0, 12000.0)
+        c0 = tuf.parse_proc_stat_cpu_line("cpu  100 0 50 850 0 0 0 0 0 0\n", "c0")
+        c1 = tuf.parse_proc_stat_cpu_line("cpu  900 0 250 1850 0 0 0 0 0 0\n", "c1")
+        rs0 = tuf.parse_cros_resource_json(
+            json.dumps(self._sample_json_dict()),
+            mono_ts=99.0,
+            rel_sec=-1.0,
+            host_cpu=c0,
+            host_load1=0.5,
+            host_mem_avail_mib=12000.0,
+        )
+        rs1 = tuf.parse_cros_resource_json(
+            json.dumps(
+                self._sample_json_dict(
+                    uptime_sec=65.0,
+                    stat_cpu="cpu  1900 0 500 9500 50 10 10 30 0 0",
+                    proc_dt_sec=15.0,
+                    sampler_ticks=10,
+                    top_procs=[
+                        {"pid": 4338, "comm": "chrome", "hint": "--type=renderer", "ticks": 1480},
+                        {"pid": 4137, "comm": "chrome", "hint": "--type=renderer", "ticks": 30},
+                    ],
+                )
+            ),
+            mono_ts=114.0,
+            rel_sec=14.0,
+            host_cpu=c1,
+            host_load1=2.0,
+            host_mem_avail_mib=12000.0,
+        )
+        rmap = {
+            4338: "chrome-untrusted://terminal/html/terminal.html?command=vmshell",
+            4137: "chrome-untrusted://terminal/html/terminal.html#home",
+        }
+        agg = "\n".join(
+            tuf.summarize_resource_diagnostics(
+                host_amd,
+                [rs0, rs1],
+                renderer_urls=rmap,
+                install_mono=100.0,
+                installer_closed_rel_sec=5.0,
+                strict=True,
+                include_samples=False,
+            )
+        )
+        self.assertIn(
+            "chrome#4338(--type=renderer chrome-untrusted://terminal/html/terminal.html?command=vmshell)=14.80s(98.7%)",
+            agg,
+        )
+        self.assertIn(
+            "chrome#4137(--type=renderer chrome-untrusted://terminal/html/terminal.html#home)=0.30s(2.0%)",
+            agg,
+        )
+        fail_rows = "\n".join(
+            tuf.summarize_resource_diagnostics(
+                host_amd,
+                [rs0, rs1],
+                renderer_urls=rmap,
+                install_mono=100.0,
+                strict=False,
+                include_samples=True,
+            )
+        )
+        self.assertIn(
+            "top=[chrome#4338(--type=renderer chrome-untrusted://terminal/html/terminal.html?command=vmshell):99%",
+            fail_rows,
+        )
+
+        # Strict failure if perf or quipper appears in top_procs
+        rs_perf = dataclasses.replace(
+            rs1,
+            top_procs=(tuf.CrosTopProc(4325, "perf", "record -a", 180),),
+        )
+        with self.assertRaisesRegex(RuntimeError, "Unexpected ChromeOS profiling process.*perf#4325"):
+            tuf.summarize_resource_diagnostics(
+                host_amd, [rs0, rs_perf], install_mono=100.0, strict=True
+            )
+
+    def test_host_qemu_cpu_guest_cpuinfo_and_quipper_bind_mount(self) -> None:
+        with mock.patch.object(
+            tuf,
+            "read_local_host_runner_info",
+            return_value=tuf.HostRunnerInfo("AuthenticAMD", "AMD EPYC 7763", 4, 16000.0, 12000.0),
+        ):
+            self.assertEqual(
+                tuf.detect_host_qemu_cpu_arg(), "host,-invpcid,-tsc-deadline,svm=on"
+            )
+        with mock.patch.object(
+            tuf,
+            "read_local_host_runner_info",
+            return_value=tuf.HostRunnerInfo("GenuineIntel", "Intel Xeon", 8, 32000.0, 24000.0),
+        ):
+            self.assertEqual(
+                tuf.detect_host_qemu_cpu_arg(), "host,-invpcid,-tsc-deadline,vmx=on"
+            )
+        with mock.patch.object(
+            tuf,
+            "read_local_host_runner_info",
+            return_value=tuf.HostRunnerInfo("UnknownCPU", "Mystery", 4, 8000.0, 4000.0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unsupported host CPU vendor"):
+                tuf.detect_host_qemu_cpu_arg()
+
+        intel_guest = tuf.parse_guest_cpuinfo(
+            "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU\n"
+            "flags\t\t: fpu vmx avx avx2 fma bmi1 bmi2 xsaveopt xsaves arch_capabilities\n"
+            "vmx flags\t: vnmi ept vpid ept_ad shadow_vmcs\n\n"
+        )
+        intel_line = tuf.format_guest_cpuinfo_summary(intel_guest)
+        self.assertIn("avx2=yes fma=yes xsaveopt=yes", intel_line)
+        self.assertIn("arch_capabilities", intel_line)
+        self.assertIn("virt=vmx[ept,ept_ad,shadow_vmcs,vnmi,vpid]", intel_line)
+
+        amd_guest = tuf.parse_guest_cpuinfo(
+            "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\n"
+            "flags\t\t: fpu svm avx avx2 fma xsaveopt xsaves npt nrip_save vmcb_clean flushbyasid decodeassists v_vmsave_vmload\n\n"
+        )
+        amd_line = tuf.format_guest_cpuinfo_summary(amd_guest)
+        self.assertIn("vendor=AuthenticAMD", amd_line)
+        self.assertIn("avx2=yes fma=yes xsaveopt=yes", amd_line)
+        self.assertIn(
+            "virt=svm[npt,nrip_save,vmcb_clean,flushbyasid,decodeassists,v_vmsave_vmload]",
+            amd_line,
+        )
+
+        # verify_quipper_bind_mount positive and negative checks
+        self.assertIn(
+            "source=/dev/sda3[/bin/true]",
+            tuf.verify_quipper_bind_mount("/usr/bin/quipper /dev/sda3[/bin/true]\n", 0, ""),
+        )
+        self.assertIn(
+            "source=/dev/sda3[/usr/bin/true]",
+            tuf.verify_quipper_bind_mount("/usr/bin/quipper /dev/sda3[/usr/bin/true]", 0, ""),
+        )
+        for bad_mnt, bad_rc, bad_out, pat in (
+            ("", 0, "", "not active"),
+            ("/usr/bin/quipper /dev/sda3[/usr/bin/quipper]", 0, "", "unexpected source"),
+            ("/usr/bin/quipper /dev/sda3[/bin/true]", 1, "", "probe failed"),
+            ("/usr/bin/quipper /dev/sda3[/bin/true]", 0, "Usage: quipper", "probe failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, pat):
+                tuf.verify_quipper_bind_mount(bad_mnt, bad_rc, bad_out)
 
 
 if __name__ == "__main__":
