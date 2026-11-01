@@ -30,7 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Iterable, TypeVar
 
 import google.protobuf
 from google.protobuf.message import DecodeError, Message
@@ -859,6 +859,29 @@ class CDPError(RuntimeError):
 
 class CDPTimeoutError(TimeoutError):
     """Structured Chrome DevTools Protocol timeout including operation, target, step, and elapsed wait."""
+
+
+class VMCommandTimeoutError(TimeoutError):
+    """Structured VM ssh/vsh/scp timeout including operation, step, command summary, and elapsed wait."""
+
+
+def _summarize_cmd(cmd: str, max_len: int = 120) -> str:
+    flat = " ".join(cmd.split())
+    return flat if len(flat) <= max_len else (flat[: max_len - 3] + "...")
+
+
+def format_vm_cmd_error_context(
+    *,
+    operation: str,
+    step: str,
+    cmd_summary: str,
+    elapsed_sec: float,
+    timeout_sec: float,
+) -> str:
+    return (
+        f"operation={operation!r} step={step!r} cmd={cmd_summary!r} "
+        f"waited={elapsed_sec:.2f}s (timeout={timeout_sec:.1f}s)"
+    )
 
 
 def _is_ws_timeout_exc(exc: BaseException) -> bool:
@@ -2581,7 +2604,9 @@ class InitTimelineRecorder:
             f"{{ grep -E 'vm_concierge|vm_cicerone|seneschal|vshd|garcon|maitred' || [ $? -eq 1 ]; }} | "
             f"{{ grep -v 'BalloonTrace:' || [ $? -eq 1 ]; }}",
             check=True,
-            timeout=30,
+            timeout=60,
+            op_desc="scrape_host_logs(/var/log/messages)",
+            cmd_summary="tail /var/log/messages | grep vm_concierge|...",
         ).stdout.strip()
         self.messages_excerpt = msg_out
         setup_user_seq = 0
@@ -2669,7 +2694,9 @@ class InitTimelineRecorder:
             f"tail -n +{self.chrome_line_cursor + 1} /var/log/chrome/chrome | "
             f"{{ grep -iE 'crostini|baguette|termina|cicerone|concierge|vsh' || [ $? -eq 1 ]; }}",
             check=True,
-            timeout=30,
+            timeout=60,
+            op_desc="scrape_host_logs(/var/log/chrome/chrome)",
+            cmd_summary="tail /var/log/chrome/chrome | grep crostini|...",
         ).stdout.strip()
         for line in self.chrome_excerpt.splitlines():
             parts = line.split(None, 3)
@@ -2803,6 +2830,11 @@ class InitTimelineRecorder:
         finally:
             b_conn.close()
 
+    # On slow 4-vCPU nested-KVM CI runners (load1~7, psi_cpu~50%), a minimal `vsh` call
+    # (`ssh -> sudo -> vsh -> LaunchVshd/RegisterVshSession`) takes ~22s just to open the
+    # guest shell; 120s leaves ~4-5x headroom for vsh startup plus systemd/journal queries.
+    GUEST_DIAG_TIMEOUT_SEC = 120
+
     def _collect_guest_diagnostics(
         self, first_host_setup_user_rel: float | None, strict_dbus: bool = True
     ) -> None:
@@ -2817,65 +2849,105 @@ class InitTimelineRecorder:
             "SYSLOG_IDENTIFIER=useradd SYSLOG_IDENTIFIER=usermod "
             "SYSLOG_IDENTIFIER=garcon SYSLOG_IDENTIFIER=sommelier SYSLOG_IDENTIFIER=vshd"
         )
+        journal_fields = "MESSAGE,_COMM,SYSLOG_IDENTIFIER,_SYSTEMD_UNIT,UNIT"
+        sys_summary_sh = (
+            'echo "===GUEST_CLOCK_SYNC==="; '
+            "read -r up _ < /proc/uptime; "
+            'echo "uptime_sec=$up"; '
+            'date -u +"epoch_sec=%s.%N"; '
+            + id_check_cmd
+            + 'echo "===GUEST_LIST_JOBS==="; '
+            "systemctl list-jobs --no-pager 2>&1; "
+            'echo "===GUEST_SYSTEMD_UNIT_SHOW==="; '
+            "systemctl show --no-pager "
+            "-p Id -p ActiveState -p SubState -p Result "
+            "-p InactiveExitTimestampMonotonic -p ActiveEnterTimestampMonotonic "
+            "-p ActiveExitTimestampMonotonic -p InactiveEnterTimestampMonotonic "
+            "-p ExecMainStartTimestampMonotonic -p ExecMainExitTimestampMonotonic "
+            "-p ExecMainStatus "
+            "first-boot-cros.service maitred.service vshd.service systemd-logind.service "
+            "ldconfig.service user-runtime-dir@1000.service user@1000.service; "
+            'echo "===GUEST_ANALYZE==="; '
+            "systemd-analyze --no-pager 2>&1; "
+            'echo "===GUEST_BLAME==="; '
+            "systemd-analyze blame --no-pager 2>&1 | sed -n '1,8p'; "
+        )
+        journal_sh = (
+            'echo "===GUEST_JOURNAL_JSON==="; '
+            f"journalctl -b -o json --output-fields={journal_fields} --no-pager "
+            f"{journal_filter_args} | sed -n '1,400p'"
+        )
         user_env_prefix = (
             "setpriv --reuid=1000 --regid=1000 --init-groups "
             "env XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus "
         )
-        steps: list[tuple[str, int, str]] = [
-            (
-                "system_diag",
-                35,
-                shell_flags
-                + 'echo "===GUEST_CLOCK_SYNC==="; '
-                + "read -r up _ < /proc/uptime; "
-                + 'echo "uptime_sec=$up"; '
-                + 'date -u +"epoch_sec=%s.%N"; '
-                + id_check_cmd
-                + 'echo "===GUEST_LIST_JOBS==="; '
-                + "systemctl list-jobs --no-pager 2>&1; "
-                + 'echo "===GUEST_SYSTEMD_UNIT_SHOW==="; '
-                + "systemctl show --no-pager "
-                + "-p Id -p ActiveState -p SubState -p Result "
-                + "-p InactiveExitTimestampMonotonic -p ActiveEnterTimestampMonotonic "
-                + "-p ActiveExitTimestampMonotonic -p InactiveEnterTimestampMonotonic "
-                + "-p ExecMainStartTimestampMonotonic -p ExecMainExitTimestampMonotonic "
-                + "-p ExecMainStatus "
-                + "first-boot-cros.service maitred.service vshd.service systemd-logind.service "
-                + "ldconfig.service user-runtime-dir@1000.service user@1000.service; "
-                + 'echo "===GUEST_ANALYZE==="; '
-                + "systemd-analyze --no-pager 2>&1; "
-                + 'echo "===GUEST_BLAME==="; '
-                + "systemd-analyze blame --no-pager 2>&1; "
-                + 'echo "===GUEST_CRITICAL_CHAIN==="; '
-                + "systemd-analyze critical-chain --no-pager 2>&1; "
-                + 'echo "===GUEST_JOURNAL_JSON==="; '
-                + f"journalctl -b -o json --no-pager {journal_filter_args}",
-            ),
-            (
-                "user_diag",
-                30,
-                shell_flags
-                + 'echo "===GUEST_USER_ANALYZE==="; '
-                + f"{user_env_prefix}systemd-analyze --user --no-pager 2>&1; "
-                + 'echo "===GUEST_USER_BLAME==="; '
-                + f"{user_env_prefix}systemd-analyze --user blame --no-pager 2>&1; "
-                + 'echo "===GUEST_USER_CRITICAL_CHAIN==="; '
-                + f"{user_env_prefix}systemd-analyze --user critical-chain --no-pager 2>&1; "
-                + 'echo "===GUEST_GARCON_STATUS==="; '
-                + f"{user_env_prefix}systemctl --user status cros-garcon.service "
-                + "sommelier@0.service sommelier-x@0.service sommelier@1.service sommelier-x@1.service --no-pager 2>&1",
-            ),
-        ]
+        user_summary_inner = (
+            f"{shell_flags}"
+            'echo "===GUEST_USER_ANALYZE==="; '
+            "systemd-analyze --user --no-pager 2>&1; "
+            'echo "===GUEST_USER_BLAME==="; '
+            "systemd-analyze --user blame --no-pager 2>&1 | sed -n '1,8p'"
+        )
+        if strict_dbus:
+            steps: list[tuple[str, int, str]] = [
+                (
+                    "guest_diag:summary",
+                    self.GUEST_DIAG_TIMEOUT_SEC,
+                    shell_flags
+                    + sys_summary_sh
+                    + f"{user_env_prefix}bash -c {shlex.quote(user_summary_inner)}; "
+                    + journal_sh,
+                )
+            ]
+        else:
+            user_verbose_inner = (
+                f"{user_summary_inner}; "
+                'echo "===GUEST_USER_CRITICAL_CHAIN==="; '
+                "systemd-analyze --user critical-chain --no-pager 2>&1; "
+                'echo "===GUEST_GARCON_STATUS==="; '
+                "systemctl --user status cros-garcon.service "
+                "sommelier@0.service sommelier-x@0.service sommelier@1.service sommelier-x@1.service --no-pager 2>&1"
+            )
+            steps = [
+                (
+                    "guest_diag:system",
+                    self.GUEST_DIAG_TIMEOUT_SEC,
+                    shell_flags
+                    + sys_summary_sh
+                    + 'echo "===GUEST_CRITICAL_CHAIN==="; '
+                    + "systemd-analyze critical-chain --no-pager 2>&1; "
+                    + journal_sh,
+                ),
+                (
+                    "guest_diag:user",
+                    self.GUEST_DIAG_TIMEOUT_SEC,
+                    f"{user_env_prefix}bash -c {shlex.quote(user_verbose_inner)}",
+                ),
+            ]
 
         combined_chunks: list[str] = []
         step_errors: list[str] = []
         for step_name, step_timeout, remote_sh in steps:
             if strict_dbus:
-                res = self.vm.vsh("termina", "root", remote_sh, check=True, timeout=step_timeout)
+                res = self.vm.vsh(
+                    "termina",
+                    "root",
+                    remote_sh,
+                    check=True,
+                    timeout=step_timeout,
+                    op_desc=step_name,
+                )
                 combined_chunks.append(res.stdout)
             else:
                 try:
-                    res = self.vm.vsh("termina", "root", remote_sh, check=False, timeout=step_timeout)
+                    res = self.vm.vsh(
+                        "termina",
+                        "root",
+                        remote_sh,
+                        check=False,
+                        timeout=step_timeout,
+                        op_desc=step_name,
+                    )
                     if res.stdout:
                         combined_chunks.append(res.stdout)
                     if res.returncode != 0:
@@ -2894,6 +2966,7 @@ class InitTimelineRecorder:
             "\n".join(combined_chunks),
             first_host_setup_user_rel=first_host_setup_user_rel,
             strict=strict_dbus,
+            include_verbose=not strict_dbus,
         )
 
     def _collect_resource_diagnostics(self, strict_dbus: bool = True) -> None:
@@ -2918,12 +2991,24 @@ class InitTimelineRecorder:
 
         if not self._final_res_snapshot_taken and self.vm is not None:
             if strict_dbus:
-                fin_res = self.vm.ssh(CROS_RESOURCE_SNAPSHOT_CMD, check=True, timeout=20)
+                fin_res = self.vm.ssh(
+                    CROS_RESOURCE_SNAPSHOT_CMD,
+                    check=True,
+                    timeout=45,
+                    op_desc="resource_diag:final_snapshot",
+                    cmd_summary="python3 <CROS_RESOURCE_SNAPSHOT>",
+                )
                 self._record_resource_json_line(fin_res.stdout.strip(), time.monotonic())
                 self._final_res_snapshot_taken = True
             else:
                 try:
-                    fin_res = self.vm.ssh(CROS_RESOURCE_SNAPSHOT_CMD, check=False, timeout=15)
+                    fin_res = self.vm.ssh(
+                        CROS_RESOURCE_SNAPSHOT_CMD,
+                        check=False,
+                        timeout=30,
+                        op_desc="resource_diag:final_snapshot",
+                        cmd_summary="python3 <CROS_RESOURCE_SNAPSHOT>",
+                    )
                     if fin_res.returncode == 0 and fin_res.stdout.strip():
                         self._record_resource_json_line(fin_res.stdout.strip(), time.monotonic())
                         self._final_res_snapshot_taken = True
@@ -2998,7 +3083,9 @@ class InitTimelineRecorder:
         for stream in (self._mon_stream, self._res_stream):
             if stream is not None:
                 stream.stop()
+        set_vm_step = getattr(self.vm, "set_step", lambda _s: None)
 
+        set_vm_step("step5:collect_resources")
         self._collect_section(
             "resources",
             "Resource diagnostics error",
@@ -3026,6 +3113,7 @@ class InitTimelineRecorder:
                 )
             self._collected_sections.add("header")
 
+        set_vm_step("step5:collect_readonly_dbus")
         self._collect_section(
             "readonly_dbus",
             "Read-only D-Bus snapshot error",
@@ -3034,6 +3122,7 @@ class InitTimelineRecorder:
             lambda: self._collect_readonly_dbus_snapshot(strict_dbus=strict_dbus),
             rollback_list=self.readonly_summary_lines,
         )
+        set_vm_step("step5:collect_uma_histograms")
         self._collect_section(
             "uma",
             "UMA histogram query error",
@@ -3042,6 +3131,7 @@ class InitTimelineRecorder:
             lambda: self._collect_uma_histograms(strict_dbus=strict_dbus),
             rollback_list=self.readonly_summary_lines,
         )
+        set_vm_step("step5:collect_host_logs")
         self._collect_section(
             "host_logs",
             "Host log scrape error",
@@ -3049,6 +3139,7 @@ class InitTimelineRecorder:
             strict_dbus,
             lambda: setattr(self, "_first_host_setup_user_rel", self.scrape_host_logs()),
         )
+        set_vm_step("step5:collect_guest_diag")
         self._collect_section(
             "guest_diag",
             "Guest diagnostics error",
@@ -3065,6 +3156,7 @@ class InitTimelineRecorder:
         raw_out: str,
         first_host_setup_user_rel: float | None = None,
         strict: bool = True,
+        include_verbose: bool = True,
     ) -> None:
         sections: dict[str, list[str]] = {}
         cur_sec: str | None = None
@@ -3275,6 +3367,8 @@ class InitTimelineRecorder:
             ("systemd-analyze --user critical-chain (terminauser@)", "GUEST_USER_CRITICAL_CHAIN", 80, True),
             ("systemctl --user status cros-garcon & sommelier", "GUEST_GARCON_STATUS", 80, True),
         ):
+            if verbose_only and not include_verbose:
+                continue
             sec_lines = [ln for ln in sections.get(key, []) if ln.strip()]
             dest = self.guest_verbose_lines if verbose_only else self.guest_summary_lines
             if not sec_lines:
@@ -3285,7 +3379,7 @@ class InitTimelineRecorder:
             dest.append(f"[{label}]")
             dest.extend(f"  {ln}" for ln in sec_lines[:max_lines])
 
-        if parsed_json:
+        if include_verbose and parsed_json:
             self.guest_verbose_lines.append("[journalctl -b (monotonic, filtered)]")
             for obj, mono_us, _rt_us in parsed_json[:140]:
                 ident_label = str(obj.get("SYSLOG_IDENTIFIER") or obj.get("_COMM") or "guest")
@@ -3531,37 +3625,77 @@ class ChromeOSVM:
             "root@127.0.0.1",
         ]
 
+    def _run_vm_cmd(
+        self,
+        argv: list[str],
+        *,
+        op_desc: str,
+        cmd_summary: str,
+        timeout: int,
+        check: bool = True,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        t0 = time.monotonic()
+        try:
+            return subprocess.run(
+                argv, check=check, text=True, timeout=timeout, capture_output=capture_output
+            )
+        except subprocess.TimeoutExpired as exc:
+            raw_err = (
+                exc.stderr.decode("utf-8", "replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+            err_snip = " | ".join(ln.strip() for ln in raw_err.splitlines() if ln.strip())[:160]
+            ctx = format_vm_cmd_error_context(
+                operation=op_desc,
+                step=self.get_step(),
+                cmd_summary=_summarize_cmd(cmd_summary),
+                elapsed_sec=time.monotonic() - t0,
+                timeout_sec=timeout,
+            )
+            raise VMCommandTimeoutError(
+                f"VM command timed out ({ctx})" + (f"; stderr={err_snip!r}" if err_snip else "")
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            log(
+                f"VM command failed ({op_desc}, step={self.get_step()!r}, rc={exc.returncode}):\n"
+                f"STDOUT:\n{exc.stdout}\nSTDERR:\n{exc.stderr}"
+            )
+            raise
+
     def ssh(
         self,
         remote_cmd: str,
         check: bool = True,
         timeout: int = 300,
         capture_output: bool = True,
+        *,
+        op_desc: str = "ssh",
+        cmd_summary: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(
-                [*self._ssh_base_cmd(), remote_cmd],
-                check=check,
-                text=True,
-                timeout=timeout,
-                capture_output=capture_output,
-            )
-        except subprocess.CalledProcessError as exc:
-            log(f"SSH command failed (rc={exc.returncode}):\nSTDOUT:\n{exc.stdout}\nSTDERR:\n{exc.stderr}")
-            raise
+        return self._run_vm_cmd(
+            [*self._ssh_base_cmd(), remote_cmd],
+            op_desc=op_desc,
+            cmd_summary=cmd_summary or remote_cmd,
+            timeout=timeout,
+            check=check,
+            capture_output=capture_output,
+        )
 
-    def scp_to(self, local_path: Path, remote_path: str) -> None:
-        subprocess.run(
-            [
-                "scp",
-                *self._ssh_common_opts(),
-                "-P",
-                str(self.ssh_port),
-                str(local_path),
-                f"root@127.0.0.1:{remote_path}",
-            ],
-            check=True,
-            timeout=180,
+    def scp_to(
+        self,
+        local_path: Path,
+        remote_path: str,
+        *,
+        timeout: int = 180,
+        op_desc: str = "scp_to",
+    ) -> None:
+        self._run_vm_cmd(
+            ["scp", *self._ssh_common_opts(), "-P", str(self.ssh_port), str(local_path), f"root@127.0.0.1:{remote_path}"],
+            op_desc=op_desc,
+            cmd_summary=f"{local_path.name} -> {remote_path}",
+            timeout=timeout,
         )
 
     def dbus_call_proto(
@@ -3570,7 +3704,7 @@ class ChromeOSVM:
         method: str,
         req_msg: Message,
         resp_cls: type[TMessage],
-        timeout: int = 15,
+        timeout: int = 30,
     ) -> tuple[TMessage, bytes]:
         """Executes a synchronous D-Bus protobuf method call on the system bus and validates the reply."""
         obj_path = "/" + dest.replace(".", "/")
@@ -3581,6 +3715,8 @@ class ChromeOSVM:
             f"{to_dbus_byte_arg(req_msg.SerializeToString())}",
             check=True,
             timeout=timeout,
+            op_desc=f"dbus_call_proto({ctx})",
+            cmd_summary=f"dbus-send {dest}.{method}",
         )
         raw_resp = parse_dbus_send_byte_array(res.stdout, ctx)
         return parse_and_validate_proto(raw_resp, resp_cls, ctx), raw_resp
@@ -3592,7 +3728,8 @@ class ChromeOSVM:
         sh_script: str,
         *,
         check: bool = True,
-        timeout: int = 30,
+        timeout: int = 60,
+        op_desc: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Runs `sh -lc <sh_script>` inside `vm_name` via `vsh` as `chronos`."""
         assert self.owner_hash
@@ -3601,7 +3738,13 @@ class ChromeOSVM:
             f"vsh --vm_name={shlex.quote(vm_name)} --owner_id={shlex.quote(self.owner_hash)} "
             f"--user={shlex.quote(user)} -- sh -lc {shlex.quote(sh_script)}"
         )
-        return self.ssh(cmd, check=check, timeout=timeout)
+        return self.ssh(
+            cmd,
+            check=check,
+            timeout=timeout,
+            op_desc=op_desc or f"vsh({vm_name},{user})",
+            cmd_summary=sh_script,
+        )
 
     def vmc(self, *args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
         """Runs non-interactive `vmc <args...>` as `chronos`."""
@@ -3611,24 +3754,40 @@ class ChromeOSVM:
             f"sudo -u chronos CROS_USER_ID_HASH={shlex.quote(self.owner_hash)} "
             f"VMC_NONINTERACTIVE=1 vmc {quoted}",
             timeout=timeout,
+            op_desc=f"vmc({args[0]})" if args else "vmc",
+            cmd_summary=f"vmc {' '.join(args)}",
         )
 
     def wait_for_ssh(
         self, timeout_sec: int = 90, different_from_boot_id: str | None = None
     ) -> str:
-        deadline = time.monotonic() + timeout_sec
+        t0 = time.monotonic()
+        deadline = t0 + timeout_sec
         while time.monotonic() < deadline:
-            res = self.ssh(
-                "cat /proc/sys/kernel/random/boot_id", check=False, timeout=8
-            )
-            if res.returncode == 0:
+            try:
+                res = self.ssh(
+                    "cat /proc/sys/kernel/random/boot_id",
+                    check=False,
+                    timeout=8,
+                    op_desc="wait_for_ssh:probe",
+                )
+            except VMCommandTimeoutError:
+                res = None
+            if res is not None and res.returncode == 0:
                 boot_id = res.stdout.strip()
                 if boot_id and (
                     different_from_boot_id is None or boot_id != different_from_boot_id
                 ):
                     return boot_id
             time.sleep(1.5)
-        raise TimeoutError(f"Timed out waiting for SSH on 127.0.0.1:{self.ssh_port}")
+        ctx = format_vm_cmd_error_context(
+            operation="wait_for_ssh",
+            step=self.get_step(),
+            cmd_summary=f"ssh root@127.0.0.1:{self.ssh_port} boot_id",
+            elapsed_sec=time.monotonic() - t0,
+            timeout_sec=timeout_sec,
+        )
+        raise VMCommandTimeoutError(f"Timed out waiting for SSH ({ctx})")
 
     def assert_guest_kvm_available(self) -> None:
         res = self.ssh("test -c /dev/kvm", check=False, timeout=15)
@@ -3721,6 +3880,7 @@ class ChromeOSVM:
             f"Booting QEMU ChromeOS VM on SSH port {self.ssh_port} "
             f"(ram={self.ram_gb}G, smp={self.smp}, cpu={cpu_arg})..."
         )
+        self.set_step("prepare:boot_cros_vm")
         subprocess.run(qemu_cmd, check=True)
         self.wait_for_ssh()
         lsb_release = self.ssh("cat /etc/lsb-release").stdout
@@ -3754,15 +3914,20 @@ class ChromeOSVM:
             self.pid_file.unlink(missing_ok=True)
 
     def prepare_nested_vm_host_and_login(self, baguette_image: Path) -> str:
+        self.set_step("prepare:remove_rootfs_verification_and_reboot")
         log("Removing rootfs verification to apply nested-KVM vm_concierge fix...")
         pre_boot_id = self.ssh("cat /proc/sys/kernel/random/boot_id").stdout.strip()
         self.ssh(
             "/usr/share/vboot/bin/make_dev_ssd.sh --remove_rootfs_verification --partitions 2"
         )
-        self.ssh("reboot", check=False)
+        try:
+            self.ssh("reboot", check=False, timeout=20, op_desc="prepare:reboot")
+        except VMCommandTimeoutError:
+            pass
         self.wait_for_ssh(timeout_sec=120, different_from_boot_id=pre_boot_id)
         self.assert_guest_kvm_available()
 
+        self.set_step("prepare:resize_stateful_and_patch_concierge")
         log("Expanding /dev/sda1 (/mnt/stateful_partition) and patching vm_concierge for nested KVM...")
         # Why vm_concierge is binary-patched here:
         # In nested KVM on Intel/AMD hosts, QEMU exposes CPU vulnerability sysfs files
@@ -3808,6 +3973,7 @@ sync
         res_setup = self.ssh(setup_script)
         log(f"Stateful partition resized:\n{res_setup.stdout.strip()}")
 
+        self.set_step("prepare:autologin")
         log("Logging in ChromeOS session...")
         login_script = """
 set -euo pipefail
@@ -3829,9 +3995,10 @@ dbus-send --system --type=method_call --print-reply \
         self.owner_hash = owner_hash
         log(f"Logged in (IsCrostiniEnabled=true)! CROS_USER_ID_HASH = {owner_hash}")
 
+        self.set_step("prepare:scp_baguette_image")
         remote_dl = f"/home/user/{owner_hash}/MyFiles/Downloads/baguette_arch_rootfs.img.zst"
         log(f"Copying {baguette_image} -> {remote_dl}...")
-        self.scp_to(baguette_image, remote_dl)
+        self.scp_to(baguette_image, remote_dl, op_desc="prepare:scp_baguette_image")
         local_sha = hashlib.sha256(baguette_image.read_bytes()).hexdigest()
         remote_sha = self.ssh(f"sha256sum '{remote_dl}'").stdout.split()[0]
         if local_sha != remote_sha:
@@ -4020,6 +4187,7 @@ dbus-send --system --type=method_call --print-reply \
         return tab
 
     def verify_guest_user_session(self, vm_name: str, expected_username: str) -> None:
+        self.set_step("step5:verify_guest_user_session")
         log(
             f"Verifying in-guest OS, UID/GID 1000, primary group '{expected_username}', "
             f"exact supplementary groups {sorted(EXPECTED_GUEST_SUPPLEMENTARY_GROUPS)}, "
@@ -4039,7 +4207,13 @@ dbus-send --system --type=method_call --print-reply \
             'echo "GARCON=$GARCON"; '
             '[ "$GARCON" = "active" ]'
         )
-        res = self.vsh(vm_name, expected_username, check_script, timeout=30)
+        res = self.vsh(
+            vm_name,
+            expected_username,
+            check_script,
+            timeout=InitTimelineRecorder.GUEST_DIAG_TIMEOUT_SEC,
+            op_desc=f"verify_guest_user_session({vm_name})",
+        )
         kv: dict[str, str] = {}
         for line in res.stdout.strip().splitlines():
             log(f"  [{vm_name}] {line}")
@@ -4622,6 +4796,7 @@ dbus-send --system --type=method_call --print-reply \
             throttler.stop()
             crosh.close()
             if not failed:
+                self.set_step("cleanup:vmc_stop_destroy")
                 self.vmc("stop", "termina")
                 self.vmc("destroy", "termina")
         log("=== Flow (`termina`) PASSED ===")

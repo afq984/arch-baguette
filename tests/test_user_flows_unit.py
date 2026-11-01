@@ -16,6 +16,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -814,6 +815,120 @@ class DiagnosticsAndLogScraperTests(unittest.TestCase):
         )
         self.assertEqual(calls, ["ok", "fail_attempt", "fail_attempt"])
         self.assertTrue(any("Flaky section error: boom" in ln for ln in rec.readonly_summary_lines))
+
+    def test_collect_guest_diagnostics_passing_vs_failure_and_vm_timeouts(self) -> None:
+        unit_blocks = "\n\n".join(
+            f"Id={u}\nActiveState=active\nSubState=running\nResult=success\n"
+            "InactiveExitTimestampMonotonic=1000000\nActiveEnterTimestampMonotonic=2000000\n"
+            "ExecMainStartTimestampMonotonic=1100000\nExecMainExitTimestampMonotonic=0\nExecMainStatus=0"
+            for u in (
+                "first-boot-cros.service",
+                "maitred.service",
+                "vshd.service",
+                "systemd-logind.service",
+                "ldconfig.service",
+                "user-runtime-dir@1000.service",
+                "user@1000.service",
+            )
+        )
+        summary_out = (
+            "===GUEST_CLOCK_SYNC===\nuptime_sec=25.0\nepoch_sec=1025.0\n"
+            "===GUEST_LIST_JOBS===\nNo jobs running.\n"
+            f"===GUEST_SYSTEMD_UNIT_SHOW===\n{unit_blocks}\n"
+            "===GUEST_ANALYZE===\nStartup finished in 2.0s\n"
+            "===GUEST_BLAME===\n0.9s first-boot-cros.service\n"
+            "===GUEST_USER_ANALYZE===\nStartup finished in 0.4s\n"
+            "===GUEST_USER_BLAME===\n0.2s cros-garcon.service\n"
+            "===GUEST_JOURNAL_JSON===\n"
+            + json.dumps(
+                {
+                    "SYSLOG_IDENTIFIER": "maitred",
+                    "MESSAGE": "Received request to setup a new user.",
+                    "__MONOTONIC_TIMESTAMP": "5000000",
+                    "__REALTIME_TIMESTAMP": "1005000000",
+                }
+            )
+            + "\n"
+        )
+        vsh_calls: list[tuple[str, int, str | None]] = []
+
+        class _FakeDiagVM:
+            def vsh(
+                self, _vm: str, _user: str, sh_script: str, *, check: bool = True, timeout: int = 60, op_desc: str | None = None
+            ) -> subprocess.CompletedProcess[str]:
+                vsh_calls.append((sh_script, timeout, op_desc))
+                if not check and op_desc == "guest_diag:user":
+                    raise tuf.VMCommandTimeoutError("VM command timed out (operation='guest_diag:user' step='step5:collect_guest_diag')")
+                extra = "===GUEST_CRITICAL_CHAIN===\nmulti-user.target @1.5s\n" if not check else ""
+                return subprocess.CompletedProcess(["vsh"], 0, stdout=summary_out + extra, stderr="")
+
+        pass_rec = tuf.InitTimelineRecorder(_FakeDiagVM(), "deadbeef")  # type: ignore[arg-type]
+        pass_rec.t_install_vm_epoch = 1000.0
+        pass_rec._collect_guest_diagnostics(first_host_setup_user_rel=6.0, strict_dbus=True)
+        self.assertEqual(len(vsh_calls), 1)
+        sh_pass, pass_timeout, pass_op = vsh_calls[0]
+        self.assertEqual(pass_timeout, 120)
+        self.assertEqual(pass_op, "guest_diag:summary")
+        self.assertIn("--output-fields=MESSAGE,_COMM,SYSLOG_IDENTIFIER,_SYSTEMD_UNIT,UNIT", sh_pass)
+        self.assertNotIn("critical-chain", sh_pass)
+        self.assertNotIn("systemctl --user status", sh_pass)
+        self.assertEqual(pass_rec.guest_verbose_lines, [])
+
+        # Passing path strictly propagates guest diagnostic timeout
+        class _HungVM:
+            def vsh(self, *_a: Any, **_kw: Any) -> subprocess.CompletedProcess[str]:
+                raise tuf.VMCommandTimeoutError("VM command timed out (operation='guest_diag:summary')")
+
+        with self.assertRaises(tuf.VMCommandTimeoutError):
+            tuf.InitTimelineRecorder(_HungVM(), "deadbeef")._collect_guest_diagnostics(6.0, strict_dbus=True)  # type: ignore[arg-type]
+
+        # Failure path fetches verbose dumps and records timeouts without masking primary exception
+        vsh_calls.clear()
+        fail_rec = tuf.InitTimelineRecorder(_FakeDiagVM(), "deadbeef")  # type: ignore[arg-type]
+        fail_rec.t_install_vm_epoch = 1000.0
+        fail_rec._collect_guest_diagnostics(first_host_setup_user_rel=6.0, strict_dbus=False)
+        self.assertEqual([c[2] for c in vsh_calls], ["guest_diag:system", "guest_diag:user"])
+        self.assertIn("critical-chain", vsh_calls[0][0])
+        self.assertIn("systemctl --user status", vsh_calls[1][0])
+        self.assertTrue(any("guest_diag:user" in ln for ln in fail_rec.guest_summary_lines))
+        self.assertTrue(any("critical-chain" in ln for ln in fail_rec.guest_verbose_lines))
+
+        # ChromeOSVM.ssh / vsh / scp_to / wait_for_ssh wrap subprocess.TimeoutExpired with context
+        vm = object.__new__(tuf.ChromeOSVM)
+        vm.ssh_key = Path("/tmp/testing_rsa")
+        vm.ssh_port = 42222
+        vm.owner_hash = "deadbeef"
+        vm._current_step = "step5:collect_guest_diag"
+        with mock.patch.object(
+            tuf.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd=["ssh"], timeout=120, stderr="vsh launch hung\n"),
+        ):
+            with self.assertRaises(tuf.VMCommandTimeoutError) as ctx_vsh:
+                vm.vsh("termina", "root", "journalctl -b -o json", timeout=120, op_desc="guest_diag:summary")
+            msg = str(ctx_vsh.exception)
+            self.assertNotIsInstance(ctx_vsh.exception, subprocess.TimeoutExpired)
+            for tok in (
+                "operation='guest_diag:summary'",
+                "step='step5:collect_guest_diag'",
+                "cmd='journalctl -b -o json'",
+                "timeout=120.0s",
+                "vsh launch hung",
+            ):
+                self.assertIn(tok, msg)
+
+            with self.assertRaises(tuf.VMCommandTimeoutError) as ctx_scp:
+                vm.scp_to(Path("/tmp/baguette.img.zst"), "/home/user/x/baguette.img.zst", timeout=15, op_desc="prepare:scp")
+            self.assertIn("operation='prepare:scp'", str(ctx_scp.exception))
+            self.assertIn("baguette.img.zst -> /home/user/x/baguette.img.zst", str(ctx_scp.exception))
+
+            vm._current_step = "prepare:boot_cros_vm"
+            clock = iter([0.0, 0.0, 0.1, 0.2, 2.0, 2.0])
+            with mock.patch.object(tuf.time, "sleep"), mock.patch.object(tuf.time, "monotonic", side_effect=lambda: next(clock, 2.0)):
+                with self.assertRaises(tuf.VMCommandTimeoutError) as ctx_wssh:
+                    vm.wait_for_ssh(timeout_sec=1)
+            self.assertIn("operation='wait_for_ssh'", str(ctx_wssh.exception))
+            self.assertIn("step='prepare:boot_cros_vm'", str(ctx_wssh.exception))
 
 
 class CDPClientMockTests(unittest.TestCase):
