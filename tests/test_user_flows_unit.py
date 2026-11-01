@@ -1508,6 +1508,136 @@ class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
             self.assertFalse(tuf._pid_matches_qemu(104, "/usr/bin/kvm", proc_root=fp))
             self.assertFalse(tuf._pid_matches_qemu(105, "qemu-system-x86_64", proc_root=fp))
 
+    def test_chrome_dev_conf_cmdline_and_terminal_renderer_guards(self) -> None:
+        base_conf = (
+            "# Comment line\n"
+            "--keep-unrelated-flag=1\n"
+            "--scheduler-configuration-default=conservative\n"
+            "--enable-features=PreEnabled,Baguette\n"
+            "--disable-features=PreDisabled\n"
+        )
+        test_switches = (
+            "--scheduler-configuration-default=performance",
+            "--disable-explicit-dma-fences",
+            "--disable-webgl",
+            "--disable-webgl2",
+        )
+        out1 = tuf.build_chrome_dev_conf(
+            base_conf,
+            switches=test_switches,
+            disable_features=("CryptohomeRecoveryByDefaultForConsumers", "Vulkan"),
+        )
+        self.assertEqual(
+            out1,
+            tuf.build_chrome_dev_conf(
+                out1,
+                switches=test_switches,
+                disable_features=("CryptohomeRecoveryByDefaultForConsumers", "Vulkan"),
+            ),
+        )
+        lines = out1.splitlines()
+        self.assertIn("--keep-unrelated-flag=1", lines)
+        self.assertNotIn("--scheduler-configuration-default=conservative", lines)
+        sched_del_idx = lines.index("!--scheduler-configuration-default")
+        sched_set_idx = lines.index("--scheduler-configuration-default=performance")
+        self.assertLess(sched_del_idx, sched_set_idx)
+        for sw in test_switches:
+            self.assertIn(sw, lines)
+        self.assertIn(
+            "--enable-features=PreEnabled,Baguette,Crostini,CrostiniContainerless",
+            lines,
+        )
+        self.assertIn(
+            "--disable-features=PreDisabled,CryptohomeRecoveryByDefaultForConsumers,Vulkan",
+            lines,
+        )
+
+        good_argv = [
+            "/opt/google/chrome/chrome",
+            "--login-manager",
+            *test_switches,
+            "--enable-features=PreEnabled,Baguette,Crostini,CrostiniContainerless",
+            "--disable-features=DefaultWebAppInstallation,CryptohomeRecoveryByDefaultForConsumers,Vulkan",
+        ]
+        summary = tuf.verify_chrome_browser_cmdline(
+            ("\x00".join(good_argv) + "\x00").encode("utf-8"),
+            switches=test_switches,
+            disable_features=("CryptohomeRecoveryByDefaultForConsumers", "Vulkan"),
+        )
+        self.assertIn("--disable-webgl2", summary)
+        self.assertIn("Vulkan", summary)
+
+        # Reject child Chrome process, missing switch, conflicting scheduler, or clobbered --disable-features
+        with self.assertRaisesRegex(RuntimeError, "Unexpected Chrome browser argv"):
+            tuf.verify_chrome_browser_cmdline(b"/opt/google/chrome/chrome\x00--type=renderer\x00")
+        missing_sw_argv = [a for a in good_argv if a != "--disable-webgl2"]
+        with self.assertRaisesRegex(RuntimeError, "missing expected switches.*--disable-webgl2"):
+            tuf.verify_chrome_browser_cmdline(
+                ("\x00".join(missing_sw_argv) + "\x00").encode("utf-8"),
+                switches=test_switches,
+            )
+        conflict_sched_argv = [
+            good_argv[0],
+            "--scheduler-configuration-default=conservative",
+            *good_argv[1:],
+        ]
+        with self.assertRaisesRegex(RuntimeError, "Conflicting --scheduler-configuration-default"):
+            tuf.verify_chrome_browser_cmdline(
+                ("\x00".join(conflict_sched_argv) + "\x00").encode("utf-8"),
+                switches=test_switches,
+            )
+        clobbered_dis_argv = [
+            *good_argv,
+            "--disable-features=DefaultWebAppInstallation",
+        ]
+        with self.assertRaisesRegex(RuntimeError, "--disable-features= mismatch"):
+            tuf.verify_chrome_browser_cmdline(
+                ("\x00".join(clobbered_dis_argv) + "\x00").encode("utf-8"),
+                switches=test_switches,
+                disable_features=("CryptohomeRecoveryByDefaultForConsumers", "Vulkan"),
+            )
+
+        # Terminal non-WebGL renderer fallback checks
+        c2d_mode = tuf.verify_terminal_renderer_fallback(
+            {
+                "hasScreen": True,
+                "webgl1": False,
+                "webgl2": False,
+                "canvas2dCanvases": 4,
+                "non2dCanvases": 0,
+                "domRowCount": 0,
+            }
+        )
+        self.assertIn("canvas-2d", c2d_mode)
+        dom_mode = tuf.verify_terminal_renderer_fallback(
+            {
+                "hasScreen": True,
+                "webgl1": False,
+                "webgl2": False,
+                "canvas2dCanvases": 0,
+                "non2dCanvases": 0,
+                "domRowCount": 24,
+            }
+        )
+        self.assertIn("dom-rows", dom_mode)
+        for bad_probe, err_pat in (
+            ({"hasScreen": False}, "missing"),
+            (
+                {"hasScreen": True, "webgl1": False, "webgl2": True, "canvas2dCanvases": 1, "non2dCanvases": 0, "domRowCount": 0},
+                "WebGL context unexpectedly available",
+            ),
+            (
+                {"hasScreen": True, "webgl1": False, "webgl2": False, "canvas2dCanvases": 1, "non2dCanvases": 1, "domRowCount": 0},
+                "non-2D/WebGL canvas",
+            ),
+            (
+                {"hasScreen": True, "webgl1": False, "webgl2": False, "canvas2dCanvases": 0, "non2dCanvases": 0, "domRowCount": 0},
+                "neither 2D canvas nor DOM rows",
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, err_pat):
+                tuf.verify_terminal_renderer_fallback(bad_probe)
+
 
 if __name__ == "__main__":
     unittest.main()

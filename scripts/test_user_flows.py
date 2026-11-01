@@ -74,6 +74,163 @@ EXPECTED_GUEST_SUPPLEMENTARY_GROUPS: frozenset[str] = frozenset(
     }
 )
 
+# Chrome command-line switches configured in /etc/chrome_dev.conf for the
+# nested, GPU-less ChromeOS test VM before login:
+# - `--scheduler-configuration-default=performance`: uses the performance CPU
+#   scheduling policy instead of conservative core-scheduling mitigations inside
+#   the nested test VM.
+# - `--disable-explicit-dma-fences`: skips explicit DMA-fence synchronization
+#   in the virtual display and software rendering path where no hardware GPU
+#   fence signaling is present.
+# - `--disable-webgl` and `--disable-webgl2`: disables WebGL1/WebGL2 context
+#   creation so ChromeOS Terminal's xterm.js falls back to its 2D canvas
+#   renderer instead of running WebGL2 shaders on CPU software rasterization.
+TEST_VM_CHROME_SWITCHES: tuple[str, ...] = (
+    "--scheduler-configuration-default=performance",
+    "--disable-explicit-dma-fences",
+    "--disable-webgl",
+    "--disable-webgl2",
+)
+TEST_VM_CHROME_ENABLE_FEATURES: tuple[str, ...] = (
+    "Baguette",
+    "Crostini",
+    "CrostiniContainerless",
+)
+# Disabled Chrome features merged into /etc/chrome_dev.conf before login:
+# - `CryptohomeRecoveryByDefaultForConsumers`: skips consumer cryptohome
+#   recovery setup during automated test login.
+# - `Vulkan`: avoids software Vulkan initialization and worker-thread CPU
+#   overhead in the GPU-less test VM.
+TEST_VM_CHROME_DISABLE_FEATURES: tuple[str, ...] = (
+    "CryptohomeRecoveryByDefaultForConsumers",
+    "Vulkan",
+)
+
+
+def _merge_csv_tokens(existing: Iterable[str], added: Iterable[str]) -> list[str]:
+    merged: list[str] = []
+    for item in (*existing, *added):
+        tok = item.strip()
+        if tok and tok not in merged:
+            merged.append(tok)
+    return merged
+
+
+def build_chrome_dev_conf(
+    existing_text: str,
+    *,
+    switches: Iterable[str] = TEST_VM_CHROME_SWITCHES,
+    enable_features: Iterable[str] = TEST_VM_CHROME_ENABLE_FEATURES,
+    disable_features: Iterable[str] = TEST_VM_CHROME_DISABLE_FEATURES,
+) -> str:
+    """Updates `/etc/chrome_dev.conf` idempotently while merging feature lists."""
+    sw_list = [s.strip() for s in switches if s.strip()]
+    sw_set = set(sw_list)
+    has_sched = any(s.startswith("--scheduler-configuration-default=") for s in sw_list)
+    en_existing: list[str] = []
+    dis_existing: list[str] = []
+    kept_lines: list[str] = []
+    for raw in existing_text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            kept_lines.append(raw)
+            continue
+        if stripped.startswith("--enable-features="):
+            en_existing.extend(stripped.split("=", 1)[1].split(","))
+            continue
+        if stripped.startswith("--disable-features="):
+            dis_existing.extend(stripped.split("=", 1)[1].split(","))
+            continue
+        if stripped in sw_set or (
+            has_sched
+            and (
+                stripped == "!--scheduler-configuration-default"
+                or stripped.startswith("--scheduler-configuration-default=")
+            )
+        ):
+            continue
+        kept_lines.append(raw)
+
+    en_merged = _merge_csv_tokens(en_existing, enable_features)
+    dis_merged = _merge_csv_tokens(dis_existing, disable_features)
+    if kept_lines and kept_lines[-1].strip() != "":
+        kept_lines.append("")
+    if has_sched:
+        kept_lines.append("!--scheduler-configuration-default")
+    kept_lines.extend(sw_list)
+    if en_merged:
+        kept_lines.append(f"--enable-features={','.join(en_merged)}")
+    if dis_merged:
+        kept_lines.append(f"--disable-features={','.join(dis_merged)}")
+    return "\n".join(kept_lines) + "\n"
+
+
+def verify_chrome_browser_cmdline(
+    raw_cmdline: bytes,
+    *,
+    switches: Iterable[str] = TEST_VM_CHROME_SWITCHES,
+    enable_features: Iterable[str] = TEST_VM_CHROME_ENABLE_FEATURES,
+    disable_features: Iterable[str] = TEST_VM_CHROME_DISABLE_FEATURES,
+) -> str:
+    """Asserts Chrome's live `/proc/<pid>/cmdline` includes configured switches and features."""
+    argv = [tok.decode("utf-8", errors="replace") for tok in raw_cmdline.rstrip(b"\x00").split(b"\x00") if tok]
+    if not argv or not argv[0].endswith("/chrome") or any(a.startswith("--type=") for a in argv):
+        raise RuntimeError(f"Unexpected Chrome browser argv: {argv!r}")
+    argv_set = set(argv)
+    missing_sw = [s for s in switches if s not in argv_set]
+    if missing_sw:
+        raise RuntimeError(f"Chrome browser cmdline missing expected switches {missing_sw!r}; argv={argv!r}")
+    sched_args = [a for a in argv if a.startswith("--scheduler-configuration-default=")]
+    if any(s.startswith("--scheduler-configuration-default=") for s in switches) and len(set(sched_args)) != 1:
+        raise RuntimeError(f"Conflicting --scheduler-configuration-default args in Chrome cmdline: {sched_args!r}")
+
+    def _check_features(prefix: str, required: Iterable[str]) -> list[str]:
+        req = [r for r in required if r]
+        flags = [a.split("=", 1)[1] for a in argv if a.startswith(prefix)]
+        if not req:
+            return []
+        if not flags:
+            raise RuntimeError(f"Chrome browser cmdline missing {prefix}... for {req!r}; argv={argv!r}")
+        effective = [f.strip() for f in flags[-1].split(",") if f.strip()]
+        eff_set = set(effective)
+        earlier_all = {f.strip() for val in flags[:-1] for f in val.split(",") if f.strip()}
+        dropped = sorted(earlier_all - eff_set)
+        missing = [r for r in req if r not in eff_set]
+        if missing or dropped:
+            raise RuntimeError(
+                f"Chrome browser {prefix} mismatch (missing={missing!r}, clobbered_earlier={dropped!r}, "
+                f"all_flags={flags!r})"
+            )
+        return effective
+
+    eff_en = _check_features("--enable-features=", enable_features)
+    eff_dis = _check_features("--disable-features=", disable_features)
+    return f"switches={list(switches)} enable_features={eff_en} disable_features={eff_dis}"
+
+
+def verify_terminal_renderer_fallback(
+    probe: Any,
+    *,
+    expect_no_webgl1: bool = True,
+    expect_no_webgl2: bool = True,
+) -> str:
+    """Asserts ChromeOS Terminal fell back from WebGL to its 2D canvas or DOM renderer."""
+    if not isinstance(probe, dict) or not probe.get("hasScreen"):
+        raise RuntimeError(f"Terminal .xterm-screen missing during renderer verification: {probe!r}")
+    webgl1 = bool(probe.get("webgl1"))
+    webgl2 = bool(probe.get("webgl2"))
+    non2d = int(probe.get("non2dCanvases", -1))
+    canvas2d = int(probe.get("canvas2dCanvases", 0))
+    dom_rows = int(probe.get("domRowCount", 0))
+    if (expect_no_webgl1 and webgl1) or (expect_no_webgl2 and webgl2):
+        raise RuntimeError(f"WebGL context unexpectedly available in Terminal tab: {probe!r}")
+    if expect_no_webgl2 and non2d != 0:
+        raise RuntimeError(f"Terminal .xterm-screen still holds non-2D/WebGL canvas(es): {probe!r}")
+    if canvas2d <= 0 and dom_rows <= 0:
+        raise RuntimeError(f"Terminal fallback renderer produced neither 2D canvas nor DOM rows: {probe!r}")
+    mode = "canvas-2d" if canvas2d > 0 else "dom-rows"
+    return f"{mode} (canvas2d={canvas2d}, dom_rows={dom_rows}, webgl1={webgl1}, webgl2={webgl2})"
+
 TMessage = TypeVar("TMessage", bound=Message)
 
 
@@ -3980,7 +4137,13 @@ class ChromeOSVM:
         # untrusted guest VMs unless patched to read "Not affected". We also replace
         # `printk.devkmsg=on` with `quiet loglevel=0 ` so inner crosvm boot logs do not
         # flood serial console I/O.
-        setup_script = """
+        existing_conf = self.ssh(
+            "cat /etc/chrome_dev.conf", op_desc="prepare:read_chrome_dev_conf"
+        ).stdout
+        chrome_dev_conf_b64 = base64.b64encode(
+            build_chrome_dev_conf(existing_conf).encode("utf-8")
+        ).decode("ascii")
+        setup_script = f"""
 set -euo pipefail
 mount -o remount,rw /
 resize2fs /dev/sda1
@@ -3990,27 +4153,26 @@ echo "Not affected" > /etc/not_affected
 chmod 644 /etc/not_affected
 
 python3 -c '
+import base64
 p = "/usr/bin/vm_concierge"
 d = open(p, "rb").read()
 for old in [b"/sys/devices/system/cpu/vulnerabilities/l1tf", b"/sys/devices/system/cpu/vulnerabilities/mds"]:
-    assert old in d, f"Expected {old!r} in {p}"
+    assert old in d, f"Expected {{old!r}} in {{p}}"
     slashes = len(old) - len(b"/etc/not_affected")
     new = b"/etc/" + (b"/" * slashes) + b"not_affected"
     assert len(old) == len(new)
     d = d.replace(old, new)
 old2 = b"printk.devkmsg=on"
 new2 = b"quiet loglevel=0 "
-assert old2 in d, f"Expected {old2!r} in {p}"
+assert old2 in d, f"Expected {{old2!r}} in {{p}}"
 assert len(old2) == len(new2)
 d = d.replace(old2, new2)
 open(p + ".patched", "wb").write(d)
+open("/etc/chrome_dev.conf", "wb").write(base64.b64decode("{chrome_dev_conf_b64}"))
 '
+chmod 644 /etc/chrome_dev.conf
 chmod 755 /usr/bin/vm_concierge.patched
 mv /usr/bin/vm_concierge.patched /usr/bin/vm_concierge
-
-if ! grep -q "enable-features=Baguette" /etc/chrome_dev.conf; then
-  echo "--enable-features=Baguette,Crostini,CrostiniContainerless" >> /etc/chrome_dev.conf
-fi
 stop vm_concierge || true
 sync
 """
@@ -4022,22 +4184,71 @@ sync
         login_script = """
 set -euo pipefail
 stop vm_concierge || true
-/usr/local/autotest/bin/autologin.py -d \
-  --disable-feature=CryptohomeRecoveryByDefaultForConsumers \
-  -w --no-popup-notification
+mapfile -t DIS_ARGS < <(python3 -c '
+import glob
+seen = []
+def add(csv):
+    for f in csv.split(","):
+        f = f.strip()
+        if f and f not in seen:
+            seen.append(f)
+for line in open("/etc/chrome_dev.conf", encoding="utf-8", errors="replace"):
+    s = line.strip()
+    if s.startswith("--disable-features="):
+        add(s.split("=", 1)[1])
+for p in sorted(glob.glob("/proc/[0-9]*/cmdline")):
+    try:
+        argv = [t.decode("utf-8", "replace") for t in open(p, "rb").read().split(b"\\x00") if t]
+    except OSError:
+        continue
+    if argv and argv[0].endswith("/chrome") and not any(a.startswith("--type=") for a in argv):
+        for a in argv:
+            if a.startswith("--disable-features="):
+                add(a.split("=", 1)[1])
+for f in seen:
+    print(f"--disable-feature={f}")
+')
+/usr/local/autotest/bin/autologin.py -d "${DIS_ARGS[@]}" -w --no-popup-notification
 HASH=$(ls /home/user/)
+echo "CROS_OWNER_HASH=$HASH"
 dbus-send --system --type=method_call --print-reply \
   --dest=org.chromium.ChromeFeaturesService /org/chromium/ChromeFeaturesService \
   org.chromium.ChromeFeaturesServiceInterface.IsCrostiniEnabled "string:$HASH"
+python3 -c '
+import base64, glob
+cands = []
+for p in sorted(glob.glob("/proc/[0-9]*/cmdline")):
+    try:
+        raw = open(p, "rb").read()
+    except OSError:
+        continue
+    argv = [t.decode("utf-8", "replace") for t in raw.split(b"\\x00") if t]
+    if argv and argv[0].endswith("/chrome") and not any(a.startswith("--type=") for a in argv):
+        cands.append((int(p.split("/")[2]), raw))
+assert cands, "No root Chrome browser process found in /proc"
+pid, raw = min(cands)
+print(f"CHROME_BROWSER_CMDLINE_B64={pid}:{base64.b64encode(raw).decode()}")
+'
 """
         res_login = self.ssh(login_script, timeout=180)
         if "boolean true" not in res_login.stdout:
             raise RuntimeError(f"IsCrostiniEnabled did not return true:\n{res_login.stdout}")
-        owner_hash = self.ssh("ls /home/user/").stdout.strip()
+        owner_hash = ""
+        cmdline_marker = ""
+        for ln in res_login.stdout.splitlines():
+            if ln.startswith("CROS_OWNER_HASH="):
+                owner_hash = ln.split("=", 1)[1].strip()
+            elif ln.startswith("CHROME_BROWSER_CMDLINE_B64="):
+                cmdline_marker = ln.split("=", 1)[1].strip()
         if not owner_hash:
             raise RuntimeError("Failed to find mounted cryptohome hash under /home/user/")
+        if ":" not in cmdline_marker:
+            raise RuntimeError(f"Missing CHROME_BROWSER_CMDLINE_B64 in autologin output:\n{res_login.stdout}")
+        chrome_pid_str, cmdline_b64 = cmdline_marker.split(":", 1)
+        cmdline_summary = verify_chrome_browser_cmdline(base64.b64decode(cmdline_b64))
         self.owner_hash = owner_hash
         log(f"Logged in (IsCrostiniEnabled=true)! CROS_USER_ID_HASH = {owner_hash}")
+        log(f"Verified Chrome browser (pid={chrome_pid_str}) cmdline: {cmdline_summary}")
 
         self.set_step("prepare:scp_baguette_image")
         remote_dl = f"/home/user/{owner_hash}/MyFiles/Downloads/baguette_arch_rootfs.img.zst"
@@ -4787,6 +4998,36 @@ dbus-send --system --type=method_call --print-reply \
                 f"Confirmed `id -nu` == {username!r} in {active_tab.label}",
             )
             log(f"  [{active_tab.label}] Verified interactive shell user `{username}` at t+{ver_rel:.1f}s")
+            if "--disable-webgl" in TEST_VM_CHROME_SWITCHES or "--disable-webgl2" in TEST_VM_CHROME_SWITCHES:
+                self.set_step("step3:verify_terminal_renderer_fallback")
+                renderer_probe = active_tab.conn.eval_js(
+                    """(() => {
+                        const root = window.term_?.term?.element || document;
+                        const screen = root.querySelector('.xterm-screen');
+                        const probe = document.createElement('canvas');
+                        const canvases = screen ? Array.from(screen.querySelectorAll('canvas')) : [];
+                        let canvas2d = 0, non2d = 0;
+                        for (const c of canvases) {
+                            if (c.getContext('2d')) canvas2d++; else non2d++;
+                        }
+                        const rows = root.querySelector('.xterm-rows');
+                        return {
+                            hasScreen: !!screen,
+                            webgl1: !!(probe.getContext('webgl') || probe.getContext('experimental-webgl')),
+                            webgl2: !!probe.getContext('webgl2'),
+                            canvas2dCanvases: canvas2d,
+                            non2dCanvases: non2d,
+                            domRowCount: rows ? rows.children.length : 0,
+                        };
+                    })()""",
+                    op_desc=f"{active_tab.label}:verify_renderer_fallback",
+                )
+                renderer_summary = verify_terminal_renderer_fallback(
+                    renderer_probe,
+                    expect_no_webgl1="--disable-webgl" in TEST_VM_CHROME_SWITCHES,
+                    expect_no_webgl2="--disable-webgl2" in TEST_VM_CHROME_SWITCHES,
+                )
+                log(f"  [{active_tab.label}] Verified non-WebGL Terminal renderer: {renderer_summary}")
         finally:
             if throttler is not None:
                 throttler.stop()
