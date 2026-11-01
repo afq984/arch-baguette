@@ -884,6 +884,13 @@ def format_vm_cmd_error_context(
     )
 
 
+def _sleep_backoff(interval: float, max_interval: float, deadline: float) -> float:
+    rem = deadline - time.monotonic()
+    if rem > 0:
+        time.sleep(min(interval, rem))
+    return min(max_interval, interval * 1.4) if interval >= 0.2 else interval
+
+
 def _is_ws_timeout_exc(exc: BaseException) -> bool:
     if isinstance(exc, (TimeoutError, socket.timeout)):
         return True
@@ -1109,6 +1116,7 @@ class CDPConnection:
         op_desc: str,
         timeout: float = 30.0,
         interval: float = 0.5,
+        max_interval: float = 2.0,
     ) -> Any:
         """Evaluates `expression` until `done_pred(val)` holds or raises `CDPTimeoutError`."""
         t0 = time.monotonic()
@@ -1118,7 +1126,7 @@ class CDPConnection:
             last_val = self.eval_js(expression, op_desc=op_desc)
             if done_pred(last_val):
                 return last_val
-            time.sleep(interval)
+            interval = _sleep_backoff(interval, max_interval, deadline)
         ctx = self._ctx(op_desc, time.monotonic() - t0, timeout)
         raise CDPTimeoutError(
             f"Timed out in {op_desc} ({ctx}; last state={last_val!r})"
@@ -1138,18 +1146,28 @@ class CroshTab:
         self.label = label
         self.conn = conn
 
-    def get_text(self, timeout: float | None = None) -> str:
-        js = """(() => {
-            if (!window.term_ || !window.term_.term || !window.term_.term.buffer) return '';
-            const buf = window.term_.term.buffer.active;
+    def get_text(
+        self, timeout: float | None = None, *, max_lines: int | None = None
+    ) -> str:
+        limit = int(max_lines) if (max_lines is not None and max_lines > 0) else 0
+        js = f"""(() => {{
+            const buf = window.term_?.term?.buffer?.active;
+            if (!buf) return '';
+            let end = buf.length - 1;
+            while (end >= 0) {{
+                const ln = buf.getLine(end);
+                if (ln && ln.translateToString(true) !== '') break;
+                end--;
+            }}
+            if (end < 0) return '';
+            const start = {limit} > 0 ? Math.max(0, end - {limit} + 1) : 0;
             const lines = [];
-            for (let i = 0; i < buf.length; i++) {
-                const line = buf.getLine(i);
-                if (line) lines.push(line.translateToString(true));
-            }
-            while (lines.length && lines[lines.length - 1] === '') lines.pop();
+            for (let i = start; i <= end; i++) {{
+                const ln = buf.getLine(i);
+                if (ln) lines.push(ln.translateToString(true));
+            }}
             return lines.join('\\n');
-        })()"""
+        }})()"""
         return (
             self.conn.eval_js(
                 js,
@@ -1204,7 +1222,16 @@ class CroshTab:
             op_desc=f"{self.label}.send_line(Enter keyUp)",
         )
 
-    def wait_for(self, predicate, timeout: float = 120.0, desc: str = "output") -> str:
+    def wait_for(
+        self,
+        predicate: Callable[[str], bool],
+        timeout: float = 120.0,
+        desc: str = "output",
+        *,
+        interval: float = 0.5,
+        max_interval: float = 2.5,
+        max_lines: int | None = None,
+    ) -> str:
         t0 = time.monotonic()
         deadline = t0 + timeout
         last = ""
@@ -1213,13 +1240,17 @@ class CroshTab:
             if rem <= 0:
                 break
             per_call_timeout = min(self.conn.default_timeout, max(5.0, rem))
-            last = self.get_text(timeout=per_call_timeout)
+            last = self.get_text(timeout=per_call_timeout, max_lines=max_lines)
             if predicate(last):
                 return last
-            sleep_sec = min(0.5, max(0.0, deadline - time.monotonic()))
-            if sleep_sec <= 0:
+            if deadline - time.monotonic() <= 0:
                 break
-            time.sleep(sleep_sec)
+            interval = _sleep_backoff(interval, max_interval, deadline)
+        if max_lines is not None:
+            try:
+                last = self.get_text(timeout=5.0) or last
+            except Exception:
+                pass
         elapsed = time.monotonic() - t0
         ctx = self.conn._ctx(f"{self.label}.wait_for({desc})", elapsed, timeout)
         raise CDPTimeoutError(
@@ -1244,6 +1275,19 @@ class CroshTab:
                 f"Command `{cmd}` failed in {self.label}:\n{delta.strip()}"
             )
         return delta.strip()
+
+    def suppress_beforeunload(self) -> None:
+        try:
+            self.conn.eval_js(
+                "window.onbeforeunload = null; "
+                "if (window.BeforeUnloadEvent) { "
+                "BeforeUnloadEvent.prototype.preventDefault = () => {}; "
+                "Object.defineProperty(BeforeUnloadEvent.prototype, 'returnValue', { set() {} }); }",
+                timeout=2.0,
+                op_desc=f"{self.label}.suppress_beforeunload",
+            )
+        except Exception:
+            pass
 
     def close(self) -> None:
         self.conn.close()
@@ -4107,6 +4151,7 @@ dbus-send --system --type=method_call --print-reply \
         target_id: str = "<pending>",
         timeout: float = 30.0,
         interval: float = 0.4,
+        max_interval: float = 2.0,
         require_ws: bool = True,
         err_prefix: str | None = None,
     ) -> dict[str, Any]:
@@ -4117,7 +4162,7 @@ dbus-send --system --type=method_call --print-reply \
             for tgt in self.list_cdp_targets():
                 if (not require_ws or "webSocketDebuggerUrl" in tgt) and predicate(tgt):
                     return tgt
-            time.sleep(interval)
+            interval = _sleep_backoff(interval, max_interval, deadline)
         ctx = format_cdp_error_context(
             operation=operation,
             target_label=target_label,
@@ -4129,6 +4174,54 @@ dbus-send --system --type=method_call --print-reply \
         )
         prefix = err_prefix or f"Timed out waiting for CDP target {target_label!r}"
         raise CDPTimeoutError(f"{prefix} ({ctx})")
+
+    def close_cdp_targets(self, target_ids: Iterable[str], *, label: str = "target") -> int:
+        ids = [tid for tid in dict.fromkeys(target_ids) if tid and not tid.startswith("<")]
+        if not ids:
+            return 0
+        closed = 0
+        try:
+            browser_conn = self.connect_browser_cdp(label=f"Browser-Close({label})")
+        except (CDPError, CDPTimeoutError):
+            return 0
+        try:
+            for tid in ids:
+                res = browser_conn.call(
+                    "Target.closeTarget",
+                    {"targetId": tid},
+                    timeout=15.0,
+                    allow_error=True,
+                    op_desc=f"close_cdp_target({label}:{tid})",
+                )
+                if res.get("success"):
+                    closed += 1
+        except (CDPError, CDPTimeoutError):
+            pass
+        finally:
+            browser_conn.close()
+        return closed
+
+    def close_cdp_targets_matching(
+        self, url_substr: str, *, label: str, exclude_ids: set[str] | None = None
+    ) -> int:
+        skip = exclude_ids or set()
+        try:
+            tids = [
+                str(t.get("id", ""))
+                for t in self.list_cdp_targets()
+                if str(t.get("id", "")) not in skip and url_substr in str(t.get("url", ""))
+            ]
+        except (CDPError, CDPTimeoutError):
+            return 0
+        return self.close_cdp_targets(tids, label=label)
+
+    def close_crosh_tab(self, tab: CroshTab | None) -> None:
+        if tab is None:
+            return
+        tid = tab.conn.target_id
+        tab.suppress_beforeunload()
+        tab.close()
+        self.close_cdp_targets([tid], label=tab.label)
 
     def connect_cdp_target(
         self,
@@ -4182,6 +4275,7 @@ dbus-send --system --type=method_call --print-reply \
             lambda txt: txt.rstrip().endswith("crosh>"),
             timeout=45.0,
             desc=f"{label} initial crosh> prompt",
+            max_lines=8,
         )
         log(f"Opened {label} (`chrome-untrusted://crosh/`, target={tid})")
         return tab
@@ -4333,6 +4427,7 @@ dbus-send --system --type=method_call --print-reply \
             interval=0.5,
             err_prefix="`chrome://crostini-installer` dialog did not open after clicking Set up",
         )
+        self.close_cdp_targets_matching("chrome://os-settings", label="OS-Settings")
         try:
             self.set_step("step2:installer_click_next")
             installer_conn.poll_js(
@@ -4376,12 +4471,44 @@ dbus-send --system --type=method_call --print-reply \
             log("  Waiting for `chrome://crostini-installer` to finish provisioning `termina`...")
             installer_finish_timeout = 420.0
             t0 = time.monotonic()
+            deadline = t0 + installer_finish_timeout
+            poll_interval = 1.0
             last_status: dict[str, str] = {"err": "", "installing": ""}
-            while time.monotonic() - t0 < installer_finish_timeout:
+            while time.monotonic() < deadline:
                 timeline.check_no_fatal_error()
-                targets = self.list_cdp_targets()
+                eval_err: Exception | None = None
+                try:
+                    status = installer_conn.eval_js(
+                        """(() => {
+                        const app = document.querySelector('crostini-installer-app');
+                        if (!app || !app.shadowRoot) return null;
+                        const err = app.shadowRoot.querySelector('#error-message:not([hidden]) div')?.innerText?.trim()
+                            || app.shadowRoot.querySelector('#error-message div')?.innerText?.trim();
+                        const installing = app.shadowRoot.querySelector('#installing-message div')?.innerText?.trim();
+                        return { err: err || '', installing: installing || '' };
+                    })()""",
+                        timeout=30.0,
+                        op_desc="Crostini-Installer:poll_status",
+                    )
+                except (CDPError, CDPTimeoutError) as exc:
+                    eval_err = exc
+                    status = None
+                if isinstance(status, dict):
+                    if status.get("installing"):
+                        last_status["installing"] = status["installing"]
+                    if status.get("err"):
+                        last_status["err"] = status["err"]
+                        raise RuntimeError(
+                            f"`chrome://crostini-installer` failed with UI error: {status['err']} "
+                            f"(last progress: {last_status.get('installing')!r})"
+                        )
+                    poll_interval = _sleep_backoff(poll_interval, 3.0, deadline)
+                    continue
+
+                # Only query `/json/list` when `eval_js` returned null or closed/failed.
                 installer_open = any(
-                    "chrome://crostini-installer" in x.get("url", "") for x in targets
+                    "chrome://crostini-installer" in x.get("url", "")
+                    for x in self.list_cdp_targets()
                 )
                 if not installer_open:
                     if last_status.get("err"):
@@ -4415,39 +4542,9 @@ dbus-send --system --type=method_call --print-reply \
                         f"Terminal app vmshell target={vmshell_tgt.get('id')})."
                     )
                     return vmshell_tgt
-                try:
-                    status = installer_conn.eval_js(
-                        """(() => {
-                        const app = document.querySelector('crostini-installer-app');
-                        if (!app || !app.shadowRoot) return null;
-                        const err = app.shadowRoot.querySelector('#error-message:not([hidden]) div')?.innerText?.trim()
-                            || app.shadowRoot.querySelector('#error-message div')?.innerText?.trim();
-                        const installing = app.shadowRoot.querySelector('#installing-message div')?.innerText?.trim();
-                        return { err: err || '', installing: installing || '' };
-                    })()""",
-                        timeout=30.0,
-                        op_desc="Crostini-Installer:poll_status",
-                    )
-                except (CDPError, CDPTimeoutError):
-                    # If the installer dialog closed while `eval_js` was in flight, the next loop
-                    # iteration handles `not installer_open`; if it is still open, fail immediately.
-                    still_open = any(
-                        "chrome://crostini-installer" in x.get("url", "")
-                        for x in self.list_cdp_targets()
-                    )
-                    if still_open:
-                        raise
-                    status = None
-                if isinstance(status, dict):
-                    if status.get("installing"):
-                        last_status["installing"] = status["installing"]
-                    if status.get("err"):
-                        last_status["err"] = status["err"]
-                        raise RuntimeError(
-                            f"`chrome://crostini-installer` failed with UI error: {status['err']} "
-                            f"(last progress: {last_status.get('installing')!r})"
-                        )
-                time.sleep(1.5)
+                if eval_err is not None:
+                    raise eval_err
+                poll_interval = _sleep_backoff(poll_interval, 3.0, deadline)
             ctx = installer_conn._ctx(
                 "Crostini-Installer:wait_for_finish",
                 time.monotonic() - t0,
@@ -4523,11 +4620,12 @@ dbus-send --system --type=method_call --print-reply \
     ) -> tuple[str, str]:
         """Polls `tab` until prompt (`'prompt'`), vmshell error (`'error'`), or deadline (`'timeout'`)."""
         deadline = time.monotonic() + timeout
+        poll_interval = 0.5
         first_output_logged = False
         last_txt = ""
         while time.monotonic() < deadline:
             timeline.check_no_fatal_error()
-            txt = tab.get_text()
+            txt = tab.get_text(max_lines=24)
             last_txt = txt
             if not first_output_logged and txt.strip():
                 first_output_logged = True
@@ -4543,8 +4641,12 @@ dbus-send --system --type=method_call --print-reply \
                 or "[process exited" in txt
                 or "ERROR vsh:" in txt
             ):
-                return "error", txt
-            time.sleep(0.5)
+                return "error", (tab.get_text() or txt)
+            poll_interval = _sleep_backoff(poll_interval, 2.5, deadline)
+        try:
+            last_txt = tab.get_text() or last_txt
+        except Exception:
+            pass
         return "timeout", last_txt
 
     def verify_terminal_app_with_readiness_gate(
@@ -4621,6 +4723,13 @@ dbus-send --system --type=method_call --print-reply \
                     "Relaunching fresh Terminal tab from Terminal Home (`#home`)..."
                 )
                 fresh_tab = self._open_fresh_terminal_from_home({initial_tid})
+                initial_tab.suppress_beforeunload()
+                initial_tab.close()
+                self.close_cdp_targets_matching(
+                    "chrome-untrusted://terminal",
+                    label="Terminal-Stale",
+                    exclude_ids={fresh_tab.conn.target_id},
+                )
                 timeline.record_ui(
                     "FreshTerminalLaunched",
                     "Clicked penguin in chrome-untrusted://terminal/html/terminal.html#home",
@@ -4671,6 +4780,7 @@ dbus-send --system --type=method_call --print-reply \
                 lambda txt: f"\n{marker}{username}" in txt and txt.rstrip().endswith("$"),
                 timeout=45.0,
                 desc=f"`id -nu` == {username} in {active_tab.label}",
+                max_lines=16,
             )
             ver_rel = timeline.record_ui(
                 "TerminalPromptVerified",
@@ -4680,9 +4790,13 @@ dbus-send --system --type=method_call --print-reply \
         finally:
             if throttler is not None:
                 throttler.stop()
-            initial_tab.close()
-            if active_tab is not None and active_tab is not initial_tab:
+            if active_tab is not None:
+                active_tab.suppress_beforeunload()
                 active_tab.close()
+            if active_tab is not initial_tab:
+                initial_tab.suppress_beforeunload()
+                initial_tab.close()
+            self.close_cdp_targets_matching("chrome-untrusted://terminal", label="Terminal-App")
 
     def _wait_for_new_guest_prompt(
         self, tab: CroshTab, prev_prompts: int, username: str, timeout: float, desc: str
@@ -4694,7 +4808,12 @@ dbus-send --system --type=method_call --print-reply \
                 )
             return txt.count(f"[{username}@") > prev_prompts and txt.rstrip().endswith("$")
 
-        tab.wait_for(_check, timeout=timeout, desc=desc)
+        tab.wait_for(
+            _check,
+            timeout=timeout,
+            desc=desc,
+            max_lines=24 if prev_prompts == 0 else None,
+        )
 
     def _assert_guest_shell_in_crosh(self, tab: CroshTab, expected_username: str) -> None:
         """Runs `id -nu` inside the active guest shell in `tab` and exits back to `crosh>`."""
@@ -4707,6 +4826,7 @@ dbus-send --system --type=method_call --print-reply \
             and txt.rstrip().endswith("$"),
             timeout=45.0,
             desc=f"`id -nu` == {expected_username} in {tab.label}",
+            max_lines=16,
         )
         log(f"  [{tab.label}] Confirmed guest shell user via crosh UI: `{expected_username}`")
         tab.send_line("exit")
@@ -4735,13 +4855,15 @@ dbus-send --system --type=method_call --print-reply \
             on_vm_starting_up=throttler.start if self.throttle_from_vm_start else None,
             on_vm_started=None if self.throttle_from_vm_start else throttler.start,
         )
-        crosh = self.open_crosh_tab("Termina-Crosh")
+        crosh: CroshTab | None = self.open_crosh_tab("Termina-Crosh")
         failed = False
         report_logged = False
         try:
             self.set_step("step1:vmc_create")
             log("Step 1: Running `vmc create` command from README.md in crosh...")
             crosh.run_crosh_cmd(readme_cmds.termina_create, timeout=180)
+            self.close_crosh_tab(crosh)
+            crosh = None
 
             self.set_step("step2:start_timeline_monitor")
             log("Step 2: Starting passive D-Bus init timeline monitor & driving ChromeOS Settings UI...")
@@ -4760,12 +4882,12 @@ dbus-send --system --type=method_call --print-reply \
 
             self.set_step("step4:crosh_vsh_reentry")
             log(f"Step 4: Verifying README crosh shell entry (`{readme_cmds.termina_reentry_vsh}`, single attempt)...")
-            prev_guest_prompts = crosh.get_text().count(f"[{username}@")
+            crosh = self.open_crosh_tab("Termina-Crosh")
             log(f"  [{crosh.label}] crosh> {readme_cmds.termina_reentry_vsh}")
             crosh.send_line(readme_cmds.termina_reentry_vsh)
             self._wait_for_new_guest_prompt(
                 crosh,
-                prev_guest_prompts,
+                0,
                 username,
                 timeout=45.0,
                 desc=f"`{readme_cmds.termina_reentry_vsh}` shell prompt for `{username}`",
@@ -4775,6 +4897,8 @@ dbus-send --system --type=method_call --print-reply \
                 "CroshVshVerified",
                 f"`{readme_cmds.termina_reentry_vsh}` -> `id -nu` == {username!r}",
             )
+            self.close_crosh_tab(crosh)
+            crosh = None
 
             self.set_step("step5:verify_guest_and_collect")
             log("Step 5: Verifying in-guest systemd/user state & collecting read-only D-Bus/UMA timeline...")
@@ -4794,7 +4918,7 @@ dbus-send --system --type=method_call --print-reply \
             raise
         finally:
             throttler.stop()
-            crosh.close()
+            self.close_crosh_tab(crosh)
             if not failed:
                 self.set_step("cleanup:vmc_stop_destroy")
                 self.vmc("stop", "termina")

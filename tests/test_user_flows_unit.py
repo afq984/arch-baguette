@@ -1115,6 +1115,53 @@ class CDPClientMockTests(unittest.TestCase):
             )
         self.assertIn("step='step2:attach_crostini_installer'", str(ctx_tgt.exception))
 
+        # Backoff helper, bounded xterm get_text(max_lines=...), and Target.closeTarget cleanup
+        with mock.patch.object(tuf.time, "sleep"):
+            self.assertAlmostEqual(tuf._sleep_backoff(0.5, 2.5, time.monotonic() + 10.0), 0.7)
+            self.assertAlmostEqual(tuf._sleep_backoff(2.0, 2.5, time.monotonic() + 10.0), 2.5)
+            self.assertAlmostEqual(tuf._sleep_backoff(0.01, 2.5, time.monotonic() + 10.0), 0.01)
+
+        tail_ws = _FakeWS(
+            [
+                json.dumps({"id": 1, "result": {"result": {"value": "tail line"}}}),
+                json.dumps({"id": 2, "result": {"result": {"value": True}}}),
+            ]
+        )
+        tail_tab = tuf.CroshTab(
+            "Terminal-App-Initial",
+            tuf.CDPConnection.from_target(
+                self.FAKE_TGT,
+                label="Terminal-App-Initial",
+                connect_fn=lambda *_a, **_kw: tail_ws,
+            ),
+        )
+        self.assertEqual(tail_tab.get_text(max_lines=16), "tail line")
+        self.assertIn("end - 16 + 1", json.loads(tail_ws.sent[0])["params"]["expression"])
+
+        browser_ws = _FakeWS(
+            [
+                json.dumps({"id": 1, "result": {"success": True}}),
+                json.dumps({"id": 1, "result": {"success": True}}),
+            ]
+        )
+        dummy_vm.connect_browser_cdp = lambda label="Browser-Root": tuf.CDPConnection(  # type: ignore[method-assign]
+            "ws://127.0.0.1:41234/devtools/browser/root",
+            target_label=label,
+            connect_fn=lambda *_a, **_kw: browser_ws,
+        )
+        dummy_vm.close_crosh_tab(tail_tab)
+        dummy_vm.list_cdp_targets = lambda timeout=20.0: [  # type: ignore[method-assign]
+            {"id": "T1", "url": "chrome-untrusted://terminal/html/terminal.html#home"},
+            {"id": "T2", "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell"},
+            {"id": "S1", "url": "chrome://os-settings/"},
+        ]
+        closed = dummy_vm.close_cdp_targets_matching(
+            "chrome-untrusted://terminal", label="Terminal-Stale", exclude_ids={"T2"}
+        )
+        self.assertEqual(closed, 1)
+        sent_close_ids = [json.loads(s)["params"]["targetId"] for s in browser_ws.sent]
+        self.assertEqual(sent_close_ids, ["9F2A1B", "T1"])
+
 
 class ResourceDiagnosticsAndQemuPidTests(unittest.TestCase):
     def _sample_json_dict(self, **overrides: Any) -> dict[str, Any]:
