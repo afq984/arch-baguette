@@ -263,6 +263,32 @@ this repo. Requirements:
   command extraction, vendored `.proto` digests and strict wire decoding,
   D-Bus/CDP parsers, and ChromeOS VM helpers.
 
+### E2E deviations from stock ChromeOS (nested-KVM test environment)
+
+To keep nested-KVM CI runs deterministic on software-rendered 4-vCPU runners,
+the harness applies four host-side adjustments inside the outer ChromeOS test
+VM that differ from an unmodified physical Chromebook:
+
+1. **`vm_concierge` nested-KVM & serial patches**: bind-mounts `"Not affected"`
+   over `/sys/devices/system/cpu/vulnerabilities/{l1tf,mds}` so `vm_concierge`
+   allows untrusted guest VMs under nested KVM, and replaces
+   `printk.devkmsg=on` with `quiet loglevel=0` in `vm_concierge` to avoid inner
+   `crosvm` 8250 serial port I/O contention during guest boot.
+2. **`VmConcierge.SetBalloonTimer(0)`**: dispatched on a background worker
+   thread on `VmStartedSignal` (with `--reply-timeout=60000` and verified in
+   unfiltered `/var/log/messages`) to stop concierge's 1 Hz
+   `BalanceAvailableBalloonPolicy` timer and eliminate `virtio-balloon`
+   stats/inflate churn orthogonal to this user-flow test.
+3. **`/etc/chrome_dev.conf` compositing/animation switches & idle-tab cleanup**:
+   disables window/CSS animations, smooth scrolling, WebGL2, and `Vulkan`, caps
+   `--num-raster-threads=1`, sets `--scheduler-configuration-default=performance`
+   (using `!--key=` prefix removals), and closes idle Settings, `crosh`, and
+   stale Terminal tabs once unused so LLVMpipe software rasterization does not
+   starve guest vCPUs.
+4. **Host background daemon quieting**: replaces `/usr/bin/quipper` with
+   `/bin/true` on rw `/` (neutralizing periodic CWP `perf record -a` inside
+   `debugd`'s private mount namespace) and stops `secanomalyd`.
+
 ### Diagnostics observer & out-of-tree `user_flows.diag` plugin hook
 
 `scripts/user_flows/__init__.py` defines a lightweight `FlowDiagnosticsObserver`

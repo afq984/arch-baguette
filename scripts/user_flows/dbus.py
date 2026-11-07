@@ -23,6 +23,7 @@ from . import (
     DEFAULT_PROTO_DIR,
     GCS_ARCHIVE_ROOT,
     FlowDiagnosticsObserver,
+    fmt_rel_t,
     log,
     terminate_proc,
 )
@@ -561,6 +562,9 @@ class BackgroundSshStream:
         self._reader_thread = self._stderr_thread = None
 
 
+BALLOON_STOP_RPC_TIMEOUT_SEC = 60
+
+
 class DbusSignalMonitor:
     """Monitors `VmConcierge`/`VmCicerone` D-Bus signals and gates on `ContainerStarted`."""
 
@@ -571,11 +575,17 @@ class DbusSignalMonitor:
         owner_hash: str,
         expected_username: str = "terminauser",
         observer: FlowDiagnosticsObserver | None = None,
+        stop_balloon_timer_on_vm_started: bool = False,
     ) -> None:
         self.vm = vm
         self.owner_hash = owner_hash
         self.expected_username = expected_username
         self.observer = observer or FlowDiagnosticsObserver()
+        self.stop_balloon_timer_on_vm_started = stop_balloon_timer_on_vm_started
+        self.balloon_timer_stopped = False
+        self._balloon_dispatched = False
+        self._balloon_thread: threading.Thread | None = None
+        self._balloon_error: BaseException | None = None
         self.protos = load_cros_protos()
         self._lock = threading.Lock()
         self.t_install_mono: float | None = None
@@ -596,9 +606,23 @@ class DbusSignalMonitor:
         with self._lock:
             self.t_install_mono = mono_ts
 
+    def _raise_if_balloon_error(self) -> None:
+        with self._lock:
+            err = self._balloon_error
+        if err is not None:
+            raise err
+
+    def _join_balloon_thread(self, *, timeout: float) -> threading.Thread | None:
+        with self._lock:
+            th = self._balloon_thread
+        if th is not None and th is not threading.current_thread():
+            th.join(timeout=timeout)
+        return th
+
     def check_healthy(self) -> None:
         if self._stream is not None:
             self._stream.check_healthy()
+        self._raise_if_balloon_error()
         self.observer.check_healthy()
 
     def start(self) -> None:
@@ -665,6 +689,62 @@ class DbusSignalMonitor:
                 self._signals.append((member, vm_name))
 
         self.observer.on_dbus_signal(iface=iface, member=member, vm_name=vm_name, detail=detail, rel_sec=rel, msg=sig)
+        if self.stop_balloon_timer_on_vm_started and member == "VmStartedSignal" and vm_name == "termina":
+            if owner_id != self.owner_hash:
+                raise ValueError(f"{ctx}: owner_id mismatch: expected {self.owner_hash!r}, got {owner_id!r} (hex={raw.hex()})")
+            should_dispatch = False
+            with self._lock:
+                if not self._balloon_dispatched:
+                    self._balloon_dispatched = True
+                    should_dispatch = True
+            if should_dispatch:
+                th = threading.Thread(
+                    target=self._run_stop_balloon_timer,
+                    args=(rel,),
+                    name="dbus-stop-balloon-timer",
+                    daemon=True,
+                )
+                with self._lock:
+                    self._balloon_thread = th
+                th.start()
+
+    def _run_stop_balloon_timer(self, signal_rel_sec: float) -> None:
+        try:
+            self.stop_concierge_balloon_timer(rel_sec=signal_rel_sec)
+        except BaseException as exc:
+            with self._lock:
+                if self._balloon_error is None:
+                    self._balloon_error = exc
+            self._subscribed_event.set()
+            self._container_started_event.set()
+
+    def stop_concierge_balloon_timer(self, *, rel_sec: float | None = None) -> None:
+        """Stops concierge's 1 Hz balloon resize timer via `VmConcierge.SetBalloonTimer(0)`.
+
+        Balloon resizing is orthogonal to what this user-flow test covers and adds 1 Hz guest
+        virtio-balloon stats/inflate churn under nested virtualization. Concierge starts
+        `balloon_resizing_timer_` right before emitting `VmStartedSignal` (`OnControlSocketReady`),
+        so dispatching `SetBalloonTimer(timer_interval_millis=0)` on a dedicated worker thread when
+        `VmStartedSignal` arrives stops it without blocking `dbus-monitor` signal consumption.
+        """
+        conc = self.protos.concierge_pb2
+        ctx = "VmConcierge.SetBalloonTimer"
+        resp, raw_resp = self.vm.dbus_call_proto(
+            "org.chromium.VmConcierge",
+            "SetBalloonTimer",
+            conc.SetBalloonTimerRequest(timer_interval_millis=0),
+            conc.SuccessFailureResponse,
+            timeout=BALLOON_STOP_RPC_TIMEOUT_SEC,
+        )
+        if not resp.success:
+            raise RuntimeError(
+                f"{ctx}(timer_interval_millis=0) failed: failure_reason={resp.failure_reason!r} (hex={raw_resp.hex()})"
+            )
+        with self._lock:
+            self.balloon_timer_stopped = True
+        done_rel = self.rel_mono()
+        trig = f" (triggered at {fmt_rel_t(rel_sec).strip()})" if rel_sec is not None else ""
+        log(f"  [dbus] Stopped concierge 1 Hz balloon resize timer via {ctx}(0) at {fmt_rel_t(done_rel).strip()}{trig}.")
 
     def is_container_started(self) -> bool:
         self.check_healthy()
@@ -735,7 +815,20 @@ class DbusSignalMonitor:
             raise RuntimeError(
                 f"Required D-Bus signals for 'termina' arrived out of order: expected {required!r}, observed {names!r}"
             )
-    def stop(self) -> None:
+        if self.stop_balloon_timer_on_vm_started:
+            join_sec = float(BALLOON_STOP_RPC_TIMEOUT_SEC + 15)
+            th = self._join_balloon_thread(timeout=join_sec)
+            self._raise_if_balloon_error()
+            if th is not None and th.is_alive():
+                raise RuntimeError(f"VmConcierge.SetBalloonTimer(0) worker thread still running after {join_sec:.0f}s")
+            if not self.balloon_timer_stopped:
+                raise RuntimeError("VmConcierge.SetBalloonTimer(0) did not complete after VmStartedSignal")
+
+    def stop(self, *, raise_errors: bool = True) -> None:
         if self._stream is not None:
             self._stream.stop()
             self._stream = None
+        join_sec = float(BALLOON_STOP_RPC_TIMEOUT_SEC + 15) if raise_errors else 5.0
+        self._join_balloon_thread(timeout=join_sec)
+        if raise_errors:
+            self._raise_if_balloon_error()

@@ -6,12 +6,23 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from user_flows import DEFAULT_README_PATH, TimelineEntry, fmt_rel_t, flow  # noqa: E402
+from user_flows import DEFAULT_README_PATH, FlowDiagnosticsObserver, TimelineEntry, fmt_rel_t, flow, vm  # noqa: E402
+
+
+def _dummy_vm(**attrs: Any) -> vm.ChromeOSVM:
+    inst = object.__new__(vm.ChromeOSVM)
+    inst._current_step = "init"
+    inst.observer = FlowDiagnosticsObserver()
+    for k, v in attrs.items():
+        setattr(inst, k, v)
+    return inst
 
 
 class FlowModuleTests(unittest.TestCase):
@@ -89,6 +100,34 @@ class FlowModuleTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             flow.classify_initial_terminal_failure("Launching vmshell failed: 22", entries, container_started_rel_sec=284.3)
+
+    def test_verify_concierge_balloon_timer_stopped(self) -> None:
+        good_unfiltered = (
+            "2026-11-02T15:19:38.700000Z INFO vm_concierge[2910]: New VM. Starting balloon resize timer\n"
+            "2026-11-02T15:19:39.700000Z INFO vm_concierge[2910]: BalloonTrace throttled with size window: 214 MIB\n"
+            "2026-11-02T15:19:39.850000Z INFO vm_concierge[2910]: Stopping balloon timer since timer_interval_millis is 0\n"
+            "2026-11-02T15:20:39.731093Z INFO vm_concierge[2910]: Received request: SetUpVmUser\n"
+        )
+        entries, _ = flow.parse_host_init_logs(good_unfiltered, "", flow.parse_rfc3339_utc("2026-11-02T13:04:49.760000Z"))
+        self.assertIn("BalloonTimerStopped", [e.name for e in entries])
+
+        seen_cmds: list[str] = []
+        fake_vm = _dummy_vm(ssh=lambda cmd, **_kw: seen_cmds.append(cmd) or mock.MagicMock(stdout=good_unfiltered))
+        flow.verify_concierge_balloon_timer_stopped(fake_vm, 120)
+        self.assertIn("tail -n +121 /var/log/messages", seen_cmds[0])
+        self.assertNotIn("BalloonTrace:", seen_cmds[0])
+
+        for desc, bad_raw in (
+            ("missing start line", "2026-11-02T15:19:39.850000Z INFO vm_concierge[2910]: Stopping balloon timer since timer_interval_millis is 0\n"),
+            ("missing stop line", "2026-11-02T15:19:38.700000Z INFO vm_concierge[2910]: New VM. Starting balloon resize timer\n"),
+            ("BalloonTrace after stop", good_unfiltered + "2026-11-02T15:20:41.000000Z INFO vm_concierge[2910]: BalloonTrace:[termina,0,678,6005,299,6271]\n"),
+            ("balloon stats timeout after stop", good_unfiltered + "2026-11-02T15:20:41.000000Z ERR vm_concierge[2910]: Failed to retrieve balloon stats\n"),
+        ):
+            fake_vm.ssh = lambda _cmd, _r=bad_raw, **_kw: mock.MagicMock(stdout=_r)  # type: ignore[method-assign]
+            with self.subTest(desc=desc), self.assertRaises(RuntimeError):
+                flow.verify_concierge_balloon_timer_stopped(fake_vm, 0)
+
+        self.assertGreaterEqual(flow.TERMINAL_POLL_FLOOR_SEC, 1.5)
 
 
 if __name__ == "__main__":

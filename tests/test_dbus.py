@@ -188,6 +188,86 @@ class DbusAndProtobufParserTests(unittest.TestCase):
                 bad_mon._signals = list(bad_signals)
                 bad_mon.verify_required_signal_sequence()
 
+        # Verify async SetBalloonTimer(0) worker thread on VmStartedSignal (non-blocking reader
+        # timestamps + timeout=60 + error surfacing via check_healthy/verify_required_signal_sequence/stop).
+        balloon_calls: list[tuple[str, str, int, int, str]] = []
+
+        class _FakeBalloonVm:
+            def __init__(self, success: bool = True, gate: Any = None) -> None:
+                self.success = success
+                self.gate = gate
+
+            def dbus_call_proto(
+                self_vm, dest: str, method: str, req_msg: Any, resp_cls: Any, timeout: int = 30
+            ) -> tuple[Any, bytes]:
+                import threading as _th  # noqa: PLC0415
+
+                if self_vm.gate is not None:
+                    self_vm.gate.wait(timeout=5.0)
+                balloon_calls.append(
+                    (dest, method, int(req_msg.timer_interval_millis), int(timeout), _th.current_thread().name)
+                )
+                resp = resp_cls(success=self_vm.success, failure_reason="" if self_vm.success else "boom")
+                return resp, resp.SerializeToString()
+
+        import threading  # noqa: PLC0415
+
+        release_gate = threading.Event()
+        b_mon = dbus.DbusSignalMonitor(
+            _FakeBalloonVm(True, gate=release_gate),
+            owner_hash=self.sample_owner,
+            expected_username="terminauser",
+            stop_balloon_timer_on_vm_started=True,
+        )
+        b_mon.mark_install_clicked(time.monotonic())
+        t_replay0 = time.monotonic()
+        _replay(b_mon)
+        replay_elapsed = time.monotonic() - t_replay0
+        # Reader thread completed _replay (including ContainerStarted) immediately while SetBalloonTimer is still blocked!
+        self.assertLess(replay_elapsed, 0.25)
+        self.assertTrue(b_mon.is_container_started())
+        self.assertFalse(b_mon.balloon_timer_stopped)
+        assert b_mon.container_started_rel_sec is not None
+        self.assertLess(b_mon.container_started_rel_sec, 0.25)
+
+        release_gate.set()
+        b_mon.verify_required_signal_sequence()
+        self.assertTrue(b_mon.balloon_timer_stopped)
+        b_mon.stop()
+        self.assertEqual(len(balloon_calls), 1)
+        self.assertEqual(
+            balloon_calls[0][:4],
+            ("org.chromium.VmConcierge", "SetBalloonTimer", 0, dbus.BALLOON_STOP_RPC_TIMEOUT_SEC),
+        )
+        self.assertEqual(balloon_calls[0][4], "dbus-stop-balloon-timer")
+
+        with self.assertRaisesRegex(RuntimeError, "SetBalloonTimer\\(0\\) did not complete"):
+            unstopped = dbus.DbusSignalMonitor(
+                _FakeBalloonVm(True), owner_hash=self.sample_owner, stop_balloon_timer_on_vm_started=True
+            )
+            unstopped._signals = list(b_mon._signals)
+            unstopped.verify_required_signal_sequence()
+
+        for surface_name, surface_fn in (
+            ("check_healthy", lambda m: (m._join_balloon_thread(timeout=2.0), m.check_healthy())),
+            ("verify_required_signal_sequence", lambda m: m.verify_required_signal_sequence()),
+            ("stop", lambda m: m.stop()),
+        ):
+            with self.subTest(surface=surface_name), self.assertRaisesRegex(RuntimeError, "failure_reason='boom'"):
+                fail_mon = dbus.DbusSignalMonitor(
+                    _FakeBalloonVm(False), owner_hash=self.sample_owner, stop_balloon_timer_on_vm_started=True
+                )
+                fail_mon._signals = [("VmStartingUpSignal", "termina"), ("ContainerStarted", "termina")]
+                fail_mon._handle_signal("org.chromium.VmConcierge", "VmStartedSignal", sig_started)
+                # Ensure signal ordering is VmStartingUpSignal -> VmStartedSignal -> ContainerStarted for sequence check.
+                fail_mon._signals = [
+                    ("VmStartingUpSignal", "termina"),
+                    ("VmStartedSignal", "termina"),
+                    ("ContainerStarted", "termina"),
+                ]
+                surface_fn(fail_mon)
+            fail_mon.stop(raise_errors=False)
+
     def test_negative_protobuf_and_dbus_parsers(self) -> None:
         raw_vm_info = bytes.fromhex("0801120f0d64735c1a10181820200130064001")
         sig_container = self.cic.ContainerStartedSignal(
