@@ -88,8 +88,12 @@ arch-baguette-v2/
 │       └── verify-image.sh      # image-level asserts (guestfish/btrfs inspect)
 ├── scripts/
 │   ├── build-repo.sh            # makepkg all packages → out/repo (repo-add)
-│   └── deploy-test.sh           # push image into the nested ChromeOS rig
-├── .github/workflows/           # packages.yaml, image.yaml, uprev.yaml (phase D)
+│   ├── deploy-test.sh           # push image into the nested ChromeOS rig
+│   ├── test_user_flows.py       # CLI entry point for nested-KVM ChromeOS E2E user-flow test
+│   ├── user_flows/              # modular CDP, D-Bus/proto, QEMU VM, and UI flow runner
+│   └── protos/                  # SHA-256-pinned ChromiumOS D-Bus .proto schemas
+├── tests/                       # offline stdlib unittest suite (test_*.py)
+├── .github/workflows/           # packages.yaml, image.yaml, test-user-flows.yaml, uprev.yaml
 └── out/                         # build products (gitignored)
     ├── packages/                # *.pkg.tar.zst
     ├── repo/                    # baguette.db + packages (local pacman repo)
@@ -248,6 +252,29 @@ this repo. Requirements:
   a VM named `v2test` by default (NEVER touch `baguette` (stock) or the
   rig-owned `archtest`), captures os-release / is-system-running / df / id
   evidence.
+- `scripts/test_user_flows.py` + `scripts/user_flows/` + `scripts/protos/`:
+  automated nested-KVM ChromiumOS E2E test driving the documented `README.md`
+  `termina` + ChromeOS Settings Linux installer flow over CDP, gating Terminal
+  readiness on `VmCicerone.ContainerStarted` (validated against vendored
+  SHA-256-pinned `.proto` schemas matching `/etc/lsb-release`), and verifying
+  `vsh termina penguin` re-entry, guest UID/GID `1000`, the 10 `SetUpUser`
+  supplementary groups, and active `cros-garcon.service`.
+- `tests/test_*.py`: offline stdlib `unittest` suite covering `README.md`
+  command extraction, vendored `.proto` digests and strict wire decoding,
+  D-Bus/CDP parsers, and ChromeOS VM helpers.
+
+### Diagnostics observer & out-of-tree `user_flows.diag` plugin hook
+
+`scripts/user_flows/__init__.py` defines a lightweight `FlowDiagnosticsObserver`
+(no-op by default) and `CompositeDiagnosticsObserver`, and
+`scripts/test_user_flows.py` calls `load_optional_diag_plugin()` to load
+`user_flows.diag` (`register_cli_args(parser)` +
+`build_observer(args, work_dir=...)`) only when installed. Heavy investigation
+tooling — including local slow-runner QEMU CPU quota throttling
+(`--qemu-cpu-quota-pct`, `--qemu-throttle-from-vm-start`), init timeline and
+UMA histogram reports, host/guest resource samplers, and guest boot journal
+collectors — lives on the separate `diag/e2e-diagnostics` branch rather than
+`main` so the production test harness stays compact.
 
 ## CI (phase D — GitHub Actions)
 
