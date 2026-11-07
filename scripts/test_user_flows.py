@@ -19,7 +19,12 @@ from typing import Any
 
 from user_flows import DEFAULT_README_PATH, FlowDiagnosticsObserver, log
 from user_flows.dbus import load_cros_protos
-from user_flows.flow import extract_readme_commands, run_termina_user_flow
+from user_flows.flow import (
+    emit_ci_relaunch_warning,
+    extract_readme_commands,
+    format_final_pass_line,
+    run_termina_user_flow,
+)
 from user_flows.vm import ChromeOSVM, ensure_cros_image, ensure_testing_rsa
 
 
@@ -81,8 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             vm.start()
             _ = vm.prepare_nested_vm_host_and_login(args.baguette_image)
-            run_termina_user_flow(vm, readme_cmds, observer=observer)
-            log("ALL REQUESTED USER FLOWS PASSED END-TO-END!")
+            flow_result = run_termina_user_flow(vm, readme_cmds, observer=observer)
+            emit_ci_relaunch_warning(flow_result)
+            log(format_final_pass_line(flow_result))
             return 0
         finally:
             vm.stop()

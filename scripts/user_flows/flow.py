@@ -5,11 +5,14 @@ from __future__ import annotations
 import calendar
 import dataclasses
 import json
+import os
 import re
+import shlex
 import sys
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from . import DEFAULT_README_PATH, FlowDiagnosticsObserver, TimelineEntry, fmt_rel_t, log
 from .cdp import CDPConnection, CDPError, CDPTimeoutError, CroshTab, sleep_backoff
@@ -33,9 +36,14 @@ EXPECTED_GUEST_SUPPLEMENTARY_GROUPS: frozenset[str] = frozenset(
 # On constrained 4-vCPU nested-KVM CI runners, a minimal `vsh` invocation can take ~22s just to
 # open the guest shell; 120s leaves ~4-5x headroom for vsh startup plus user-session checks.
 GUEST_VSH_TIMEOUT_SEC = 120
+LOG_FLUSH_TIMEOUT_SEC = 10.0
 TERMINAL_POLL_FLOOR_SEC = 1.5
+SETUP_USER_DEADLINE_MIN_SEC = 15.0
+SETUP_USER_DEADLINE_MAX_SEC = 35.0
+FINAL_PASS_LINE = "ALL REQUESTED USER FLOWS PASSED END-TO-END!"
 _TERMINAL_HOME_URL = "chrome-untrusted://terminal/html/terminal.html#home"
 _TERMINAL_VMSHELL_URL = "chrome-untrusted://terminal/html/terminal.html?command=vmshell"
+_EVIDENCE_SENTINEL = "Host concierge/cicerone entries since "
 _BALLOON_NOISE_TOKENS = ("BalloonTrace", "BalloonInit", "balloon stats")
 
 
@@ -43,6 +51,91 @@ _BALLOON_NOISE_TOKENS = ("BalloonTrace", "BalloonInit", "balloon stats")
 class ReadmeCommands:
     termina_create: str
     termina_reentry_vsh: str
+
+
+@dataclasses.dataclass(frozen=True)
+class TerminalRelaunch:
+    call_index: int
+    req_entry: TimelineEntry
+    fail_entry: TimelineEntry
+    post_container_started: bool
+    reason: str = "Known slow-runner SetUpVmUser 20s gRPC deadline (code 50)"
+    daemon_label: str = "Concierge"
+    rule_id: str = "S2"
+    rule_name: str = "SetUpVmUser 20s deadline"
+
+    @property
+    def duration_sec(self) -> float:
+        return self.fail_entry.rel_sec - self.req_entry.rel_sec
+
+
+@dataclasses.dataclass(frozen=True)
+class FlowResult:
+    terminal_relaunch: TerminalRelaunch | None = None
+    terminal_relaunches: tuple[TerminalRelaunch, ...] = ()
+
+    @property
+    def all_relaunches(self) -> tuple[TerminalRelaunch, ...]:
+        if self.terminal_relaunches:
+            return self.terminal_relaunches
+        return (self.terminal_relaunch,) if self.terminal_relaunch is not None else ()
+
+
+def format_final_pass_line(result: FlowResult | None = None) -> str:
+    ev = result.terminal_relaunch if result is not None else None
+    if ev is None or not ev.post_container_started:
+        return FINAL_PASS_LINE
+    cause = (
+        f"LaunchVshd call #{ev.call_index} vsh 5s poll timeout"
+        if "ListenForVshd" in ev.reason
+        else f"SetUpVmUser call #{ev.call_index} {ev.duration_sec:.1f}s deadline"
+    )
+    return f"{FINAL_PASS_LINE} (1 Terminal relaunch used after post-ContainerStarted {cause})"
+
+
+def _escape_gha_command_value(val: str, *, for_property: bool = False) -> str:
+    out = val.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if for_property:
+        out = out.replace(":", "%3A").replace(",", "%2C")
+    return out
+
+
+def emit_ci_relaunch_warning(
+    result: FlowResult | None,
+    *,
+    env: Mapping[str, str] | None = None,
+    stream: Any = None,
+) -> list[str]:
+    """Emits GitHub Actions `::warning::` annotations and `$GITHUB_STEP_SUMMARY` lines on relaunch."""
+    if result is None or not result.all_relaunches:
+        return []
+    eff_env = os.environ if env is None else env
+    out_stream = sys.stdout if stream is None else stream
+    summary_path_raw = eff_env.get("GITHUB_STEP_SUMMARY", "").strip()
+    annotations: list[str] = []
+    summary_lines: list[str] = []
+    for ev in result.all_relaunches:
+        scope = "post-ContainerStarted" if ev.post_container_started else "pre-ContainerStarted"
+        req_t = fmt_rel_t(ev.req_entry.rel_sec).strip()
+        err_t = fmt_rel_t(ev.fail_entry.rel_sec).strip()
+        title = _escape_gha_command_value(f"Terminal relaunch ({ev.rule_id} - {ev.rule_name})", for_property=True)
+        msg = _escape_gha_command_value(
+            f"E2E passed after Terminal relaunch [rule={ev.rule_id} ({ev.rule_name}), scope={scope}, "
+            f"call=#{ev.call_index}]: {ev.reason} | evidence ({ev.daemon_label} {req_t} -> {err_t}, "
+            f"dur={ev.duration_sec:.1f}s): {ev.fail_entry.detail}"
+        )
+        ann = f"::warning title={title}::{msg}"
+        annotations.append(ann)
+        print(ann, file=out_stream, flush=True)
+        summary_lines.append(
+            f"- **Terminal relaunch (`{ev.rule_id}: {ev.rule_name}`, `{scope}`)**: {ev.reason} — "
+            f"evidence (`{ev.daemon_label}`, `req={req_t} -> err={err_t}`, `dur={ev.duration_sec:.1f}s`): "
+            f"`{ev.fail_entry.detail}`\n"
+        )
+    if summary_path_raw:
+        with Path(summary_path_raw).open("a", encoding="utf-8") as fh:
+            fh.writelines(summary_lines)
+    return annotations
 
 
 def split_shell_commands(block: str) -> list[str]:
@@ -364,37 +457,471 @@ class HostLogScraper:
         )
         return self.last_entries
 
+    def _filter_excerpt_since(
+        self, excerpt: str, since_rel_sec: float, *, max_lines: int, ignore: tuple[str, ...] = ()
+    ) -> list[str]:
+        out: list[str] = []
+        keep = self.t_install_vm_epoch is None
+        for line in excerpt.splitlines():
+            if any(sub in line for sub in ignore):
+                continue
+            head = line.split(None, 1)[0] if line.strip() else ""
+            if re.match(r"^\d{4}-\d{2}-\d{2}T", head):
+                if self.t_install_vm_epoch is None:
+                    keep = True
+                else:
+                    try:
+                        keep = (parse_rfc3339_utc(head) - self.t_install_vm_epoch) >= since_rel_sec
+                    except ValueError:
+                        keep = True
+            if keep and line.strip():
+                out.append(f"    {line}")
+        return out[-max_lines:]
 
-def classify_initial_terminal_failure(
-    initial_buffer: str,
-    entries: list[TimelineEntry],
-    *,
-    container_started_rel_sec: float,
-) -> None:
-    """Allowlists the single pre-ContainerStarted slow-runner SetUpVmUser call #2 deadline."""
-    cleaned_buf = initial_buffer.strip()
-    if cleaned_buf != KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR:
-        raise RuntimeError(
-            "Initial Terminal tab failed with an unrecognized or incomplete buffer "
-            f"(expected exact {KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR!r}, got {cleaned_buf!r})"
+    def format_window_tail(self, since_rel_sec: float, *, max_lines: int = 40) -> str:
+        """Formats bounded host concierge/cicerone/seneschal/crosvm and Chrome lines since `since_rel_sec`."""
+        host_lines = [
+            f"    {fmt_rel_t(e.rel_sec)} [{e.source}] {e.name}: {e.detail}"
+            for e in self.last_entries
+            if e.source in ("concierge", "cicerone", "parser") and e.rel_sec >= since_rel_sec
+        ][-max_lines:]
+        raw_msg_lines = self._filter_excerpt_since(self.messages_excerpt, since_rel_sec, max_lines=max_lines)
+        chrome_lines = self._filter_excerpt_since(
+            self.chrome_excerpt, since_rel_sec, max_lines=max_lines, ignore=("task queue exceeded allotted deadline",)
         )
-    installer_closed = [e for e in entries if e.source == "ui" and e.name == "InstallerClosed"]
-    if len(installer_closed) != 1:
-        raise RuntimeError(f"Expected 1 InstallerClosed entry in timeline, found {len(installer_closed)}")
-    ic_rel = installer_closed[0].rel_sec
-    call2 = [e for e in entries if e.source == "concierge" and e.name == "SetUpVmUser" and e.detail.startswith("call #2:")]
-    if len(call2) != 1 or not (ic_rel <= call2[0].rel_sec < container_started_rel_sec):
-        raise RuntimeError(f"Expected pre-ContainerStarted SetUpVmUser call #2 after InstallerClosed, got {call2!r}")
-    failed = [
-        e
+        lbl = fmt_rel_t(since_rel_sec).strip()
+        return "\n".join(
+            (
+                f"  Host concierge/cicerone entries since {lbl} (last <={max_lines}):",
+                *(host_lines or ("    (none)",)),
+                f"  Host /var/log/messages (concierge/cicerone/seneschal/crosvm) since {lbl} (last <={max_lines}):",
+                *(raw_msg_lines or ("    (none)",)),
+                f"  Chrome crostini/terminal/vsh log lines since {lbl} (last <={max_lines}):",
+                *(chrome_lines or ("    (none)",)),
+            )
+        )
+
+
+def _compact_crosvm_ps_lines(ps_part: str, *, max_lines: int = 65) -> list[str]:
+    """Deduplicates repeated `/usr/bin/crosvm ...` command lines across thread rows and caps length."""
+    if not (raw_lines := ps_part.splitlines()):
+        return ["    (none)"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for ln in raw_lines:
+        if (idx := ln.find("/usr/bin/crosvm ")) >= 0:
+            tail = ln[idx:]
+            if len(tail) > 80 and tail in seen:
+                ln = f"{ln[:idx]}/usr/bin/crosvm ... (same cmdline)"
+            else:
+                seen.add(tail)
+        out.append(f"    {ln}")
+    if len(out) > max_lines:
+        out = [*out[:max_lines], f"    ... ({len(out) - max_lines} more crosvm thread rows omitted)"]
+    return out
+
+
+def collect_baguette_boot_evidence(
+    vm: ChromeOSVM,
+    owner_hash: str | None,
+    *,
+    max_console_head_lines: int = 60,
+    max_console_lines: int = 80,
+) -> str:
+    """Reads Baguette's host-persisted console log (head + tail) and `crosvm` thread table.
+
+    On R156 (`platform2@4f4daab2`), `vm_tools/init/vmlog_forwarder.conf.in:26` starts
+    `vmlog_forwarder --syslog=false`, so guest console lines are not mirrored to `/var/log/messages`.
+    `Service::StartVmInternal` (`vm_tools/concierge/service.cc:544,1536,4387`) and
+    `LogPipeManager::OnVmStartingUpSignal` (`vm_tools/syslog/log_pipe.cc:67-74,244-264`) write
+    `/run/daemon-store/crosvm/<owner_hash>/log/<base64(vm_name)>.log` (`dGVybWluYQ==.log`, fed via
+    `earlycon`/`serial`, `virtio-console`, and `debugcon` in `termina_vm.cc:201-204`), which persists
+    on disk after `~TerminaVm()` (`termina_vm.cc:139,320`) stops `crosvm` on `StartVm` timeout.
+    """
+    if not owner_hash or not hasattr(vm, "ssh"):
+        return ""
+    log_dir = f"/run/daemon-store/crosvm/{owner_hash}/log"
+    head_n, tail_n = int(max_console_head_lines), int(max_console_lines)
+    limit_n = head_n + tail_n
+    script = (
+        f"d={shlex.quote(log_dir)}; echo '===CONSOLE==='; "
+        'if [ -d "$d" ]; then ls -la "$d" 2>&1; found=0; '
+        'for f in "$d"/*.log; do [ -e "$f" ] || continue; found=1; '
+        'sz=$(wc -c < "$f" 2>/dev/null || echo "?"); lc=$(wc -l < "$f" 2>/dev/null || echo 0); '
+        f'echo "--- $(basename "$f") (${{sz}} bytes, ${{lc}} lines, first <={head_n} + last <={tail_n}) ---"; '
+        f'if [ ! -s "$f" ]; then echo "(empty 0-byte file)"; '
+        f'elif [ "$lc" -le {limit_n} ]; then cat "$f" 2>&1; '
+        f'else head -n {head_n} "$f" 2>&1; echo "... ($((lc - {limit_n})) lines omitted) ..."; tail -n {tail_n} "$f" 2>&1; fi; done; '
+        '[ "$found" -eq 1 ] || echo "(no *.log files present)"; '
+        'else echo "(directory not present: $d)"; fi; '
+        "echo '===CROSVM_PS==='; "
+        "ps_out=$(ps -ww -eL -o pid,lwp,stat,pcpu,pmem,etime,wchan:20,comm,args 2>/dev/null "
+        "|| ps -ww -eL -o pid,tid,stat,pcpu,pmem,etime,comm,args 2>/dev/null || ps -ww -ef 2>&1); "
+        'hdr=$(printf "%s\\n" "$ps_out" | head -n 1); '
+        'body=$(printf "%s\\n" "$ps_out" | awk \'NR>1 && $0 !~ /===CROSVM_PS===/ && ($0 ~ /[c]rosvm|[p]civirtio|VM\\([0-9]+\\)/)\'); '
+        'if [ -n "$body" ]; then printf "%s\\n%s\\n" "$hdr" "$body"; '
+        'else echo "(no crosvm processes running; concierge ~TerminaVm() stops failed StartVm instances before returning)"; fi'
+    )
+    try:
+        res = vm.ssh(
+            script,
+            check=False,
+            timeout=15,
+            op_desc="collect_baguette_boot_evidence(console+crosvm_ps)",
+            cmd_summary="head+tail /run/daemon-store/crosvm/.../log/*.log + ps crosvm",
+        )
+    except Exception as exc:
+        return f"  Baguette VM console log & crosvm ps: (probe failed: {exc})"
+    raw = (res.stdout or "").strip()
+    if "===CROSVM_PS===" in raw:
+        cons_part, ps_part = raw.split("===CROSVM_PS===", 1)
+        cons_part, ps_part = cons_part.replace("===CONSOLE===", "", 1).strip(), ps_part.strip()
+    else:
+        cons_part = raw or f"(ssh probe rc={res.returncode} stderr={(res.stderr or '').strip()!r})"
+        ps_part = "(unavailable)"
+    return "\n".join(
+        (
+            f"  Baguette VM console log ({log_dir}, first <={head_n} + last <={tail_n} lines):",
+            *([f"    {ln}" for ln in cons_part.splitlines()] or ["    (empty)"]),
+            "  Host crosvm processes/threads (ps):",
+            *_compact_crosvm_ps_lines(ps_part),
+        )
+    )
+
+
+def format_fatal_flow_evidence(
+    vm: ChromeOSVM,
+    log_scraper: HostLogScraper,
+    *,
+    since_rel_sec: float = 0.0,
+    scrape: bool = True,
+    max_console_head_lines: int = 60,
+    max_console_lines: int = 80,
+) -> str:
+    """Scrapes and formats bounded host/Chrome logs, Baguette console log, and `crosvm` `ps`."""
+    if scrape:
+        try:
+            log_scraper.scrape(vm)
+        except Exception:
+            pass
+    parts = [log_scraper.format_window_tail(since_rel_sec)]
+    if boot_ev := collect_baguette_boot_evidence(
+        vm,
+        getattr(vm, "owner_hash", None),
+        max_console_head_lines=max_console_head_lines,
+        max_console_lines=max_console_lines,
+    ):
+        parts.append(boot_ev)
+    return "\n".join(parts)
+
+
+def _has_flow_evidence(exc: BaseException) -> bool:
+    if _EVIDENCE_SENTINEL in str(exc):
+        return True
+    return any(_EVIDENCE_SENTINEL in note for note in getattr(exc, "__notes__", ()))
+
+
+def _reraise_with_flow_evidence(
+    exc: BaseException,
+    vm: ChromeOSVM,
+    log_scraper: HostLogScraper,
+    *,
+    since_rel_sec: float = 0.0,
+) -> NoReturn:
+    if _has_flow_evidence(exc):
+        if sys.exc_info()[1] is exc:
+            raise
+        raise exc
+    tunnel_dead_exc: CDPError | None = None
+    if isinstance(exc, CDPError) and hasattr(vm, "check_devtools_tunnel_alive"):
+        try:
+            vm.check_devtools_tunnel_alive()
+        except CDPError as tunnel_exc:
+            tunnel_dead_exc = tunnel_exc
+    diag = format_fatal_flow_evidence(vm, log_scraper, since_rel_sec=since_rel_sec, scrape=True)
+    if tunnel_dead_exc is not None:
+        tunnel_dead_exc.add_note(diag)
+        raise tunnel_dead_exc from exc
+    exc.add_note(diag)
+    if sys.exc_info()[1] is exc:
+        raise
+    raise exc
+
+
+_VSH_ERR_PREFIX = r"(?:(?:\d{4}-\d{2}-\d{2}T\S+\s+)?ERROR vsh:\s+\[[^\]]*vsh\.cc[^\]]*\]|\[[^\]]*ERROR:[^\]]*vsh\.cc[^\]]*\])\s+"
+_PRE_CS_VSH_NO_CONTAINER_RE = re.compile(
+    rf"^{_VSH_ERR_PREFIX}Failed to launch vshd for termina:penguin: [Rr]equested container does not exist: penguin$"
+)
+_VSH_POLL_TIMEOUT_RE = re.compile(rf"^{_VSH_ERR_PREFIX}Poll timed out after waiting 5 seconds\.$")
+_CODE50_EXACT_RE = re.compile(rf"^{re.escape(KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR)}$")
+_VSH_WARNING_RE = re.compile(r"^(?:\d{4}-\d{2}-\d{2}T\S+\s+)?WARNING vsh:\s+\[[^\]]+\]\s+")
+
+
+def _call_idx(detail: str, suffix: str = ":") -> int | None:
+    m = re.match(rf"^call #(\d+){suffix}", detail)
+    return int(m.group(1)) if m else None
+
+
+def _match_terminal_error_text(buf: str, pattern: re.Pattern[str], *, allow_vsh_noise: bool) -> str | None:
+    cleaned = buf.strip()
+    if not allow_vsh_noise:
+        return cleaned if pattern.fullmatch(cleaned) else None
+    rem = [
+        ln
+        for raw in cleaned.splitlines()
+        if (ln := raw.strip())
+        and not _VSH_WARNING_RE.match(ln)
+        and not (ln.startswith("[") and "ERROR" not in ln and "FATAL" not in ln)
+    ]
+    if not rem:
+        return None
+    if len(rem) == 1 and pattern.search(rem[0]):
+        return rem[0]
+    joined = "".join(rem)
+    return joined if pattern.search(joined) and joined.count("ERROR") == 1 else None
+
+
+def _match_pre_cs_vsh_no_container(
+    _err_line: str, entries: list[TimelineEntry], tab_launched_rel: float, _cs_rel: float | None, _attempt: int
+) -> TerminalRelaunch:
+    lv_reqs = {
+        idx: e
+        for e in entries
+        if e.source == "cicerone"
+        and e.name == "LaunchVshd"
+        and (idx := _call_idx(e.detail)) is not None
+        and ": Received LaunchVshd request" in e.detail
+    }
+    ready = [e.rel_sec for e in entries if e.source == "cicerone" and e.name == "ContainerReadyLog"]
+    earliest_ready = min(ready) if ready else None
+    reason = "Premature LaunchVshd before cros-garcon ready (requested container does not exist)"
+    matched = [
+        TerminalRelaunch(
+            idx,
+            lv_reqs[idx],
+            e,
+            False,
+            reason,
+            "Cicerone",
+            rule_id="S1",
+            rule_name="pre-ContainerStarted LaunchVshd",
+        )
+        for e in entries
+        if e.source == "cicerone"
+        and e.name == "LaunchVshdNoContainer"
+        and (idx := _call_idx(e.detail, " failed after ")) is not None
+        and "ERR vm_cicerone[" in e.detail
+        and e.detail.endswith(": Requested container does not exist: penguin")
+        and idx in lv_reqs
+        and lv_reqs[idx].rel_sec >= tab_launched_rel
+        and (earliest_ready is None or e.rel_sec < earliest_ready)
+    ]
+    if len(matched) != 1:
+        raise RuntimeError(
+            "Expected a single pre-ContainerReadyLog vm_cicerone 'Requested container does not "
+            f"exist: penguin' LaunchVshd failure at/after {fmt_rel_t(tab_launched_rel)}, found {len(matched)}"
+        )
+    return matched[0]
+
+
+def _match_post_cs_vsh_poll_timeout(
+    err_line: str, entries: list[TimelineEntry], tab_launched_rel: float, _cs_rel: float | None, _attempt: int
+) -> TerminalRelaunch:
+    failed_lv = {
+        idx
+        for e in entries
+        if e.source == "cicerone"
+        and e.name in ("LaunchVshdNoContainer", "LaunchVshdFailed")
+        and (idx := _call_idx(e.detail, " failed after ")) is not None
+    }
+    lv_post = [
+        (idx, e)
+        for e in entries
+        if e.source == "cicerone"
+        and e.name == "LaunchVshd"
+        and (idx := _call_idx(e.detail)) is not None
+        and ": Received LaunchVshd request" in e.detail
+        and idx not in failed_lv
+        and e.rel_sec >= tab_launched_rel
+    ]
+    if len(lv_post) != 1:
+        raise RuntimeError(
+            "Expected a single cicerone 'Received LaunchVshd request' at/after "
+            f"{fmt_rel_t(tab_launched_rel)} for vsh ListenForVshd timeout, found {len(lv_post)}"
+        )
+    lv_idx, lv_req = lv_post[0]
+    fail_ev = TimelineEntry(lv_req.rel_sec + 5.0, "vsh", "ListenForVshdTimeout", f"call #{lv_idx}: {err_line}")
+    return TerminalRelaunch(
+        lv_idx,
+        lv_req,
+        fail_ev,
+        True,
+        "Known slow-runner vsh 5s ListenForVshd poll timeout (vsh.cc:240)",
+        "Cicerone",
+        rule_id="S3",
+        rule_name="post-ContainerStarted ListenForVshd",
+    )
+
+
+def _match_setup_vm_user_deadline(
+    _err_line: str, entries: list[TimelineEntry], tab_launched_rel: float, cs_rel: float | None, attempt: int
+) -> TerminalRelaunch:
+    reqs = {
+        idx: e
+        for e in entries
+        if e.source == "concierge"
+        and e.name == "SetUpVmUser"
+        and (idx := _call_idx(e.detail)) is not None
+        and ": Received request: SetUpVmUser" in e.detail
+    }
+    ready = [e.rel_sec for e in entries if e.source == "cicerone" and e.name == "ContainerReadyLog"]
+    matched = [
+        TerminalRelaunch(
+            idx,
+            reqs[idx],
+            e,
+            cs_rel is not None
+            and (
+                attempt >= 1
+                or (bool(ready) and reqs[idx].rel_sec >= ready[-1])
+                or (not ready and tab_launched_rel >= cs_rel)
+            ),
+            rule_id="S2",
+            rule_name="SetUpVmUser 20s deadline",
+        )
         for e in entries
         if e.source == "concierge"
         and e.name == "SetUpVmUserFailed"
-        and e.detail.startswith("call #2 failed after ")
-        and "SetUpUser RPC failed: Deadline Exceeded" in e.detail
+        and (idx := _call_idx(e.detail, " failed after ")) is not None
+        and "ERR vm_concierge[" in e.detail
+        and e.detail.endswith(": SetUpUser RPC failed: Deadline Exceeded")
+        and idx in reqs
+        and reqs[idx].rel_sec >= tab_launched_rel
+        and SETUP_USER_DEADLINE_MIN_SEC <= (e.rel_sec - reqs[idx].rel_sec) <= SETUP_USER_DEADLINE_MAX_SEC
     ]
-    if len(failed) != 1 or any(e.name == "SetUpVmUserInFlight" for e in entries):
-        raise RuntimeError(f"Expected settled concierge SetUpVmUserFailed for call #2, got {failed!r}")
+    if len(matched) != 1:
+        raise RuntimeError(
+            "Expected a single concierge SetUpVmUser ~20s 'Deadline Exceeded' failure "
+            f"at/after tab launch ({fmt_rel_t(tab_launched_rel)}), found {len(matched)}"
+        )
+    return matched[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _TerminalFailureRule:
+    rule_id: str
+    name: str
+    error_re: re.Pattern[str]
+    allow_vsh_noise: bool
+    slot: str  # "pre_cs_only" | "post_cs_only" | "either"
+    match_log: Callable[[str, list[TimelineEntry], float, float | None, int], TerminalRelaunch]
+    is_settled: Callable[[list[TimelineEntry], float], bool]
+
+
+_TERMINAL_FAILURE_RULES: tuple[_TerminalFailureRule, ...] = (
+    _TerminalFailureRule(
+        rule_id="S1",
+        name="pre-ContainerStarted LaunchVshd",
+        error_re=_PRE_CS_VSH_NO_CONTAINER_RE,
+        allow_vsh_noise=True,
+        slot="pre_cs_only",
+        match_log=_match_pre_cs_vsh_no_container,
+        is_settled=lambda entries, floor: any(
+            e.name in ("LaunchVshdNoContainer", "LaunchVshdFailed") and e.rel_sec >= floor for e in entries
+        ),
+    ),
+    _TerminalFailureRule(
+        rule_id="S2",
+        name="SetUpVmUser 20s deadline",
+        error_re=_CODE50_EXACT_RE,
+        allow_vsh_noise=False,
+        slot="either",
+        match_log=_match_setup_vm_user_deadline,
+        is_settled=lambda entries, floor: (
+            any(e.name == "SetUpVmUserFailed" and e.rel_sec >= floor for e in entries)
+            and not any(e.name == "SetUpVmUserInFlight" for e in entries)
+        ),
+    ),
+    _TerminalFailureRule(
+        rule_id="S3",
+        name="post-ContainerStarted ListenForVshd",
+        error_re=_VSH_POLL_TIMEOUT_RE,
+        allow_vsh_noise=True,
+        slot="post_cs_only",
+        match_log=_match_post_cs_vsh_poll_timeout,
+        is_settled=lambda entries, floor: any(
+            e.name.startswith("LaunchVshd") and e.rel_sec >= floor for e in entries
+        ),
+    ),
+)
+
+
+def _slot_eligible(slot: str, *, attempt: int, cs_rel: float | None, post_cs_used: bool) -> bool:
+    if attempt >= 2 or post_cs_used:
+        return False
+    if slot == "pre_cs_only":
+        return attempt == 0 and cs_rel is None
+    if slot == "post_cs_only":
+        return cs_rel is not None
+    return not (attempt >= 1 and cs_rel is None)
+
+
+def _find_terminal_rule(terminal_buffer: str) -> tuple[_TerminalFailureRule, str] | None:
+    for rule in _TERMINAL_FAILURE_RULES:
+        if (err_line := _match_terminal_error_text(terminal_buffer, rule.error_re, allow_vsh_noise=rule.allow_vsh_noise)) is not None:
+            return rule, err_line
+    return None
+
+
+def classify_terminal_setup_failure(
+    terminal_buffer: str,
+    entries: list[TimelineEntry],
+    *,
+    tab_launched_rel_sec: float,
+    container_started_rel_sec: float | None,
+    attempt: int = 0,
+    post_cs_relaunch_used: bool = False,
+) -> TerminalRelaunch:
+    """Allowlists known slow-runner SetUpVmUser ~20s deadline, pre-CS LaunchVshd, or post-CS vsh 5s poll timeout."""
+    found = _find_terminal_rule(terminal_buffer)
+    if found is None:
+        raise RuntimeError(
+            "Terminal tab failed with an unrecognized or incomplete buffer "
+            f"(expected exact {KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR!r}, pre-ContainerStarted "
+            "vsh 'requested container does not exist: penguin', or post-ContainerStarted "
+            f"vsh 'Poll timed out after waiting 5 seconds.', got {terminal_buffer.strip()!r})"
+        )
+    rule, err_line = found
+    if not _slot_eligible(
+        rule.slot, attempt=attempt, cs_rel=container_started_rel_sec, post_cs_used=post_cs_relaunch_used
+    ):
+        raise RuntimeError(
+            f"Terminal {rule.name} retry not eligible (attempt={attempt}, "
+            f"container_started_rel_sec={container_started_rel_sec}, "
+            f"post_cs_relaunch_used={post_cs_relaunch_used})"
+        )
+    return rule.match_log(err_line, entries, tab_launched_rel_sec, container_started_rel_sec, attempt)
+
+
+def format_terminal_relaunch_banner(
+    ev: TerminalRelaunch,
+    *,
+    failed_label: str,
+    target_id: str,
+    tab_launched_rel_sec: float,
+    cs_rel_sec: float,
+) -> str:
+    scope = "1/1 post-ContainerStarted" if ev.post_container_started else "pre-ContainerStarted installer tab"
+    prefix = f"{ev.daemon_label}:"
+    return "\n".join(
+        (
+            f"  WARNING: TERMINAL RELAUNCH TRIGGERED [{ev.rule_id}: {ev.rule_name}] ({scope})",
+            f"    Reason:    {ev.reason} on {failed_label} (target={target_id})",
+            f"    Timings:   launch={fmt_rel_t(tab_launched_rel_sec).strip()} | req={fmt_rel_t(ev.req_entry.rel_sec).strip()} -> err={fmt_rel_t(ev.fail_entry.rel_sec).strip()} (dur={ev.duration_sec:.1f}s) | ContainerStarted={fmt_rel_t(cs_rel_sec).strip()}",
+            f"    {prefix:<10} {ev.req_entry.detail}",
+            f"    {prefix:<10} {ev.fail_entry.detail}",
+        )
+    )
 
 
 class _FlowTracker:
@@ -412,6 +939,7 @@ class _FlowTracker:
         self.log_scraper = log_scraper
         self.observer = observer
         self.ui_entries: list[TimelineEntry] = []
+        self.relaunches: list[TerminalRelaunch] = []
         self.initial_tab_launched_rel = 0.0
         self.vm_clock_skew_sec = 0.5
 
@@ -446,7 +974,8 @@ def run_settings_crostini_installer_ui(
 ) -> dict[str, Any]:
     """Drives ChromeOS Settings -> About ChromeOS -> Developers -> Set up -> crostini-installer.
 
-    Returns the initial `chrome-untrusted://terminal` vmshell CDP target opened by the installer.
+    Returns the initial `chrome-untrusted://terminal` vmshell CDP target opened by the installer,
+    attaching bounded host/Chrome/Baguette-console/crosvm-ps evidence on fatal failure.
     """
     installer_conn: CDPConnection | None = None
     try:
@@ -627,6 +1156,8 @@ def run_settings_crostini_installer_ui(
         raise CDPTimeoutError(
             f"Timed out waiting for `chrome://crostini-installer` to finish ({ctx}; last status={last_status!r})"
         )
+    except (CDPError, CDPTimeoutError, RuntimeError) as exc:
+        _reraise_with_flow_evidence(exc, vm, tracker.log_scraper, since_rel_sec=0.0)
     finally:
         if installer_conn is not None:
             installer_conn.close()
@@ -681,7 +1212,160 @@ def _open_fresh_terminal_from_home(
     )
     tracker.record_ui("FreshTerminalLaunched", f"Clicked penguin in {_TERMINAL_HOME_URL} ({label})")
     log(f"  Attached to {label} vmshell tab (target={fresh_tgt.get('id')})")
-    return CroshTab(label, CDPConnection.from_target(fresh_tgt, label=label, step_getter=vm.get_step))
+    return CroshTab(
+        label,
+        CDPConnection.from_target(
+            fresh_tgt, label=label, step_getter=vm.get_step, on_error=vm.check_devtools_tunnel_alive
+        ),
+    )
+
+
+def disable_terminal_close_on_exit(vm: ChromeOSVM) -> None:
+    """Disables Terminal's default `close-on-exit` pref so failed `vsh` tabs stay open and diagnosable.
+
+    Terminal's `Terminal.exit` (`terminal.js`) calls `window.close()` when `vsh` exits after writing
+    to the PTY if `/hterm/profiles/default/close-on-exit` is true (its default). Writing `false` to
+    `crostini.terminal_settings` via `chrome.terminalPrivate.setPrefs` (the same pref store written
+    by Terminal Settings) retains `vsh`'s stderr output in the tab instead of closing the target.
+    """
+    vm.set_step("step2:disable_terminal_close_on_exit")
+    vm.launch_swa_or_target(
+        _TERMINAL_HOME_URL, label="Browser-TerminalPrefInit", op_desc=f"launch {_TERMINAL_HOME_URL} for pref init"
+    )
+    pref_conn = vm.connect_cdp_target(
+        lambda tgt: _TERMINAL_HOME_URL in tgt.get("url", ""),
+        operation="find_target(Terminal-PrefInit #home)",
+        target_label="Terminal-PrefInit",
+        target_url=_TERMINAL_HOME_URL,
+        timeout=30.0,
+        interval=0.4,
+        err_prefix="Could not open Terminal #home to configure close-on-exit=false",
+    )
+    try:
+        pref_conn.poll_js(
+            "typeof chrome?.terminalPrivate?.getPrefs === 'function' "
+            "&& typeof chrome?.terminalPrivate?.setPrefs === 'function'",
+            bool,
+            op_desc="Terminal-PrefInit:wait_terminalPrivate",
+            timeout=15.0,
+        )
+        readback = pref_conn.eval_js(
+            """(async () => {
+                const p = 'crostini.terminal_settings', k = '/hterm/profiles/default/close-on-exit';
+                const call = (fn, arg) => new Promise((res, rej) => fn(arg, (v) => {
+                    const e = chrome.runtime?.lastError?.message; e ? rej(new Error(e)) : res(v);
+                }));
+                const cur = await call(chrome.terminalPrivate.getPrefs, [p]);
+                await call(chrome.terminalPrivate.setPrefs, { [p]: Object.assign({}, cur?.[p] || {}, { [k]: false }) });
+                return (await call(chrome.terminalPrivate.getPrefs, [p]))?.[p]?.[k];
+            })()""",
+            await_promise=True,
+            timeout=15.0,
+            op_desc="Terminal-PrefInit:set_and_verify_close_on_exit",
+        )
+        if not (isinstance(readback, bool) and readback is False):
+            raise RuntimeError(
+                f"Terminal close-on-exit pref readback mismatch after setPrefs: expected False, got {readback!r}"
+            )
+        log("  Verified Terminal pref `/hterm/profiles/default/close-on-exit` = False.")
+    finally:
+        pref_conn.close()
+        vm.close_cdp_page_targets_by_url((_TERMINAL_HOME_URL,), label="Terminal-PrefInit")
+
+
+def _classify_terminal_failure_with_flush(
+    vm: ChromeOSVM,
+    terminal_buffer: str,
+    tracker: _FlowTracker,
+    *,
+    tab_launched_rel_sec: float,
+    container_started_rel_sec: float | None,
+    attempt: int,
+    post_cs_relaunch_used: bool,
+) -> TerminalRelaunch:
+    """Scrapes host logs (allowing rsyslog flush) and classifies allowlisted Terminal errors."""
+    flush_deadline = time.monotonic() + LOG_FLUSH_TIMEOUT_SEC
+    found = _find_terminal_rule(terminal_buffer)
+    while True:
+        tracker.log_scraper.scrape(vm)
+        entries = tracker.combined_classifier_entries()
+        launch_floor = tab_launched_rel_sec
+        if attempt == 0:
+            if call1_done := [
+                e.rel_sec
+                for e in entries
+                if e.source == "concierge" and e.name == "SetUpVmUserDone" and e.detail.startswith("call #1 ")
+            ]:
+                launch_floor = max(launch_floor, call1_done[-1])
+        try:
+            return classify_terminal_setup_failure(
+                terminal_buffer,
+                entries,
+                tab_launched_rel_sec=launch_floor,
+                container_started_rel_sec=container_started_rel_sec,
+                attempt=attempt,
+                post_cs_relaunch_used=post_cs_relaunch_used,
+            )
+        except RuntimeError:
+            rem = flush_deadline - time.monotonic()
+            if (
+                found is None
+                or not _slot_eligible(
+                    found[0].slot,
+                    attempt=attempt,
+                    cs_rel=container_started_rel_sec,
+                    post_cs_used=post_cs_relaunch_used,
+                )
+                or found[0].is_settled(entries, launch_floor)
+                or rem <= 0
+            ):
+                raise
+            time.sleep(min(0.8, rem))
+
+
+def _observe_terminal_until_prompt_or_error(
+    tab: CroshTab,
+    username: str,
+    tracker: _FlowTracker,
+    *,
+    timeout: float,
+    first_output_event: str,
+    log_first_output: bool = False,
+) -> tuple[str, str]:
+    """Polls `tab` until prompt (`'prompt'`), vmshell error (`'error'`), or deadline (`'timeout'`)."""
+    deadline = time.monotonic() + timeout
+    poll_interval = TERMINAL_POLL_FLOOR_SEC
+    first_output_logged = False
+    last_txt = ""
+    while time.monotonic() < deadline:
+        tracker.check_healthy()
+        txt = last_txt = tab.get_text(max_lines=24)
+        if not first_output_logged and txt.strip():
+            first_output_logged = True
+            first_ln = txt.strip().splitlines()[0][:140]
+            fo_rel = tracker.record_ui(first_output_event, first_ln)
+            if log_first_output:
+                log(f"  [{tab.label}] First output at t+{fo_rel:.1f}s: {first_ln}")
+        if f"[{username}@" in txt and txt.rstrip().endswith("$"):
+            return "prompt", txt
+        has_vsh_err = bool(
+            re.search(r"(?:ERROR|FATAL)[:\s].*\bvsh(?:_client)?\.cc\b", txt) or "Failed to launch vshd for " in txt
+        )
+        if (
+            txt.strip() == KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR
+            or "Launching vmshell failed:" in txt
+            or "[process exited" in txt
+            or has_vsh_err
+        ):
+            if has_vsh_err:
+                time.sleep(0.1)
+            return "error", (tab.get_text() or txt)
+        poll_interval = sleep_backoff(poll_interval, 2.5, deadline)
+    try:
+        last_txt = tab.get_text() or last_txt
+    except (CDPError, CDPTimeoutError, OSError):
+        pass
+    return "timeout", last_txt
 
 
 def verify_terminal_app_with_readiness_gate(
@@ -689,60 +1373,111 @@ def verify_terminal_app_with_readiness_gate(
     initial_vmshell_tgt: dict[str, Any],
     username: str,
     tracker: _FlowTracker,
-) -> None:
-    """Observes installer-opened Terminal gated on `ContainerStarted` and verifies interactive shell."""
-    initial_tid = str(initial_vmshell_tgt["id"])
-    initial_tab = CroshTab(
+) -> TerminalRelaunch | None:
+    """Observes Terminal in a single readiness-gated loop and verifies interactive shell identity."""
+    seen_target_ids: set[str] = {str(initial_vmshell_tgt["id"])}
+    active_tab: CroshTab | None = CroshTab(
         "Terminal-App-Initial",
-        CDPConnection.from_target(initial_vmshell_tgt, label="Terminal-App-Initial", step_getter=vm.get_step),
+        CDPConnection.from_target(
+            initial_vmshell_tgt,
+            label="Terminal-App-Initial",
+            step_getter=vm.get_step,
+            on_error=vm.check_devtools_tunnel_alive,
+        ),
     )
-    active_tab: CroshTab | None = initial_tab
+    tab_launched_rel = tracker.initial_tab_launched_rel
+    post_cs_relaunch: TerminalRelaunch | None = None
+    last_relaunch: TerminalRelaunch | None = None
+    attempt = 0
     try:
+        # Do NOT call Target.closeTarget on Tab 0 (`terminal.html#home`) while a
+        # vmshell tab is open: Terminal pins `#home` (`web_app::IsTabClosable` is
+        # false when tab count > 1), so ClosePage() aborts `#home` parsing via
+        # `Document::DispatchUnloadEvents` (`StopParsing()`) without closing it.
         log("  Observing installer-opened ChromeOS Terminal app window...")
-        vm.set_step("step3:observe_terminal_0")
-        deadline = time.monotonic() + 120.0
-        poll_interval = TERMINAL_POLL_FLOOR_SEC
-        reached_prompt = first_logged = False
-        last_txt = ""
-        while time.monotonic() < deadline:
-            tracker.check_healthy()
-            txt = last_txt = initial_tab.get_text(max_lines=24)
-            if not first_logged and txt.strip():
-                first_logged = True
-                tracker.record_ui("InitialTerminalFirstOutput", txt.strip().splitlines()[0][:140])
-            if f"[{username}@" in txt and txt.rstrip().endswith("$"):
-                reached_prompt = True
-                break
-            if (
-                txt.strip() == KNOWN_INITIAL_TERMINAL_TIMEOUT_ERROR
-                or "Launching vmshell failed:" in txt
-                or "[process exited" in txt
-                or "ERROR vsh:" in txt
-            ):
-                break
-            poll_interval = sleep_backoff(poll_interval, 2.5, deadline)
+        while True:
+            assert active_tab is not None
+            vm.set_step(f"step3:observe_terminal_{attempt}")
+            obs_timeout = 120.0 if attempt == 0 else 180.0
+            t_obs0 = time.monotonic()
+            outcome, last_txt = _observe_terminal_until_prompt_or_error(
+                active_tab,
+                username,
+                tracker,
+                timeout=obs_timeout,
+                first_output_event="InitialTerminalFirstOutput" if attempt == 0 else "FreshTerminalFirstOutput",
+                log_first_output=(attempt > 0),
+            )
 
-        if reached_prompt:
-            vm.set_step("step3:wait_container_started")
-            cs_rel = tracker.dbus_mon.wait_for_container_started(timeout=60.0)
-            pr_rel = tracker.record_ui("InitialTerminalObserved", f"reached prompt [{username}@penguin]$")
-            log(f"  [Terminal-App-Initial] Reached prompt at t+{pr_rel:.1f}s (ContainerStarted at t+{cs_rel:.1f}s).")
-        else:
+            if outcome == "prompt":
+                vm.set_step("step3:wait_container_started")
+                cs_rel = tracker.dbus_mon.wait_for_container_started(timeout=60.0)
+                pr_rel = tracker.record_ui(
+                    "InitialTerminalObserved" if attempt == 0 else "FreshTerminalPromptReached",
+                    f"reached prompt [{username}@penguin]$ in {active_tab.label}",
+                )
+                log(f"  [{active_tab.label}] Reached prompt at t+{pr_rel:.1f}s (ContainerStarted at t+{cs_rel:.1f}s).")
+                break
+
+            if outcome == "timeout":
+                if hasattr(vm, "check_devtools_tunnel_alive"):
+                    vm.check_devtools_tunnel_alive()
+                ctx = active_tab.conn.error_context(
+                    f"{active_tab.label}:wait_for_shell_prompt", time.monotonic() - t_obs0, obs_timeout
+                )
+                raise CDPTimeoutError(
+                    f"Timed out waiting for {active_tab.label} prompt ({ctx}). Buffer:\n{last_txt}"
+                )
+
             cs_already = tracker.dbus_mon.is_container_started()
-            tracker.record_ui(
-                "InitialTerminalObserved",
+            cs_rel_pre = tracker.dbus_mon.container_started_rel_sec if cs_already else None
+            failed_tid, failed_label = str(active_tab.conn.target_id), active_tab.label
+            obs_rel = tracker.record_ui(
+                "InitialTerminalObserved" if attempt == 0 else "FreshTerminalObserved",
                 f"no prompt (container_started_already={cs_already}): {last_txt.strip().replace(chr(10), ' | ')[:200]}",
             )
-            vm.close_crosh_tab(initial_tab)
-            active_tab = None
-            vm.set_step("step3:wait_container_started")
-            cs_rel = tracker.dbus_mon.wait_for_container_started(timeout=300.0)
-            tracker.log_scraper.scrape(vm)
-            classify_initial_terminal_failure(
-                last_txt, tracker.combined_classifier_entries(), container_started_rel_sec=cs_rel
+            log(f"  WARNING: {failed_label} failed at t+{obs_rel:.1f}s (ContainerStarted already fired={cs_already}):\n{last_txt}")
+            ev = _classify_terminal_failure_with_flush(
+                vm,
+                last_txt,
+                tracker,
+                tab_launched_rel_sec=tab_launched_rel,
+                container_started_rel_sec=cs_rel_pre,
+                attempt=attempt,
+                post_cs_relaunch_used=(post_cs_relaunch is not None),
             )
-            active_tab = _open_fresh_terminal_from_home(vm, {initial_tid}, tracker)
-            _wait_for_new_guest_prompt(active_tab, 0, username, timeout=180.0, desc="fresh Terminal prompt")
+            vm.set_step("step3:close_failed_terminal")
+            vm.close_crosh_tab(active_tab)
+            active_tab = None
+
+            vm.set_step("step3:wait_container_started")
+            if not cs_already:
+                log("  Waiting on D-Bus readiness gate: `VmCicerone.ContainerStarted` (termina/penguin)...")
+            cs_rel = tracker.dbus_mon.wait_for_container_started(timeout=300.0 if not cs_already else 60.0)
+            last_relaunch = ev
+            tracker.relaunches.append(ev)
+            if ev.post_container_started:
+                post_cs_relaunch = ev
+            log(
+                "\n"
+                + format_terminal_relaunch_banner(
+                    ev,
+                    failed_label=failed_label,
+                    target_id=failed_tid,
+                    tab_launched_rel_sec=tab_launched_rel,
+                    cs_rel_sec=cs_rel,
+                )
+            )
+            tab_launched_rel = max(
+                ev.fail_entry.rel_sec + 0.001, tracker.dbus_mon.rel_mono() - tracker.vm_clock_skew_sec
+            )
+            next_label = "Terminal-App-Relaunch" if ev.post_container_started else "Terminal-App-Fresh"
+            active_tab = _open_fresh_terminal_from_home(vm, seen_target_ids, tracker, label=next_label)
+            seen_target_ids.add(str(active_tab.conn.target_id))
+            vm.close_cdp_targets_matching(
+                _TERMINAL_VMSHELL_URL, label="Terminal-Stale", exclude_ids={active_tab.conn.target_id}
+            )
+            attempt += 1
 
         assert active_tab is not None
         vm.set_step("step3:verify_terminal_interactive_shell")
@@ -758,6 +1493,9 @@ def verify_terminal_app_with_readiness_gate(
             "TerminalPromptVerified", f"Confirmed `id -nu` == {username!r} in {active_tab.label}"
         )
         log(f"  [{active_tab.label}] Verified interactive shell user `{username}` at t+{ver_rel:.1f}s")
+        return last_relaunch
+    except (CDPError, CDPTimeoutError, RuntimeError) as exc:
+        _reraise_with_flow_evidence(exc, vm, tracker.log_scraper, since_rel_sec=tab_launched_rel)
     finally:
         if active_tab is not None:
             vm.close_crosh_tab(active_tab)
@@ -847,7 +1585,7 @@ def run_termina_user_flow(
     *,
     username: str = "terminauser",
     observer: FlowDiagnosticsObserver | None = None,
-) -> None:
+) -> FlowResult:
     """Executes the full `termina` + Settings Linux installer + Terminal + `crosh` E2E flow."""
     assert vm.owner_hash
     obs = observer or vm.observer
@@ -867,6 +1605,7 @@ def run_termina_user_flow(
 
     crosh: CroshTab | None = None
     failed = report_logged = False
+    relaunch_ev: TerminalRelaunch | None = None
     try:
         log_scraper.capture_cursors(vm)
         crosh = vm.open_crosh_tab("Termina-Crosh")
@@ -875,6 +1614,8 @@ def run_termina_user_flow(
         crosh.run_crosh_cmd(readme_cmds.termina_create, timeout=180)
         vm.close_crosh_tab(crosh)
         crosh = None
+
+        disable_terminal_close_on_exit(vm)
 
         vm.set_step("step2:start_dbus_monitor")
         log("Step 2: Subscribing system D-Bus monitor & driving ChromeOS Settings UI...")
@@ -886,7 +1627,7 @@ def run_termina_user_flow(
             initial_vmshell_tgt = run_settings_crostini_installer_ui(vm, username=username, tracker=tracker)
 
             log("Step 3: Verifying ChromeOS Terminal app (`chrome-untrusted://terminal`) gated on `ContainerStarted`...")
-            verify_terminal_app_with_readiness_gate(
+            relaunch_ev = verify_terminal_app_with_readiness_gate(
                 vm, initial_vmshell_tgt=initial_vmshell_tgt, username=username, tracker=tracker
             )
 
@@ -915,7 +1656,7 @@ def run_termina_user_flow(
         if report := obs.format_report(include_verbose=False):
             log("\n" + report)
         report_logged = True
-    except Exception:
+    except Exception as exc:
         failed = True
         if not report_logged:
             try:
@@ -924,7 +1665,7 @@ def run_termina_user_flow(
                     log("\n" + report)
             except Exception as diag_exc:
                 log(f"Failed collecting diagnostics: {diag_exc}")
-        raise
+        _reraise_with_flow_evidence(exc, vm, log_scraper, since_rel_sec=0.0)
     finally:
         if obs is not vm.observer:
             obs.close()
@@ -934,3 +1675,4 @@ def run_termina_user_flow(
             vm.vmc("stop", "termina")
             vm.vmc("destroy", "termina")
     log("=== Flow (`termina`) PASSED ===")
+    return FlowResult(terminal_relaunch=relaunch_ev, terminal_relaunches=tuple(tracker.relaunches))

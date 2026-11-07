@@ -392,6 +392,7 @@ class ChromeOSVM:
         self.serial_log = self.work_dir / "kvm.serial"
         self.owner_hash: str | None = None
         self._devtools_fwd_proc: subprocess.Popen[Any] | None = None
+        self._devtools_fwd_stderr_path = self.work_dir / "devtools_tunnel.stderr"
         self._local_dt_port: int | None = None
         self._remote_dt_port: int | None = None
         self._browser_ws_path: str | None = None
@@ -787,8 +788,9 @@ sync
         log(f"Forwarding host 127.0.0.1:{self._local_dt_port} -> ChromeOS DevTools 127.0.0.1:{self._remote_dt_port}...")
         base_ssh = self.ssh_base_cmd()
         fwd = f"127.0.0.1:{self._local_dt_port}:127.0.0.1:{self._remote_dt_port}"
-        cmd = [*base_ssh[:-1], "-N", "-L", fwd, base_ssh[-1]]
-        self._devtools_fwd_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = [*base_ssh[:-1], "-o", "ExitOnForwardFailure=yes", "-N", "-L", fwd, base_ssh[-1]]
+        with self._devtools_fwd_stderr_path.open("wb") as err_fp:
+            self._devtools_fwd_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_fp)
         tunnel_timeout, t0 = 20.0, time.monotonic()
         deadline = t0 + tunnel_timeout
         last_err: Exception | None = None
@@ -797,8 +799,10 @@ sync
                 _ = self.list_cdp_targets(timeout=5.0)
                 return
             except Exception as exc:
+                self.check_devtools_tunnel_alive()
                 last_err = exc
                 time.sleep(0.3)
+        self.check_devtools_tunnel_alive()
         ctx = self._cdp_ctx(
             "SSH -L DevTools tunnel readiness probe",
             "DevToolsTunnel",
@@ -811,8 +815,25 @@ sync
             f"Timed out establishing SSH port forward to Chrome DevToolsActivePort ({ctx}; last error: {last_err})"
         )
 
+    def check_devtools_tunnel_alive(self) -> None:
+        """Raises `CDPError` with exit code and stderr tail if the `ssh -L` tunnel died."""
+        proc = getattr(self, "_devtools_fwd_proc", None)
+        if proc is None or (rc := proc.poll()) is None:
+            return
+        err_path: Path | None = getattr(self, "_devtools_fwd_stderr_path", None)
+        stderr_tail = (
+            err_path.read_text("utf-8", "replace").strip()[-600:]
+            if err_path is not None and err_path.is_file()
+            else ""
+        )
+        raise CDPError(
+            f"DevTools SSH -L tunnel (pid={proc.pid}) exited with returncode={rc} "
+            f"(step={self.get_step()!r}; stderr={stderr_tail!r})"
+        )
+
     def connect_browser_cdp(self, label: str = "Browser-Root") -> CDPConnection:
         assert self._local_dt_port and self._browser_ws_path
+        self.check_devtools_tunnel_alive()
         ws_url = f"ws://127.0.0.1:{self._local_dt_port}{self._browser_ws_path}"
         return CDPConnection(
             ws_url,
@@ -820,15 +841,18 @@ sync
             target_url=ws_url,
             target_id=self._browser_ws_path.rsplit("/", 1)[-1] or "browser",
             step_getter=self.get_step,
+            on_error=self.check_devtools_tunnel_alive,
         )
 
     def list_cdp_targets(self, timeout: float = 20.0) -> list[dict[str, Any]]:
         assert self._local_dt_port and self._remote_dt_port
+        self.check_devtools_tunnel_alive()
         url = f"http://127.0.0.1:{self._local_dt_port}/json/list"
         t0 = time.monotonic()
         try:
             targets = json.loads(urllib.request.urlopen(url, timeout=timeout).read())
         except Exception as exc:
+            self.check_devtools_tunnel_alive()
             ctx = self._cdp_ctx("HTTP GET /json/list", "DevToolsHTTP", url, "<json-list>", t0, timeout)
             err_cls = CDPTimeoutError if is_ws_timeout_exc(exc) else CDPError
             verb = "timed out" if err_cls is CDPTimeoutError else "failed"
@@ -888,7 +912,9 @@ sync
             require_ws=True,
             err_prefix=err_prefix,
         )
-        return CDPConnection.from_target(tgt, label=target_label, step_getter=self.get_step)
+        return CDPConnection.from_target(
+            tgt, label=target_label, step_getter=self.get_step, on_error=self.check_devtools_tunnel_alive
+        )
 
     def launch_swa_or_target(self, url: str, *, label: str, op_desc: str) -> None:
         """Launches a URL or System Web App via Browser CDP `Target.createTarget`."""

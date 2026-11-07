@@ -261,7 +261,49 @@ this repo. Requirements:
   supplementary groups, and active `cros-garcon.service`.
 - `tests/test_*.py`: offline stdlib `unittest` suite covering `README.md`
   command extraction, vendored `.proto` digests and strict wire decoding,
-  D-Bus/CDP parsers, and ChromeOS VM helpers.
+  D-Bus/CDP parsers, ChromeOS VM helpers, Terminal readiness/relaunch rules,
+  fatal failure evidence attachment, and CI warning emission.
+
+### E2E Terminal readiness gate, relaunch rules (`S1`/`S2`/`S3`), and CI visibility
+
+- **Retaining failed Terminal tabs (`close-on-exit=false`)**: before opening
+  ChromeOS Settings, the harness sets `/hterm/profiles/default/close-on-exit`
+  to `false` in `crostini.terminal_settings` via `chrome.terminalPrivate.setPrefs`
+  (and verifies readback) so a `vsh` exit leaves its stderr text in the tab
+  instead of calling `window.close()` and dropping the CDP WebSocket.
+- **Bounded relaunch budget**: at most **3** Terminal windows total — at most
+  1 pre-`ContainerStarted` relaunch on the installer-opened tab (`attempt=0`)
+  and at most 1 post-`ContainerStarted` relaunch (`1/1` post-gate slot) — and
+  only when **both** exact Terminal buffer text and host daemon log evidence
+  match one of three slow-runner rules:
+  - **`S1` (`pre-ContainerStarted LaunchVshd`, `slot="pre_cs_only"`)**: when
+    nested boot → `cros-garcon` exceeds the installer's 40 s
+    `WaitUntilBaguetteReady` timeout, Terminal opens before `ContainerStarted`
+    and its `StartVm` (`VM_STATUS_RUNNING`) triggers a premature `LaunchVshd`.
+    Requires `Failed to launch vshd for termina:penguin: requested container does not exist: penguin`
+    in the tab plus a single `vm_cicerone` `Received LaunchVshd request` →
+    `ERR ... Requested container does not exist: penguin` at/after tab launch
+    and before `ContainerReadyLog`.
+  - **`S2` (`SetUpVmUser 20s deadline`, `slot="either"`)**: requires exact
+    `Launching vmshell failed: Error starting crostini for terminal: 50 (CONTAINER_SETUP_FAILED)`
+    in the tab plus a single `vm_concierge` `Received request: SetUpVmUser` →
+    `ERR ... SetUpUser RPC failed: Deadline Exceeded` (`15s..35s` duration)
+    at/after tab launch with no `SetUpVmUser` still in flight.
+  - **`S3` (`post-ContainerStarted ListenForVshd`, `slot="post_cs_only"`)**:
+    requires `Poll timed out after waiting 5 seconds.` (`vsh.cc:240`) in the
+    tab after `ContainerStarted` has fired plus a single `vm_cicerone`
+    `Received LaunchVshd request` at/after tab launch with no cicerone
+    `LaunchVshd` `ERR`.
+- **CI visibility & failure evidence**: whenever any relaunch rule fires,
+  `test_user_flows.py` emits a column-0 GitHub Actions `::warning::` annotation
+  (and appends a line to `$GITHUB_STEP_SUMMARY` when set) naming the rule ID,
+  scope, and daemon log evidence so user-visible Terminal retries are surfaced
+  in CI. Unallowlisted errors, exhausted budgets, installer failures, or dead
+  DevTools SSH tunnels fail immediately with bounded `/var/log/messages`,
+  `/var/log/chrome/chrome`, Baguette console head+tail
+  (`/run/daemon-store/crosvm/<owner_hash>/log/*.log`), and `crosvm` `ps`
+  evidence attached via `BaseException.add_note()` (preserving the original
+  traceback).
 
 ### E2E deviations from stock ChromeOS (nested-KVM test environment)
 

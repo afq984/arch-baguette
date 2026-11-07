@@ -241,6 +241,43 @@ class ChromeOSVMAndHelpersTests(unittest.TestCase):
         with self.assertRaisesRegex(cdp.CDPTimeoutError, "DevTools /json/list timed out"):
             dummy_vm.close_cdp_page_targets_by_url(("chrome://newtab/",), label="PostLogin-NewTab")
 
+    def test_devtools_tunnel_health_check_and_cdp_propagation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            inst = _new_vm(
+                work_dir=work_dir,
+                ssh_port=42222,
+                ssh_key=work_dir / "testing_rsa",
+                _current_step="step3:observe_terminal_0",
+                _devtools_fwd_stderr_path=work_dir / "devtools_tunnel.stderr",
+                _local_dt_port=43333,
+                _remote_dt_port=9222,
+                _browser_ws_path="/devtools/browser/a",
+                _devtools_fwd_proc=mock.MagicMock(pid=777, **{"poll.return_value": None}),
+            )
+            inst.check_devtools_tunnel_alive()
+
+            dead_proc = mock.MagicMock(pid=778, **{"poll.return_value": 255})
+            with (
+                mock.patch.object(inst, "ssh", return_value=mock.Mock(stdout="9222\n/devtools/browser/a\n")),
+                mock.patch.object(vm, "find_free_port", return_value=43333),
+                mock.patch.object(
+                    vm.subprocess,
+                    "Popen",
+                    side_effect=lambda *_a, **kw: (kw["stderr"].write(b"bind: Address already in use\n"), dead_proc)[1],
+                ) as popen_mock,
+                self.assertRaisesRegex(cdp.CDPError, "returncode=255.*Address already in use"),
+            ):
+                inst._setup_devtools_tunnel()
+            self.assertIn("ExitOnForwardFailure=yes", popen_mock.call_args.args[0])
+            conn = cdp.CDPConnection(
+                "ws://127.0.0.1:43333/devtools/page/T1",
+                connect_fn=lambda *_a, **_kw: _FakeWS([]),
+                on_error=inst.check_devtools_tunnel_alive,
+            )
+            with self.assertRaisesRegex(cdp.CDPError, "DevTools SSH -L tunnel.*returncode=255"):
+                conn.call("Runtime.evaluate")
+
     def test_composite_diagnostics_observer_strict_and_idempotent(self) -> None:
         noop = FlowDiagnosticsObserver()
         noop.collect(strict=True)
