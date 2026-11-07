@@ -6,6 +6,7 @@ import calendar
 import dataclasses
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -32,9 +33,10 @@ EXPECTED_GUEST_SUPPLEMENTARY_GROUPS: frozenset[str] = frozenset(
 # On constrained 4-vCPU nested-KVM CI runners, a minimal `vsh` invocation can take ~22s just to
 # open the guest shell; 120s leaves ~4-5x headroom for vsh startup plus user-session checks.
 GUEST_VSH_TIMEOUT_SEC = 120
-TERMINAL_POLL_FLOOR_SEC = 0.5
+TERMINAL_POLL_FLOOR_SEC = 1.5
 _TERMINAL_HOME_URL = "chrome-untrusted://terminal/html/terminal.html#home"
 _TERMINAL_VMSHELL_URL = "chrome-untrusted://terminal/html/terminal.html?command=vmshell"
+_BALLOON_NOISE_TOKENS = ("BalloonTrace", "BalloonInit", "balloon stats")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -278,6 +280,8 @@ def parse_host_init_logs(
             launch_vshd_seq += 1
             pending_launch_vshd = (launch_vshd_seq, rel)
             entries.append(TimelineEntry(rel, "cicerone", "LaunchVshd", f"call #{launch_vshd_seq}: {line.strip()}"))
+        elif proc_tag.startswith("vm_concierge[") and "timer_interval_millis is 0" in msg_body:
+            entries.append(TimelineEntry(rel, "concierge", "BalloonTimerStopped", msg_body))
         else:
             for needle, src, ev_name, fixed_detail in _MSG_SUBSTRING_EVENTS:
                 if needle in msg_body:
@@ -792,6 +796,51 @@ def _assert_guest_shell_in_crosh(vm: ChromeOSVM, tab: CroshTab, expected_usernam
     )
 
 
+def verify_concierge_balloon_timer_stopped(vm: ChromeOSVM, msg_line_cursor: int) -> None:
+    """Verifies in unfiltered `/var/log/messages` that concierge stopped its balloon timer cleanly.
+
+    Reads raw `vm_concierge` lines directly (bypassing `HostLogScraper.scrape()`'s `BalloonTrace:`
+    filter) and asserts that after `SetBalloonTimer(0)` logs its stop message, zero `BalloonTrace`,
+    `BalloonInit`, or `balloon stats` lines occur for the remainder of the flow.
+    """
+    raw = vm.ssh(
+        f"set -o pipefail; test -r /var/log/messages; "
+        f"tail -n +{msg_line_cursor + 1} /var/log/messages | {{ grep 'vm_concierge\\[' || [ $? -eq 1 ]; }}",
+        check=True,
+        timeout=30,
+        op_desc="verify_concierge_balloon_timer_stopped(/var/log/messages)",
+    ).stdout
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    start_idx = next((i for i, ln in enumerate(lines) if "Starting balloon resize timer" in ln), -1)
+    if start_idx < 0:
+        raise RuntimeError(
+            "Expected concierge 'Starting balloon resize timer' line in unfiltered "
+            f"/var/log/messages, found none ({len(lines)} vm_concierge lines)"
+        )
+    stop_indices = [
+        i
+        for i, ln in enumerate(lines[start_idx + 1 :], start=start_idx + 1)
+        if "timer_interval_millis is 0" in ln and ("Stopping balloon timer" in ln or "Stop the timer" in ln)
+    ]
+    if not stop_indices:
+        raise RuntimeError(
+            "Expected concierge SetBalloonTimer(0) stop log after 'Starting balloon resize timer' "
+            f"in unfiltered /var/log/messages, found none (tail={lines[start_idx : start_idx + 12]!r})"
+        )
+    stop_idx = stop_indices[-1]
+    is_balloon = lambda ln: any(tok in ln for tok in _BALLOON_NOISE_TOKENS)
+    if post_balloon := [ln for ln in lines[stop_idx + 1 :] if is_balloon(ln)]:
+        raise RuntimeError(
+            f"Unexpected concierge balloon activity after SetBalloonTimer(0) stopped the timer: {post_balloon[:5]!r}"
+        )
+    pre_balloon_count = sum(1 for ln in lines[start_idx:stop_idx] if is_balloon(ln))
+    log(
+        f"  Verified concierge balloon timer stopped in unfiltered /var/log/messages "
+        f"({lines[stop_idx].split(None, 3)[-1]!r}; pre-stop balloon lines={pre_balloon_count}, "
+        "post-stop balloon lines=0)."
+    )
+
+
 def run_termina_user_flow(
     vm: ChromeOSVM,
     readme_cmds: ReadmeCommands,
@@ -804,7 +853,16 @@ def run_termina_user_flow(
     obs = observer or vm.observer
     log("=== Starting Flow: `termina` VM + ChromeOS Settings UI Installer ===")
     log_scraper = HostLogScraper()
-    dbus_mon = DbusSignalMonitor(vm, owner_hash=vm.owner_hash, expected_username=username, observer=obs)
+    # Stop concierge's 1 Hz BalanceAvailableBalloonPolicy timer once Baguette starts:
+    # memory ballooning is orthogonal to this user-flow test and inflates ~1.5 GiB via
+    # 1 Hz virtio-balloon stats/reclaim churn during SetUpVmUser under nested virtualization.
+    dbus_mon = DbusSignalMonitor(
+        vm,
+        owner_hash=vm.owner_hash,
+        expected_username=username,
+        observer=obs,
+        stop_balloon_timer_on_vm_started=True,
+    )
     tracker = _FlowTracker(vm, dbus_mon, log_scraper, obs)
 
     crosh: CroshTab | None = None
@@ -846,11 +904,12 @@ def run_termina_user_flow(
             crosh = None
 
             vm.set_step("step5:verify_guest_and_collect")
-            log("Step 5: Verifying D-Bus signal sequence and in-guest user/garcon state...")
+            log("Step 5: Verifying D-Bus signal sequence, balloon timer stop, and in-guest user/garcon state...")
             dbus_mon.verify_required_signal_sequence()
+            verify_concierge_balloon_timer_stopped(vm, log_scraper.msg_line_cursor)
             verify_guest_user_session(vm, "termina", expected_username=username)
         finally:
-            dbus_mon.stop()
+            dbus_mon.stop(raise_errors=(sys.exc_info()[1] is None))
 
         obs.collect(strict=True)
         if report := obs.format_report(include_verbose=False):

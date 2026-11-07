@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -53,8 +55,8 @@ class ChromeOSVMAndHelpersTests(unittest.TestCase):
         info = vm.read_host_cpu_and_mem(amd_cpuinfo, "MemTotal: 16384000 kB\nMemAvailable: 12288000 kB\n")
         self.assertEqual(info.vendor_id, "AuthenticAMD")
         self.assertAlmostEqual(info.mem_total_mib, 16000.0, places=2)
-        self.assertEqual(vm.detect_host_qemu_cpu_arg(amd_cpuinfo), "Opteron_G4,-invpcid,-tsc-deadline,check,svm=on")
-        self.assertEqual(vm.detect_host_qemu_cpu_arg(intel_cpuinfo), "Haswell-noTSX,-invpcid,-tsc-deadline,check,vmx=on")
+        self.assertEqual(vm.detect_host_qemu_cpu_arg(amd_cpuinfo), "host,-invpcid,-tsc-deadline,svm=on")
+        self.assertEqual(vm.detect_host_qemu_cpu_arg(intel_cpuinfo), "host,-invpcid,-tsc-deadline,vmx=on")
         with self.assertRaisesRegex(RuntimeError, "Unsupported host CPU vendor"):
             vm.detect_host_qemu_cpu_arg("processor : 0\nvendor_id : MysteryCPU\n")
 
@@ -73,6 +75,65 @@ class ChromeOSVMAndHelpersTests(unittest.TestCase):
                 (d / "comm").write_text(comm_txt + "\n", encoding="utf-8")
                 (d / "cmdline").write_bytes(cmdline_bytes)
                 self.assertEqual(vm.pid_matches_qemu(pid_num, bin_arg, proc_root=fp), expected)
+
+    def test_chrome_dev_conf_and_browser_cmdline_guard(self) -> None:
+        base_conf = (
+            "# Comment line\n--keep-unrelated-flag=1\n--num-raster-threads-extra=1\n"
+            "!--num-raster-threads\n--scheduler-configuration-default=conservative\n"
+            "--num-raster-threads=4\n--enable-features=PreEnabled,Baguette\n--disable-features=PreDisabled\n"
+        )
+        test_switches = vm.TEST_VM_CHROME_SWITCHES
+        for expected_sw in (
+            "--wm-window-animations-disabled",
+            "--animation-duration-scale=0",
+            "--force-prefers-reduced-motion",
+            "--disable-smooth-scrolling",
+            "--num-raster-threads=1",
+        ):
+            self.assertIn(expected_sw, test_switches)
+        out1 = vm.build_chrome_dev_conf(base_conf)
+        self.assertEqual(out1, vm.build_chrome_dev_conf(out1))
+        lines = out1.splitlines()
+        self.assertIn("--keep-unrelated-flag=1", lines)
+        self.assertIn("--num-raster-threads-extra=1", lines)
+        self.assertNotIn("!--num-raster-threads", lines)
+        self.assertNotIn("--scheduler-configuration-default=conservative", lines)
+        self.assertNotIn("--num-raster-threads=4", lines)
+        self.assertLess(
+            lines.index("!--scheduler-configuration-default="),
+            lines.index("--scheduler-configuration-default=performance"),
+        )
+        self.assertLess(lines.index("!--num-raster-threads="), lines.index("--num-raster-threads=1"))
+        for sw in test_switches:
+            self.assertIn(sw, lines)
+        self.assertIn("--enable-features=PreEnabled,Baguette,Crostini,CrostiniContainerless", lines)
+        self.assertIn("--disable-features=PreDisabled,CryptohomeRecoveryByDefaultForConsumers,Vulkan", lines)
+
+        good_argv = [
+            "/opt/google/chrome/chrome",
+            "--login-manager",
+            *test_switches,
+            "--enable-features=PreEnabled,Baguette,Crostini,CrostiniContainerless",
+            "--disable-features=DefaultWebAppInstallation,CryptohomeRecoveryByDefaultForConsumers,Vulkan",
+        ]
+        encode_argv = lambda argv: ("\x00".join(argv) + "\x00").encode("utf-8")
+        summary = vm.verify_chrome_browser_cmdline(encode_argv(good_argv))
+        self.assertIn("--disable-webgl2", summary)
+        self.assertIn("Vulkan", summary)
+
+        for desc, bad_argv, pat in (
+            ("renderer process", ["/opt/google/chrome/chrome", "--type=renderer"], "Unexpected Chrome browser argv"),
+            ("missing --disable-webgl2", [a for a in good_argv if a != "--disable-webgl2"], "missing expected switches.*--disable-webgl2"),
+            (
+                "conflicting --scheduler-configuration-default",
+                [good_argv[0], "--scheduler-configuration-default=conservative", *good_argv[1:]],
+                "Conflicting --scheduler-configuration-default",
+            ),
+            ("conflicting --num-raster-threads", [good_argv[0], "--num-raster-threads=4", *good_argv[1:]], "Conflicting --num-raster-threads"),
+            ("clobbered --disable-features=", [*good_argv, "--disable-features=DefaultWebAppInstallation"], "--disable-features= mismatch"),
+        ):
+            with self.subTest(desc=desc), self.assertRaisesRegex(RuntimeError, pat):
+                vm.verify_chrome_browser_cmdline(encode_argv(bad_argv))
 
     def test_vm_command_timeout_wrapping(self) -> None:
         inst = _new_vm(
@@ -147,7 +208,7 @@ class ChromeOSVMAndHelpersTests(unittest.TestCase):
             "Terminal-App-Initial",
             cdp.CDPConnection.from_target(fake_tgt, label="Terminal-App-Initial", connect_fn=lambda *_a, **_kw: tab_ws),
         )
-        browser_ws = _FakeWS([json.dumps({"id": 1, "result": {"success": True}}), json.dumps({"id": 1, "result": {"success": True}})])
+        browser_ws = _FakeWS([json.dumps({"id": i, "result": {"success": True}}) for i in (1, 1, 1, 2)])
         dummy_vm.connect_browser_cdp = lambda label="Browser-Root": cdp.CDPConnection(  # type: ignore[method-assign]
             "ws://127.0.0.1:41234/devtools/browser/root", target_label=label, connect_fn=lambda *_a, **_kw: browser_ws
         )
@@ -155,9 +216,30 @@ class ChromeOSVMAndHelpersTests(unittest.TestCase):
         dummy_vm.list_cdp_targets = lambda timeout=20.0: [  # type: ignore[method-assign]
             {"id": "T1", "type": "page", "url": "chrome-untrusted://terminal/html/terminal.html#home"},
             {"id": "T2", "type": "page", "url": "chrome-untrusted://terminal/html/terminal.html?command=vmshell"},
+            {"id": "N1", "type": "page", "url": "chrome://newtab/"},
+            {"id": "N2", "type": "other", "url": "chrome://newtab/"},
+            {"id": "N3", "type": "page", "url": "chrome://newtab/subpath"},
+            {"id": "S1", "type": "page", "url": "chrome://os-settings/"},
         ]
         self.assertEqual(dummy_vm.close_cdp_targets_matching("chrome-untrusted://terminal", label="Terminal-Stale", exclude_ids={"T2"}), 1)
-        self.assertEqual([json.loads(s)["params"]["targetId"] for s in browser_ws.sent], ["9F2A1B", "T1"])
+        self.assertEqual(
+            dummy_vm.close_cdp_page_targets_by_url(
+                ("chrome://newtab", "chrome://newtab/", "chrome-untrusted://terminal/html/terminal.html#home"),
+                label="Idle-Pages",
+                exclude_ids={"T2"},
+            ),
+            2,
+        )
+        self.assertEqual([json.loads(s)["params"]["targetId"] for s in browser_ws.sent], ["9F2A1B", "T1", "T1", "N1"])
+
+        buf_none = io.StringIO()
+        with contextlib.redirect_stdout(buf_none):
+            self.assertEqual(dummy_vm.close_cdp_page_targets_by_url(("chrome://nonexistent/",), label="PostLogin-NewTab"), 0)
+        self.assertIn("No PostLogin-NewTab page targets to close.", buf_none.getvalue())
+
+        dummy_vm.list_cdp_targets = mock.MagicMock(side_effect=cdp.CDPTimeoutError("DevTools /json/list timed out"))  # type: ignore[method-assign]
+        with self.assertRaisesRegex(cdp.CDPTimeoutError, "DevTools /json/list timed out"):
+            dummy_vm.close_cdp_page_targets_by_url(("chrome://newtab/",), label="PostLogin-NewTab")
 
     def test_composite_diagnostics_observer_strict_and_idempotent(self) -> None:
         noop = FlowDiagnosticsObserver()
@@ -190,6 +272,45 @@ class ChromeOSVMAndHelpersTests(unittest.TestCase):
         for tok in ("OK(verbose=True)", "PARTIAL_FLAKY", "_FlakyObs: RuntimeError: collector boom"):
             self.assertIn(tok, rep)
 
+    def test_dbus_call_proto_reply_timeout_and_vm_stop_closes_observer(self) -> None:
+        from user_flows import dbus  # noqa: PLC0415
+
+        conc = dbus.load_cros_protos().concierge_pb2
+        seen_ssh: list[tuple[str, int]] = []
+        raw_ok = conc.SuccessFailureResponse(success=True).SerializeToString()
+        dbus_stdout = (
+            "method return time=1761840000.1 sender=:1.12 -> destination=:1.99 serial=42 reply_serial=2\n"
+            + f"   array of bytes [\n      {' '.join(f'{b:02x}' for b in raw_ok)}\n   ]\n"
+        )
+        closed_count = 0
+
+        class _CloseObs(FlowDiagnosticsObserver):
+            def close(self) -> None:
+                nonlocal closed_count
+                closed_count += 1
+
+        with tempfile.TemporaryDirectory() as td:
+            inst = _new_vm(
+                observer=_CloseObs(),
+                pid_file=Path(td) / "kvm.pid",
+                _devtools_fwd_proc=None,
+                ssh=lambda cmd, *, timeout=300, **_kw: (
+                    seen_ssh.append((cmd, timeout)) or mock.Mock(returncode=0, stdout=dbus_stdout, stderr="")
+                ),
+            )
+            resp, _ = inst.dbus_call_proto(
+                "org.chromium.VmConcierge",
+                "SetBalloonTimer",
+                conc.SetBalloonTimerRequest(timer_interval_millis=0),
+                conc.SuccessFailureResponse,
+                timeout=60,
+            )
+            self.assertTrue(resp.success)
+            self.assertEqual(len(seen_ssh), 1)
+            self.assertIn("--reply-timeout=60000", seen_ssh[0][0])
+            self.assertEqual(seen_ssh[0][1], 70)
+            inst.stop()
+            self.assertEqual(closed_count, 1)
 
 
 if __name__ == "__main__":
