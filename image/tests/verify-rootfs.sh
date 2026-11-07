@@ -111,6 +111,19 @@ else
     pass "no ssh host keys (/etc/ssh/ssh_host_*)"
 fi
 
+check "openssh sshdgenkeys.service unit present (on-demand ssh host keys)" \
+    test -f "${ROOTFS}/usr/lib/systemd/system/sshdgenkeys.service"
+check "openssh sshd.service pulls in sshdgenkeys.service on demand" \
+    grep -Eq '^Wants=.*\bsshdgenkeys\.service\b' "${ROOTFS}/usr/lib/systemd/system/sshd.service"
+for ssh_u in sshd.service sshdgenkeys.service; do
+    ssh_u_state="$(systemctl --root="${ROOTFS}" is-enabled -- "${ssh_u}" 2>/dev/null || true)"
+    if [ "${ssh_u_state}" = "disabled" ]; then
+        pass "system unit disabled by default: ${ssh_u}"
+    else
+        fail "system unit disabled by default: ${ssh_u} (got: ${ssh_u_state:-<none>})"
+    fi
+done
+
 if [ -z "$(find "${ROOTFS}/var/cache/pacman/pkg" -mindepth 1 2>/dev/null)" ]; then
     pass "pacman cache is empty (/var/cache/pacman/pkg)"
 else
@@ -121,6 +134,15 @@ if [ -f "${ROOTFS}/etc/fstab" ] && grep -Evq '^[[:space:]]*(#|$)' "${ROOTFS}/etc
     fail "no active /etc/fstab entries (default subvolume does the job)"
 else
     pass "no active /etc/fstab entries (default subvolume does the job)"
+fi
+
+if grep -Ehs '^[[:space:]]*DefaultDeviceTimeoutSec[[:space:]]*=' \
+    "${ROOTFS}/etc/systemd/system.conf" \
+    "${ROOTFS}"/etc/systemd/system.conf.d/*.conf \
+    "${ROOTFS}"/usr/lib/systemd/system.conf.d/*.conf >/dev/null 2>&1; then
+    fail "DefaultDeviceTimeoutSec kept at systemd default (no global override)"
+else
+    pass "DefaultDeviceTimeoutSec kept at systemd default (no global override)"
 fi
 
 check "in-target pacman keyring populated (pacman-key trustdb)" \
@@ -377,8 +399,55 @@ pkg_check "journald ForwardToConsole drop-in present" \
     grep -q '^ForwardToConsole=yes' "${ROOTFS}/usr/lib/systemd/journald.conf.d/50-console.conf"
 pkg_check "first-boot script /usr/lib/baguette/first-boot-cros executable" \
     test -x "${ROOTFS}/usr/lib/baguette/first-boot-cros"
+FIRST_BOOT="${ROOTFS}/usr/lib/baguette/first-boot-cros"
+FIRST_BOOT_UNIT="${ROOTFS}/usr/lib/systemd/system/first-boot-cros.service"
+if [ "${SKIP_BAGUETTE}" -eq 1 ]; then
+    skip "first-boot-cros grows root btrfs filesystem (--skip-baguette-repo)"
+    skip "first-boot-cros scrubs /etc/ssh/ssh_host_* (--skip-baguette-repo)"
+    skip "first-boot-cros omits eager ssh-keygen (--skip-baguette-repo)"
+    skip "first-boot-cros omits full-system sync (--skip-baguette-repo)"
+    skip "first-boot-cros.service ordered Before=maitred.service (--skip-baguette-repo)"
+    skip "first-boot-cros.service disables itself with --no-reload (--skip-baguette-repo)"
+else
+    check "first-boot-cros grows root btrfs filesystem" \
+        grep -Eq '^[[:space:]]*btrfs[[:space:]]+filesystem[[:space:]]+resize[[:space:]]+max[[:space:]]+/$' "${FIRST_BOOT}"
+    check "first-boot-cros scrubs /etc/ssh/ssh_host_*" \
+        grep -Eq '^[[:space:]]*rm[[:space:]]+-[a-zA-Z]*f[a-zA-Z]*[[:space:]]+/etc/ssh/ssh_host_\*$' "${FIRST_BOOT}"
+    if grep -Ev '^[[:space:]]*(#|$)' "${FIRST_BOOT}" 2>/dev/null \
+       | grep -Eq '(^|[^[:alnum:]_-])ssh-keygen([^[:alnum:]_-]|$)'; then
+        fail "first-boot-cros omits eager ssh-keygen"
+    else
+        pass "first-boot-cros omits eager ssh-keygen"
+    fi
+    if grep -Ev '^[[:space:]]*(#|$)' "${FIRST_BOOT}" 2>/dev/null \
+       | grep -Eq '(^|[[:space:];&|])sync([[:space:];&|]|$)'; then
+        fail "first-boot-cros omits full-system sync"
+    else
+        pass "first-boot-cros omits full-system sync"
+    fi
+    check "first-boot-cros.service ordered Before=maitred.service" \
+        grep -Eq '^Before=.*\bmaitred\.service\b' "${FIRST_BOOT_UNIT}"
+    check "first-boot-cros.service disables itself with --no-reload" \
+        grep -Eq '^ExecStartPost=/usr/bin/systemctl[[:space:]]+--no-reload[[:space:]]+disable[[:space:]]+first-boot-cros\.service$' "${FIRST_BOOT_UNIT}"
+fi
 pkg_check "preset file /usr/lib/systemd/system-preset/50-baguette.preset present" \
     test -f "${ROOTFS}/usr/lib/systemd/system-preset/50-baguette.preset"
+
+# Targeted infinite device-job timeout on crosvm virtual boot devices
+has_infinite_job_running_timeout() {
+    awk '/^\[/ { sec = $0 }
+         sec == "[Unit]" && /^JobRunningTimeoutSec=infinity$/ { ok = 1 }
+         END { exit(ok ? 0 : 1) }' "$1"
+}
+BAGUETTE_BOOT_DEVICES=(
+    'dev-disk-by\x2dlabel-cros\x2dvm\x2dtools.device'
+    dev-vsock.device
+    dev-hvc0.device
+)
+for dev_u in "${BAGUETTE_BOOT_DEVICES[@]}"; do
+    pkg_check "device drop-in ${dev_u}.d/10-baguette.conf sets JobRunningTimeoutSec=infinity" \
+        has_infinite_job_running_timeout "${ROOTFS}/usr/lib/systemd/system/${dev_u}.d/10-baguette.conf"
+done
 
 # udev rules + dbus activation
 pkg_check "udev rule 10-cros-virtwl.rules present" \
