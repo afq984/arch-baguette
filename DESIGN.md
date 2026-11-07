@@ -196,11 +196,24 @@ this repo. Requirements:
 - Config steps (parity with official setup_in_guest.sh, adapted):
   hostname `penguin`; `/etc/hosts` with `127.0.0.1 localhost`,
   `127.0.1.1 penguin`, `100.115.92.2 arc`; `en_US.UTF-8` locale-gen +
-  locale.conf; `/etc/resolv.conf` → `/run/resolv.conf` symlink;
+  locale.conf; `/etc/nsswitch.conf` configured with `group: files systemd`
+  (drops Arch's `[SUCCESS=merge]` so `getgrnam`/`getgrgid` in
+  `maitred`/`useradd`/`usermod` return on local `/etc/group` hits without PID-1
+  Varlink IPC, matching `passwd`/`shadow`/`gshadow` and Debian's Baguette image)
+  plus `initgroups: files [SUCCESS=return] systemd` (so `initgroups`/`getgrouplist`
+  in `login`/`su`/`sudo`/`id` also short-circuit on local `/etc/group` hits
+  while `DynamicUser=` misses still fall back to `systemd`);
+  `/etc/resolv.conf` → `/run/resolv.conf` symlink;
   `: > /etc/machine-id`; delete `/etc/ssh/ssh_host_*`; in-target
   `pacman-key --init && --populate archlinux`; `systemctl --root preset-all`
   (or explicit enable list matching the preset); empty pacman cache in the
-  final rootfs; `pacman -Q` manifest emitted next to the image.
+  final rootfs; `pacman -Q` manifest emitted next to the image; and
+  `/usr/lib/systemd/systemd-update-done` run after all `/usr` and `/etc` writes
+  to pre-populate `/etc/.updated` and `/var/.updated` (skipping redundant
+  first-boot `ConditionNeedsUpdate=` units whose caches — `ld.so.cache`,
+  `/etc/{passwd,group}`, `hwdb.bin`, journal catalog — were already generated
+  by `pacstrap` ALPM hooks, without affecting `ConditionFirstBoot=` or future
+  `pacman -Syu` `35-systemd-update.hook`).
 - **No user creation by default.** `--dev-user NAME[:PASSWORD]` flag creates a
   dev user (uid 1000, the full contract group list, linger enabled, default
   password `test0000`) for local testing — mirrors official `-c`/`-u`.
@@ -212,8 +225,11 @@ this repo. Requirements:
 ## Tests
 
 - `image/tests/verify-rootfs.sh <rootfs-dir>`: userns-chroot asserts —
-  all 11 contract groups resolve; `/usr/sbin/useradd` resolves; enabled units
-  (system + user wants-symlinks)
+  all 11 contract groups resolve; `/etc/nsswitch.conf` sets
+  `group: files systemd` and `initgroups: files [SUCCESS=return] systemd`;
+  `/etc/.updated` + `/var/.updated` stamps (`0:0`, `TIMESTAMP_NSEC >= /usr`
+  mtime) and pre-built `ld.so.cache`/`hwdb.bin`/journal catalog exist;
+  `/usr/sbin/useradd` resolves; enabled units (system + user wants-symlinks)
   and `.device.d/10-baguette.conf` `JobRunningTimeoutSec=infinity` drop-ins
   (`DefaultDeviceTimeoutSec` unoverridden globally) present; `/etc/machine-id`
   empty; no `ssh_host_*` (`sshd.service` + `sshdgenkeys.service` disabled by

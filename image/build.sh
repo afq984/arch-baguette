@@ -283,6 +283,26 @@ sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
 locale-gen
 echo 'LANG=en_US.UTF-8' > /etc/locale.conf
 
+# Arch's `filesystem` package ships `group: files [SUCCESS=merge] systemd` with
+# no `initgroups:` line (`backup = etc/nsswitch.conf`):
+# - `[SUCCESS=merge]` on `group:` forces `getgrnam`/`getgrgid` (used by
+#   `maitred`, `useradd`, and `usermod`) to query `libnss_systemd` over PID-1
+#   Varlink even on local `/etc/group` hits; drop `[SUCCESS=merge]` for parity
+#   with `passwd`/`shadow`/`gshadow` and Debian's Baguette image.
+# - Without `initgroups:`, glibc's `initgroups`/`getgrouplist` keeps walking
+#   later services after `files` succeeds (`grp/initgroups.c`), so `login`,
+#   `su`, `sudo`, and `id` still query `libnss_systemd`; add
+#   `initgroups: files [SUCCESS=return] systemd` so local `/etc/group` hits
+#   return without Varlink IPC while `DynamicUser=` misses still fall back.
+sed -i -E \
+    -e '/^initgroups:/d' \
+    -e 's/^(group:[[:space:]]+files)([[:space:]]+\[SUCCESS=merge\])?([[:space:]]+systemd[[:space:]]*)$/\1\3\ninitgroups: files [SUCCESS=return] systemd/' \
+    /etc/nsswitch.conf
+test "$(grep -Ec '^group:' /etc/nsswitch.conf)" = "1"
+grep -Eq '^group:[[:space:]]+files[[:space:]]+systemd[[:space:]]*$' /etc/nsswitch.conf
+test "$(grep -Ec '^initgroups:' /etc/nsswitch.conf)" = "1"
+grep -Eq '^initgroups:[[:space:]]+files[[:space:]]+\[SUCCESS=return\][[:space:]]+systemd[[:space:]]*$' /etc/nsswitch.conf
+
 # In-target keyring so `pacman -Syu` works after first boot.
 pacman-key --init
 pacman-key --populate archlinux
@@ -301,8 +321,9 @@ if [ -n "${DEV_USER:-}" ]; then
     touch "/var/lib/systemd/linger/${DEV_USER}"
 fi
 
-# Production defaults: no ssh host keys (first-boot-cros regenerates), empty
-# machine-id (first boot initializes). Keep these LAST.
+# Production defaults: no ssh host keys (sshdgenkeys.service generates on
+# demand if sshd is enabled), empty machine-id (first boot initializes).
+# Keep these LAST.
 rm -f /etc/ssh/ssh_host_*
 : > /etc/machine-id
 CONFEOF
@@ -385,6 +406,22 @@ fi
 
 as_root chroot "${ROOTFS}" /usr/bin/pacman -Q >"${MANIFEST}"
 echo "==> manifest: ${MANIFEST} ($(wc -l <"${MANIFEST}") packages)"
+
+# Pre-populate /etc/.updated and /var/.updated after all /usr and /etc writes
+# (including preset-all) so first boot skips redundant ConditionNeedsUpdate=
+# units (ldconfig, systemd-sysusers, systemd-journal-catalog-update,
+# systemd-update-done; pacstrap's ALPM hooks already materialized
+# /etc/ld.so.cache, /etc/{passwd,group}, hwdb.bin, and the journal catalog).
+# Future in-guest `pacman -Syu` runs 35-systemd-update.hook (`touch -c /usr`)
+# to re-arm ConditionNeedsUpdate=; ConditionFirstBoot= (empty /etc/machine-id)
+# is unaffected.
+as_root chroot "${ROOTFS}" /usr/lib/systemd/systemd-update-done
+for stamp in "${ROOTFS}/etc/.updated" "${ROOTFS}/var/.updated"; do
+    if [ ! -s "${stamp}" ]; then
+        echo "error: expected non-empty ${stamp} after systemd-update-done" >&2
+        exit 1
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # [8/9] btrfs image (content in default subvolume rootfs_subvol)

@@ -93,6 +93,19 @@ check "locale.conf sets LANG=en_US.UTF-8" \
 check "locale.gen enables en_US.UTF-8" \
     grep -Eq '^en_US\.UTF-8 UTF-8[[:space:]]*$' "${ROOTFS}/etc/locale.gen"
 
+if [ "$(grep -Ec '^group:' "${ROOTFS}/etc/nsswitch.conf" 2>/dev/null || true)" = "1" ] \
+   && grep -Eq '^group:[[:space:]]+files[[:space:]]+systemd[[:space:]]*$' "${ROOTFS}/etc/nsswitch.conf"; then
+    pass "/etc/nsswitch.conf sets 'group: files systemd' (no [SUCCESS=merge])"
+else
+    fail "/etc/nsswitch.conf sets 'group: files systemd' (got: $(grep '^group:' "${ROOTFS}/etc/nsswitch.conf" 2>/dev/null || echo '<missing>'))"
+fi
+if [ "$(grep -Ec '^initgroups:' "${ROOTFS}/etc/nsswitch.conf" 2>/dev/null || true)" = "1" ] \
+   && grep -Eq '^initgroups:[[:space:]]+files[[:space:]]+\[SUCCESS=return\][[:space:]]+systemd[[:space:]]*$' "${ROOTFS}/etc/nsswitch.conf"; then
+    pass "/etc/nsswitch.conf sets 'initgroups: files [SUCCESS=return] systemd'"
+else
+    fail "/etc/nsswitch.conf sets 'initgroups: files [SUCCESS=return] systemd' (got: $(grep '^initgroups:' "${ROOTFS}/etc/nsswitch.conf" 2>/dev/null || echo '<missing>'))"
+fi
+
 if [ "$(readlink "${ROOTFS}/etc/resolv.conf" 2>/dev/null)" = "/run/resolv.conf" ]; then
     pass "/etc/resolv.conf is a symlink to /run/resolv.conf"
 else
@@ -104,6 +117,34 @@ if [ -f "${ROOTFS}/etc/machine-id" ] && [ ! -s "${ROOTFS}/etc/machine-id" ]; the
 else
     fail "/etc/machine-id exists and is empty"
 fi
+
+# ConditionNeedsUpdate= pre-population: /etc/.updated and /var/.updated must be
+# owned by 0:0 inside the rootfs, stamped >= /usr mtime (nanoseconds), and the
+# caches those boot units would otherwise regenerate must already exist.
+usr_mtime_raw="$(stat -c '%.9Y' "${ROOTFS}/usr" 2>/dev/null || true)"
+usr_mtime_nsec="${usr_mtime_raw//./}"
+if [[ ! "${usr_mtime_nsec}" =~ ^[0-9]+$ ]] || [ "${usr_mtime_nsec}" -le 0 ]; then
+    fail "/usr mtime readable in nanoseconds (got: ${usr_mtime_raw:-<empty>})"
+else
+    for stamp_rel in /etc/.updated /var/.updated; do
+        stamp_path="${ROOTFS}${stamp_rel}"
+        stamp_ts_nsec="$(awk -F= '/^TIMESTAMP_NSEC=[0-9]+$/ {print $2; exit}' "${stamp_path}" 2>/dev/null || true)"
+        stamp_owner="$(in_chroot stat -c '%u:%g' "${stamp_rel}" 2>/dev/null || true)"
+        if [ -s "${stamp_path}" ] && [ -n "${stamp_ts_nsec}" ] \
+           && [ "${stamp_owner}" = "0:0" ] \
+           && [ "${stamp_ts_nsec}" -ge "${usr_mtime_nsec}" ]; then
+            pass "${stamp_rel} pre-populated (0:0, TIMESTAMP_NSEC >= /usr mtime)"
+        else
+            fail "${stamp_rel} pre-populated (owner=${stamp_owner:-<missing>} ts_nsec=${stamp_ts_nsec:-<missing>} usr_nsec=${usr_mtime_nsec})"
+        fi
+    done
+fi
+check "pre-built /etc/ld.so.cache exists and is non-empty" \
+    test -s "${ROOTFS}/etc/ld.so.cache"
+check "pre-built /usr/lib/udev/hwdb.bin exists and is non-empty" \
+    test -s "${ROOTFS}/usr/lib/udev/hwdb.bin"
+check "pre-built /var/lib/systemd/catalog/database exists and is non-empty" \
+    test -s "${ROOTFS}/var/lib/systemd/catalog/database"
 
 if compgen -G "${ROOTFS}/etc/ssh/ssh_host_*" >/dev/null; then
     fail "no ssh host keys (/etc/ssh/ssh_host_*)"
